@@ -105,11 +105,12 @@
         chatBox.scrollTop = chatBox.scrollHeight;
 
         try {
-            const response = await fetch('https://comex-backend.vercel.app/', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ businessId, question })
-            });
+        // Change this line:
+const response = await fetch('https://comex-backend.vercel.app/api/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ businessId, question })
+});
             const data = await response.json();
             chatBox.innerHTML += `<div class="cc-bubble cc-ai">${data.answer}</div>`;
             chatBox.scrollTop = chatBox.scrollHeight;
