@@ -2,9 +2,10 @@
   "name": "comex-backend",
   "version": "1.0.0",
   "type": "module",
-  "dependencies": {
+"dependencies": {
     "cheerio": "^1.0.0-rc.12",
     "firebase": "^10.8.1",
+    "firebase-admin": "^12.0.0",
     "groq-sdk": "^0.5.0"
-  }
+}
 }
