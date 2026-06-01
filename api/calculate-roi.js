@@ -1,35 +1,57 @@
 import { initializeApp, cert, getApps } from 'firebase-admin/app';
 import { getFirestore, Timestamp } from 'firebase-admin/firestore';
 
-// 1. Initialize Firebase Admin safely (prevents re-initialization crashes on Vercel)
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
-if (!getApps().length) {
+// 1. SAFELY INITIALIZE FIREBASE ADMIN
+// If Vercel environment variables are missing, this fallback string prevents an immediate JSON parse crash
+const serviceAccountRaw = process.env.FIREBASE_SERVICE_ACCOUNT_KEY || "{}";
+let serviceAccount;
+try {
+    serviceAccount = JSON.parse(serviceAccountRaw);
+} catch (e) {
+    serviceAccount = {};
+}
+
+if (!getApps().length && serviceAccount.project_id) {
     initializeApp({ credential: cert(serviceAccount) });
 }
-const db = getFirestore();
 
-// Regular expressions to check if a user dropped contact info (Lead Tracking)
+// Regular expressions to check for Lead Tracking
 const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
 const phoneRegex = /(\+?\d{1,4}[\s-])?\(?\d{3}\)?[\s-]?\d{3}[\s-]?\d{4}/;
 
 export default async function handler(req, res) {
-    // Enable CORS so your dashboard UI can fetch this data securely
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    // 2. FORCE CORS HEADERS TO SEND IMMEDIATELY
+    res.setHeader('Access-Control-Allow-Credentials', true);
+    res.setHeader('Access-Control-Allow-Origin', '*'); 
+    res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
+    res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version');
 
-    if (req.method === 'OPTIONS') return res.status(200).end();
-    if (req.method !== 'POST') return res.status(405).json({ message: 'Method Not Allowed' });
+    // Handle preflight browser check safely
+    if (req.method === 'OPTIONS') {
+        return res.status(200).end();
+    }
+
+    if (req.method !== 'POST') {
+        return res.status(405).json({ success: false, message: 'Method Not Allowed' });
+    }
+
+    // 3. CHECK IF ENVIRONMENT VARIABLES ARE CONFIGURED BEFORE ACCESSING DB
+    if (!process.env.FIREBASE_SERVICE_ACCOUNT_KEY) {
+        return res.status(500).json({ 
+            success: false, 
+            message: 'Backend Configuration Error: FIREBASE_SERVICE_ACCOUNT_KEY is missing in Vercel settings.' 
+        });
+    }
 
     try {
-        // Grab configuration variables passed from your UI
+        const db = getFirestore();
         const { businessId, hourlySupportCost = 20, leadValue = 50 } = req.body;
 
         if (!businessId) {
             return res.status(400).json({ success: false, message: 'Missing businessId parameter.' });
         }
 
-        // 2. Fetch all raw chats logged by Llama 3.1 for this specific business
+        // Fetch all raw chats logged by Llama 3.1
         const chatsSnapshot = await db.collection('user_bots')
                                       .doc(businessId)
                                       .collection('chats')
@@ -40,15 +62,13 @@ export default async function handler(req, res) {
         let totalLeadsCaptured = 0;
         let totalMessagesProcessed = 0;
 
-        // If no chats exist yet, return an empty but clean state to your UI
         if (totalChats === 0) {
             return res.status(200).json({
                 success: true,
-                metrics: { totalConversations: 0, resolutionRate: 0, financialSavings: 0, pipelineValue: 0, netROI: 0 }
+                metrics: { totalConversations: 0, resolutionRate: 0, estimatedHoursSaved: 0, financialSavings: 0, pipelineValue: 0, netROI: 0 }
             });
         }
 
-        // 3. Scan through every single conversation record
         chatsSnapshot.forEach(doc => {
             const chatData = doc.data();
             const messages = chatData.messages || [];
@@ -58,33 +78,27 @@ export default async function handler(req, res) {
             let escalatedToHuman = false;
 
             messages.forEach(msg => {
-                // Check if the website visitor sent an email or phone number
                 if (msg.sender === 'user') {
                     if (emailRegex.test(msg.text) || phoneRegex.test(msg.text)) {
                         containsLeadInfo = true;
                     }
                 }
-                
-                // Check if the chat was escalated (user clicked human backup or bot triggered a handoff text)
                 if (chatData.isEscalated || (msg.text && msg.text.toLowerCase().includes('transferring to a human'))) {
                     escalatedToHuman = true;
                 }
             });
 
             if (containsLeadInfo) totalLeadsCaptured++;
-            if (!escalatedToHuman) resolvedByAI++; // If it never needed a human, Llama 3.1 resolved it successfully!
+            if (!escalatedToHuman) resolvedByAI++;
         });
 
-        // 4. Run our Math Formulas
+        // Calculations
         const resolutionRate = parseFloat(((resolvedByAI / totalChats) * 100).toFixed(1));
-        
-        // Every message processed saves roughly 1.5 minutes of live human typing speed
         const hoursSaved = (totalMessagesProcessed * 1.5) / 60;
         const totalCostSaved = parseFloat((hoursSaved * hourlySupportCost).toFixed(2));
         const leadValueGenerated = totalLeadsCaptured * leadValue;
         const totalROIEarned = totalCostSaved + leadValueGenerated;
 
-        // 5. Structure the finalized analytics payload
         const metricsPayload = {
             totalConversations: totalChats,
             resolutionRate: resolutionRate,
@@ -96,14 +110,13 @@ export default async function handler(req, res) {
             lastCalculated: Timestamp.now()
         };
 
-        // 6. Save the snapshot back to Firestore under a dedicated analytics document
+        // Cache snapshot
         await db.collection('user_bots')
                 .doc(businessId)
                 .collection('analytics')
                 .doc('roi_dashboard')
                 .set(metricsPayload, { merge: true });
 
-        // Return the fresh stats directly back to your UI request
         return res.status(200).json({ success: true, metrics: metricsPayload });
 
     } catch (error) {
