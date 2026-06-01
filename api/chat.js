@@ -44,7 +44,7 @@ export default async function handler(req, res) {
                 { role: "system", content: context },
                 { role: "user", content: question }
             ],
-            model: "llama3-8b-8192", // Meta Llama 3.1 8B Instruct
+     model: "llama-3.1-8b-instant",
             temperature: 0.5,
         });
 
