@@ -2,7 +2,6 @@ import Groq from 'groq-sdk';
 import { initializeApp } from 'firebase/app';
 import { getFirestore, doc, getDoc } from 'firebase/firestore';
 
-// 1. Firebase configuration
 const firebaseConfig = {
     apiKey: "AIzaSyD0q99R9wn-r6e5aygL2zzg7e-Gc439ssY",
     authDomain: "cometchat-ai-platform.firebaseapp.com",
@@ -13,68 +12,46 @@ const firebaseConfig = {
 };
 
 export default async function handler(req, res) {
-    // 🌟 CRITICAL: Set CORS headers immediately before ANY other logic runs
+    // 🌟 1. SET HEADERS IMMEDIATELY
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
+    res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version, Authorization');
 
-    // 🌟 CRITICAL: Answer the browser's preflight check right here and stop
+    // 🌟 2. HANDLE PREFLIGHT IMMEDIATELY
     if (req.method === 'OPTIONS') {
-        return res.status(200).end();
-    }
-
-    if (req.method !== 'POST') {
-        return res.status(405).json({ message: 'Method Not Allowed' });
+        res.status(200).end();
+        return;
     }
 
     try {
         const { businessId, question } = req.body;
 
-        if (!businessId || !question) {
-            return res.status(400).json({ answer: "Missing required fields." });
-        }
-
-        // Initialize Firebase and Groq safely inside the POST block
+        // 🌟 3. INITIALIZE CLIENTS INSIDE THE TRY BLOCK
         const app = initializeApp(firebaseConfig);
         const db = getFirestore(app);
-        
-        // Ensure your Groq API key variable is named exactly like this in Vercel
         const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-        // Fetch the context text from Firestore
         const docRef = doc(db, "user_bots", businessId);
         const docSnap = await getDoc(docRef);
 
-        let systemContext = "You are a helpful customer service assistant.";
+        let context = "You are a helpful assistant.";
         if (docSnap.exists()) {
-            const botData = docSnap.data();
-            if (botData.context) {
-                systemContext = `You are a professional customer support assistant. 
-                Use ONLY the following context to answer the user's questions:
-                ---
-                ${botData.context}
-                ---
-                If the answer cannot be found in the context, politely say you don't know.`;
-            }
+            context = docSnap.data().context || context;
         }
 
-        // Call Meta Llama 3.1 via Groq
         const chatCompletion = await groq.chat.completions.create({
             messages: [
-                { role: "system", content: systemContext },
+                { role: "system", content: context },
                 { role: "user", content: question }
             ],
-            model: "llama3-8b-8192", // Official ID for Meta Llama 3.1 8B Instruct on Groq
-            temperature: 0.2
+            model: "llama3-8b-8192", // Meta Llama 3.1 8B Instruct
+            temperature: 0.5,
         });
 
-        const replyText = chatCompletion.choices[0]?.message?.content || "I couldn't process that.";
-        return res.status(200).json({ answer: replyText });
-
+        res.status(200).json({ answer: chatCompletion.choices[0].message.content });
     } catch (error) {
-        console.error("Server Error:", error);
-        // Returning a 200 even on error during testing ensures your widget 
-        // will print the error message instead of triggering a CORS block!
-        return res.status(200).json({ answer: `Backend Error: ${error.message}` });
+        console.error("Crash Log:", error);
+        // We return 200 here so the widget shows the error text instead of a CORS block
+        res.status(200).json({ answer: `Backend Error: ${error.message}` });
     }
 }
