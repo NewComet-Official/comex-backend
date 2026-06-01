@@ -1,32 +1,18 @@
 import { initializeApp, cert, getApps } from 'firebase-admin/app';
 import { getFirestore, Timestamp } from 'firebase-admin/firestore';
 
-// 1. SAFELY INITIALIZE FIREBASE ADMIN
-// If Vercel environment variables are missing, this fallback string prevents an immediate JSON parse crash
-const serviceAccountRaw = process.env.FIREBASE_SERVICE_ACCOUNT_KEY || "{}";
-let serviceAccount;
-try {
-    serviceAccount = JSON.parse(serviceAccountRaw);
-} catch (e) {
-    serviceAccount = {};
-}
-
-if (!getApps().length && serviceAccount.project_id) {
-    initializeApp({ credential: cert(serviceAccount) });
-}
-
-// Regular expressions to check for Lead Tracking
+// Move regex outside, but keep ALL database logic inside the handler
 const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
 const phoneRegex = /(\+?\d{1,4}[\s-])?\(?\d{3}\)?[\s-]?\d{3}[\s-]?\d{4}/;
 
 export default async function handler(req, res) {
-    // 2. FORCE CORS HEADERS TO SEND IMMEDIATELY
+    // 1. FORCE HEADERS INSTANTLY - NO CODE RUNS BEFORE THIS
     res.setHeader('Access-Control-Allow-Credentials', true);
     res.setHeader('Access-Control-Allow-Origin', '*'); 
     res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
     res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version');
 
-    // Handle preflight browser check safely
+    // 2. INTERCEPT PREFLIGHT BROWSER CHECKS
     if (req.method === 'OPTIONS') {
         return res.status(200).end();
     }
@@ -35,15 +21,17 @@ export default async function handler(req, res) {
         return res.status(405).json({ success: false, message: 'Method Not Allowed' });
     }
 
-    // 3. CHECK IF ENVIRONMENT VARIABLES ARE CONFIGURED BEFORE ACCESSING DB
-    if (!process.env.FIREBASE_SERVICE_ACCOUNT_KEY) {
-        return res.status(500).json({ 
-            success: false, 
-            message: 'Backend Configuration Error: FIREBASE_SERVICE_ACCOUNT_KEY is missing in Vercel settings.' 
-        });
-    }
-
     try {
+        // 3. INITIALIZE FIREBASE SAFELY INSIDE THE TRY/CATCH
+        if (!process.env.FIREBASE_SERVICE_ACCOUNT_KEY) {
+            throw new Error('Vercel Environment Error: FIREBASE_SERVICE_ACCOUNT_KEY is missing.');
+        }
+
+        if (!getApps().length) {
+            const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
+            initializeApp({ credential: cert(serviceAccount) });
+        }
+        
         const db = getFirestore();
         const { businessId, hourlySupportCost = 20, leadValue = 50 } = req.body;
 
@@ -51,7 +39,7 @@ export default async function handler(req, res) {
             return res.status(400).json({ success: false, message: 'Missing businessId parameter.' });
         }
 
-        // Fetch all raw chats logged by Llama 3.1
+        // 4. EXECUTE CALCULATIONS
         const chatsSnapshot = await db.collection('user_bots')
                                       .doc(businessId)
                                       .collection('chats')
@@ -120,7 +108,8 @@ export default async function handler(req, res) {
         return res.status(200).json({ success: true, metrics: metricsPayload });
 
     } catch (error) {
-        console.error("ROI Calc Error:", error);
+        console.error("Backend Error Caught:", error);
+        // Safely return the error so the frontend can read it instead of crashing
         return res.status(500).json({ success: false, message: error.message });
     }
 }
