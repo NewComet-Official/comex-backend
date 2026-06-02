@@ -1,115 +1,102 @@
-import { initializeApp, cert, getApps } from 'firebase-admin/app';
-import { getFirestore, Timestamp } from 'firebase-admin/firestore';
+import { initializeApp } from 'firebase/app';
+import { getFirestore, collection, getDocs } from 'firebase/firestore';
 
-// Move regex outside, but keep ALL database logic inside the handler
-const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
-const phoneRegex = /(\+?\d{1,4}[\s-])?\(?\d{3}\)?[\s-]?\d{3}[\s-]?\d{4}/;
+// Your static Firebase web application settings configuration
+const firebaseConfig = {
+    apiKey: "AIzaSyD0q99R9wn-r6e5aygL2zzg7e-Gc439ssY",
+    authDomain: "cometchat-ai-platform.firebaseapp.com",
+    projectId: "cometchat-ai-platform",
+    storageBucket: "cometchat-ai-platform.firebasestorage.app",
+    messagingSenderId: "604438924597",
+    appId: "1:604438924597:web:a180d59f7f00385138507c"
+};
 
 export default async function handler(req, res) {
-    // 1. FORCE HEADERS INSTANTLY - NO CODE RUNS BEFORE THIS
-    res.setHeader('Access-Control-Allow-Credentials', true);
-    res.setHeader('Access-Control-Allow-Origin', '*'); 
+    // 🌐 HANDLE CORS CROSS-ORIGIN RESOURCE SHARING HEADERS
+    res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
-    res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version');
+    res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version, Authorization');
 
-    // 2. INTERCEPT PREFLIGHT BROWSER CHECKS
     if (req.method === 'OPTIONS') {
-        return res.status(200).end();
-    }
-
-    if (req.method !== 'POST') {
-        return res.status(405).json({ success: false, message: 'Method Not Allowed' });
+        res.status(200).end();
+        return;
     }
 
     try {
-        // 3. INITIALIZE FIREBASE SAFELY INSIDE THE TRY/CATCH
-        if (!process.env.FIREBASE_SERVICE_ACCOUNT_KEY) {
-            throw new Error('Vercel Environment Error: FIREBASE_SERVICE_ACCOUNT_KEY is missing.');
-        }
-
-        if (!getApps().length) {
-            const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
-            initializeApp({ credential: cert(serviceAccount) });
-        }
-        
-        const db = getFirestore();
-        const { businessId, hourlySupportCost = 20, leadValue = 50 } = req.body;
+        const { businessId } = req.body;
 
         if (!businessId) {
-            return res.status(400).json({ success: false, message: 'Missing businessId parameter.' });
+            return res.status(200).json({ success: false, message: "Missing businessId parameter." });
         }
 
-        // 4. EXECUTE CALCULATIONS
-        const chatsSnapshot = await db.collection('user_bots')
-                                      .doc(businessId)
-                                      .collection('chats')
-                                      .get();
+        // Initialize Firebase
+        const app = initializeApp(firebaseConfig);
+        const db = getFirestore(app);
 
-        let totalChats = chatsSnapshot.size;
-        let resolvedByAI = 0;
-        let totalLeadsCaptured = 0;
-        let totalMessagesProcessed = 0;
+        // Fetch all chat logs from the bot's sub-collection
+        const chatsSubcollectionRef = collection(db, "user_bots", businessId, "chats");
+        const querySnapshot = await getDocs(chatsSubcollectionRef);
 
-        if (totalChats === 0) {
-            return res.status(200).json({
-                success: true,
-                metrics: { totalConversations: 0, resolutionRate: 0, estimatedHoursSaved: 0, financialSavings: 0, pipelineValue: 0, netROI: 0 }
-            });
-        }
+        let genuineChatCount = 0;
+        let leadCount = 0;
+        let totalChatsParsed = 0;
 
-        chatsSnapshot.forEach(doc => {
-            const chatData = doc.data();
-            const messages = chatData.messages || [];
-            totalMessagesProcessed += messages.length;
+        // 📊 INTERPRET DATA SMARTER
+        querySnapshot.forEach((docSnap) => {
+            const chatData = docSnap.data();
+            totalChatsParsed++;
 
-            let containsLeadInfo = false;
-            let escalatedToHuman = false;
+            // Check our new smart analytical parameter flag
+            // Fallback to true if it's an old legacy log without the key so old data stays intact
+            const isGenuine = chatData.isGenuineQuery !== undefined ? chatData.isGenuineQuery : true;
 
-            messages.forEach(msg => {
-                if (msg.sender === 'user') {
-                    if (emailRegex.test(msg.text) || phoneRegex.test(msg.text)) {
-                        containsLeadInfo = true;
-                    }
-                }
-                if (chatData.isEscalated || (msg.text && msg.text.toLowerCase().includes('transferring to a human'))) {
-                    escalatedToHuman = true;
-                }
-            });
+            if (isGenuine) {
+                genuineChatCount++;
+            }
 
-            if (containsLeadInfo) totalLeadsCaptured++;
-            if (!escalatedToHuman) resolvedByAI++;
+            // Check if a lead (email/phone) was captured during this conversation
+            if (chatData.isLeadCaptured || chatData.leadCaptured) {
+                leadCount++;
+            }
         });
 
-        // Calculations
-        const resolutionRate = parseFloat(((resolvedByAI / totalChats) * 100).toFixed(1));
-        const hoursSaved = (totalMessagesProcessed * 1.5) / 60;
-        const totalCostSaved = parseFloat((hoursSaved * hourlySupportCost).toFixed(2));
-        const leadValueGenerated = totalLeadsCaptured * leadValue;
-        const totalROIEarned = totalCostSaved + leadValueGenerated;
+        // 📈 BUSINESS METRICS CALCULATIONS (Running ONLY on genuine interactions)
+        // Adjust these variables based on your actual business estimates
+        const minutesSavedPerChat = 15; // Assume each real customer query saves 15 mins of human work
+        const hourlySupportCost = 20;   // Assume a customer support agent costs $20/hour
+        const averageLeadValue = 50;    // Assume capturing a customer lead is worth $50 to the business
 
-        const metricsPayload = {
-            totalConversations: totalChats,
-            resolutionRate: resolutionRate,
-            leadsCaptured: totalLeadsCaptured,
-            estimatedHoursSaved: parseFloat(hoursSaved.toFixed(1)),
-            financialSavings: totalCostSaved,
-            pipelineValue: leadValueGenerated,
-            netROI: totalROIEarned,
-            lastCalculated: Timestamp.now()
-        };
+        // 1. Calculate hours saved
+        const estimatedHoursSaved = parseFloat(((genuineChatCount * minutesSavedPerChat) / 60).toFixed(1));
 
-        // Cache snapshot
-        await db.collection('user_bots')
-                .doc(businessId)
-                .collection('analytics')
-                .doc('roi_dashboard')
-                .set(metricsPayload, { merge: true });
+        // 2. Calculate customer support labor costs saved
+        const supportCostSavings = genuineChatCount * ((minutesSavedPerChat / 60) * hourlySupportCost);
 
-        return res.status(200).json({ success: true, metrics: metricsPayload });
+        // 3. Calculate potential revenue generated from captured leads
+        const potentialLeadRevenue = leadCount * averageLeadValue;
+
+        // 4. Combined total Net ROI
+        const netROI = supportCostSavings + potentialLeadRevenue;
+
+        // 5. Calculate resolution rate cleanly
+        const resolutionRate = genuineChatCount > 0 
+            ? Math.round(((genuineChatCount - leadCount) / genuineChatCount) * 100) 
+            : 100;
+
+        // Return clean metrics payload back to the frontend dashboard UI
+        res.status(200).json({
+            success: true,
+            metrics: {
+                totalConversations: totalChatsParsed,      // Total chats ever had (including tests)
+                genuineConversations: genuineChatCount,  // Real customer queries used for financial calculation
+                hoursSaved: estimatedHoursSaved,
+                moneySaved: parseFloat(netROI.toFixed(2)), // This drives your ROI $% display!
+                leadsCaptured: leadCount,
+                resolutionRate: resolutionRate
+            }
+        });
 
     } catch (error) {
-        console.error("Backend Error Caught:", error);
-        // Safely return the error so the frontend can read it instead of crashing
-        return res.status(500).json({ success: false, message: error.message });
+        res.status(200).json({ success: false, message: `ROI Calculation Backend Error: ${error.message}` });
     }
 }
