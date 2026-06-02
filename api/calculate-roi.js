@@ -84,16 +84,17 @@ export default async function handler(req, res) {
             : 100;
 
         // Return clean metrics payload back to the frontend dashboard UI
+       // ── REPLACE THE BOTTOM OF YOUR api/calculate-roi FILE WITH THIS ──
+
+        // Return flat metrics payload back to the frontend dashboard UI
         res.status(200).json({
             success: true,
-            metrics: {
-                totalConversations: totalChatsParsed,      // Total chats ever had (including tests)
-                genuineConversations: genuineChatCount,  // Real customer queries used for financial calculation
-                hoursSaved: estimatedHoursSaved,
-                moneySaved: parseFloat(netROI.toFixed(2)), // This drives your ROI $% display!
-                leadsCaptured: leadCount,
-                resolutionRate: resolutionRate
-            }
+            totalConversations: totalChatsParsed,      
+            genuineConversations: genuineChatCount,  
+            hoursSaved: estimatedHoursSaved,
+            moneySaved: parseFloat(netROI.toFixed(2)), // Matches old frontend data.moneySaved
+            leadsCaptured: leadCount,
+            resolutionRate: resolutionRate
         });
 
     } catch (error) {
