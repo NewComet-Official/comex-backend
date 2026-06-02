@@ -22,7 +22,6 @@ export default async function handler(req, res) {
     }
 
     try {
-        // Accept either 'message' (from your test panel) or 'question' (from your older formats)
         const { businessId, message, question, conversationId } = req.body;
         const activeUserText = message || question;
 
@@ -30,41 +29,29 @@ export default async function handler(req, res) {
         const db = getFirestore(app);
         const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-        if (!businessId) {
-            return res.status(200).json({ success: false, message: "Debug Error: The widget failed to send a businessId inside the request body." });
-        }
-
-        if (!activeUserText) {
-            return res.status(200).json({ success: false, message: "Debug Error: No prompt text provided in 'message' or 'question'." });
+        if (!businessId || !activeUserText) {
+            return res.status(200).json({ success: false, message: "Missing required payload parameters." });
         }
 
         const docRef = doc(db, "user_bots", businessId);
         const docSnap = await getDoc(docRef);
 
-        let systemContext = "You are a helpful assistant.";
-        
         if (!docSnap.exists()) {
-            return res.status(200).json({ 
-                success: false,
-                message: `Debug Alert: Bot document was not found matching ID: "${businessId}".` 
-            });
+            return res.status(200).json({ success: false, message: "Bot document not found." });
         }
 
         const botData = docSnap.data();
         const activeContext = botData.context || botData.text || botData.scrapedData || "";
 
-        systemContext = `You are a professional customer support assistant. 
+        const systemContext = `You are a professional customer support assistant. 
         Use ONLY the following context to answer the user's questions:
-        ---
-        ${activeContext}
-        ---
+        ---\n${activeContext}\n---
         If the answer cannot be found in the context, politely say you don't know.`;
 
-        // 🚀 Call Groq ensuring correct schema format
         const chatCompletion = await groq.chat.completions.create({
             messages: [
                 { role: "system", content: systemContext },
-                { role: "user", content: activeUserText } // Using mapped string variable
+                { role: "user", content: activeUserText }
             ],
             model: "llama-3.1-8b-instant",
             temperature: 0.2,
@@ -72,17 +59,24 @@ export default async function handler(req, res) {
 
         const botReply = chatCompletion.choices[0].message.content;
 
-        // 📊 AUTOMATIC FIRESTORE LOGGING PIPELINE
-        // Checks if a message looks like a captured customer lead conversion
-        const textToAnalyze = activeUserText.toLowerCase();
-        const containsLeadIndicator = textToAnalyze.includes('@') || 
-                                     textToAnalyze.includes('.com') || 
-                                     textToAnalyze.match(/\b\d{10}\b/);
+        // 🧠 INTENT DETECTION GUARD
+        const cleanMsg = activeUserText.toLowerCase().trim();
+        const structuralGreetings = ['hi', 'hello', 'hey', 'test', 'hola', 'yo', 'sup'];
+        
+        // A chat is genuine ONLY if it's not a quick greeting AND contains real text length
+        let isGenuine = true;
+        if (structuralGreetings.includes(cleanMsg) || cleanMsg.length <= 4) {
+            isGenuine = false;
+        }
 
-        // Build a structured log matching what your ROI loop reads
+        // Check for lead acquisition
+        const containsLeadIndicator = cleanMsg.includes('@') || cleanMsg.includes('.com') || cleanMsg.match(/\b\d{10}\b/);
+
         const chatLogPayload = {
             conversationId: conversationId || `session-${Date.now()}`,
             isEscalated: false,
+            isGenuineQuery: isGenuine, // 👈 New analytical parameter tracking flag
+            isLeadCaptured: !!containsLeadIndicator,
             timestamp: new Date().toISOString(),
             messages: [
                 { sender: "user", text: activeUserText },
@@ -90,15 +84,13 @@ export default async function handler(req, res) {
             ]
         };
 
-        // Write the log directly into the chats subcollection of this specific bot
         const chatsSubcollectionRef = collection(db, "user_bots", businessId, "chats");
         await addDoc(chatsSubcollectionRef, chatLogPayload);
 
-        // Send standard payload structure back to the frontend sandbox
         res.status(200).json({ 
             success: true, 
             reply: botReply,
-            answer: botReply // Keeps backwards compatibility for older versions
+            answer: botReply 
         });
 
     } catch (error) {
