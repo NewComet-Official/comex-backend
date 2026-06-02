@@ -1,6 +1,6 @@
 import Groq from 'groq-sdk';
 import { initializeApp } from 'firebase/app';
-import { getFirestore, doc, getDoc } from 'firebase/firestore';
+import { getFirestore, doc, getDoc, collection, addDoc } from 'firebase/firestore';
 
 const firebaseConfig = {
     apiKey: "AIzaSyD0q99R9wn-r6e5aygL2zzg7e-Gc439ssY",
@@ -22,15 +22,20 @@ export default async function handler(req, res) {
     }
 
     try {
-        const { businessId, question } = req.body;
+        // Accept either 'message' (from your test panel) or 'question' (from your older formats)
+        const { businessId, message, question, conversationId } = req.body;
+        const activeUserText = message || question;
 
         const app = initializeApp(firebaseConfig);
         const db = getFirestore(app);
         const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-        // 🔍 Debug log checking
         if (!businessId) {
-            return res.status(200).json({ answer: "Debug Error: The widget failed to send a businessId inside the request body." });
+            return res.status(200).json({ success: false, message: "Debug Error: The widget failed to send a businessId inside the request body." });
+        }
+
+        if (!activeUserText) {
+            return res.status(200).json({ success: false, message: "Debug Error: No prompt text provided in 'message' or 'question'." });
         }
 
         const docRef = doc(db, "user_bots", businessId);
@@ -38,26 +43,16 @@ export default async function handler(req, res) {
 
         let systemContext = "You are a helpful assistant.";
         
-        // 🌟 CHECK 1: Does the document even exist in Firestore?
         if (!docSnap.exists()) {
             return res.status(200).json({ 
-                answer: `Debug Alert: Connected to database successfully, but NO bot document was found matching the ID: "${businessId}". Check if this matches your Firestore collection ID.` 
+                success: false,
+                message: `Debug Alert: Bot document was not found matching ID: "${businessId}".` 
             });
         }
 
         const botData = docSnap.data();
-        
-        // 🌟 CHECK 2: Look for the exact text data key
-        // We will check for 'context', 'text', or 'scrapedData' automatically.
-        const activeContext = botData.context || botData.text || botData.scrapedData;
+        const activeContext = botData.context || botData.text || botData.scrapedData || "";
 
-        if (!activeContext) {
-            return res.status(200).json({ 
-                answer: `Debug Alert: Found document for "${businessId}", but the fields ('context', 'text', 'scrapedData') are empty! Available keys in your database are: ${Object.keys(botData).join(', ')}` 
-            });
-        }
-
-        // Build system rules safely using the data found
         systemContext = `You are a professional customer support assistant. 
         Use ONLY the following context to answer the user's questions:
         ---
@@ -65,17 +60,48 @@ export default async function handler(req, res) {
         ---
         If the answer cannot be found in the context, politely say you don't know.`;
 
+        // 🚀 Call Groq ensuring correct schema format
         const chatCompletion = await groq.chat.completions.create({
             messages: [
                 { role: "system", content: systemContext },
-                { role: "user", content: question }
+                { role: "user", content: activeUserText } // Using mapped string variable
             ],
             model: "llama-3.1-8b-instant",
             temperature: 0.2,
         });
 
-        res.status(200).json({ answer: chatCompletion.choices[0].message.content });
+        const botReply = chatCompletion.choices[0].message.content;
+
+        // 📊 AUTOMATIC FIRESTORE LOGGING PIPELINE
+        // Checks if a message looks like a captured customer lead conversion
+        const textToAnalyze = activeUserText.toLowerCase();
+        const containsLeadIndicator = textToAnalyze.includes('@') || 
+                                     textToAnalyze.includes('.com') || 
+                                     textToAnalyze.match(/\b\d{10}\b/);
+
+        // Build a structured log matching what your ROI loop reads
+        const chatLogPayload = {
+            conversationId: conversationId || `session-${Date.now()}`,
+            isEscalated: false,
+            timestamp: new Date().toISOString(),
+            messages: [
+                { sender: "user", text: activeUserText },
+                { sender: "bot", text: botReply }
+            ]
+        };
+
+        // Write the log directly into the chats subcollection of this specific bot
+        const chatsSubcollectionRef = collection(db, "user_bots", businessId, "chats");
+        await addDoc(chatsSubcollectionRef, chatLogPayload);
+
+        // Send standard payload structure back to the frontend sandbox
+        res.status(200).json({ 
+            success: true, 
+            reply: botReply,
+            answer: botReply // Keeps backwards compatibility for older versions
+        });
+
     } catch (error) {
-        res.status(200).json({ answer: `Backend Error: ${error.message}` });
+        res.status(200).json({ success: false, message: `Backend Error: ${error.message}` });
     }
 }
