@@ -17,15 +17,15 @@ export default async function handler(req, res) {
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
     if (req.method === 'OPTIONS') return res.status(200).end();
-    if (req.method !== 'POST') return res.status(405).json({ success: false, message: 'Method Not Allowed' });
+    if (req.method !== 'POST') return res.status(405).json({ message: 'Method Not Allowed' });
 
     try {
-        // Accept either 'question' (widget) or 'message' (dashboard index.html)
+        // Fallback checks for both standard dashboards ('message') and custom widgets ('question')
         const { businessId, question, message } = req.body;
-        const queryText = question || message;
+        const promptText = question || message;
 
-        if (!businessId || !queryText) {
-            return res.status(400).json({ success: false, answer: "Missing payload details.", reply: "Missing payload details." });
+        if (!businessId || !promptText) {
+            return res.status(400).json({ success: false, answer: "Missing prompt payload parameters." });
         }
 
         const app = initializeApp(firebaseConfig);
@@ -45,25 +45,27 @@ export default async function handler(req, res) {
             }
         }
 
+        // UPGRADED TO LLAMA 3.1 PRODUCTION MODEL EXPLICITLY
         const chatCompletion = await groq.chat.completions.create({
             messages: [
                 { role: "system", content: systemContext },
-                { role: "user", content: queryText }
+                { role: "user", content: promptText }
             ],
-            model: "llama3-8b-8192",
+            model: "llama-3.1-8b-instant",
             temperature: 0.2
         });
 
         const replyText = chatCompletion.choices[0]?.message?.content || "No response generated.";
         
-        // Return dual properties to satisfy both frontend callers seamlessly
+        // Return both properties so it satisfies both widget.js and your index.html playground 
         return res.status(200).json({ 
-            success: true, 
+            success: true,
             answer: replyText, 
             reply: replyText 
         });
+
     } catch (error) {
-        console.error("Error:", error);
-        return res.status(500).json({ success: false, answer: "Internal Server Error", reply: "Internal Server Error" });
+        console.error("Chat Error:", error);
+        return res.status(500).json({ success: false, answer: "Internal server processing fault." });
     }
 }
