@@ -1,5 +1,4 @@
 (async function() {
-    // 1. Pull core identifier out of host tag setup 
     const scriptTag = document.currentScript;
     const businessId = scriptTag.getAttribute('data-business-id');
 
@@ -8,13 +7,13 @@
         return;
     }
 
-    // Default configuration objects fallback rules
+    // Baseline fallback defaults if the document has no custom entries yet
     let config = {
         name: "AI Assistant",
         position: "bottom-right",
         logoBase64: null,
         designConfig: {
-            themeColor: "#111827",
+            themeColor: "#0f172a",
             typebarSize: "standard",
             sendButtonStyle: "icon",
             loadingAnim: "dots",
@@ -22,7 +21,7 @@
         }
     };
 
-    // 2. Query cloud-saved customized matrix profiles asynchronously 
+    // 1. Asynchronously load customization profiles directly from your backend
     try {
         const response = await fetch(`https://comex-backend.vercel.app/api/config?businessId=${businessId}`);
         const result = await response.json();
@@ -33,12 +32,12 @@
             config.designConfig = { ...config.designConfig, ...result.designConfig };
         }
     } catch (err) {
-        console.warn("Comex Widget: Config profile network error. Using default fallbacks.", err);
+        console.warn("Comex Widget: Could not fetch configuration settings, using defaults.", err);
     }
 
     const { themeColor, typebarSize, sendButtonStyle, loadingAnim, voiceEnabled } = config.designConfig;
 
-    // Define alignment positioning variables
+    // Determine target location window rules based on position property parameters
     let bubblePositioningStyles = '';
     let windowPositioningStyles = '';
 
@@ -56,7 +55,7 @@
         windowPositioningStyles = 'top: 100px; left: 25px;';
     }
 
-    // 3. Inject fully dynamic CSS elements tailored to matching inputs
+    // 2. Inject completely variable styling values into host head target nodes
     const style = document.createElement('style');
     style.innerHTML = `
         #cc-widget-bubble {
@@ -67,7 +66,7 @@
             transition: 0.3s; z-index: 999999; user-select: none; color: white;
             background-size: cover; background-position: center; border: 2px solid #ffffff;
         }
-        #cc-widget-bubble:hover { transform: scale(1.05); box-shadow: 0 15px 35px rgba(0,0,0,0.3); }
+        #cc-widget-bubble:hover { transform: scale(1.05); }
         
         #cc-widget-window {
             position: fixed; ${windowPositioningStyles}
@@ -76,13 +75,15 @@
             flex-direction: column; overflow: hidden; box-shadow: 0 20px 40px rgba(0,0,0,0.15);
             z-index: 999999; font-family: system-ui, sans-serif; color: #111827;
         }
-        .cc-header { padding: 20px; background: #f9fafb; border-bottom: 1px solid #e5e7eb; font-weight: 700; font-size: 15px; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+        .cc-header { padding: 20px; background: #f9fafb; border-bottom: 1px solid #e5e7eb; font-weight: 700; font-size: 15px; display: flex; align-items: center; justify-content: space-between; }
         .cc-chatbox { flex: 1; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; background: #ffffff; }
         .cc-bubble { max-width: 85%; padding: 12px 16px; border-radius: 14px; font-size: 14px; line-height: 1.4; }
         .cc-user { background: ${themeColor}; color: #ffffff; align-self: flex-end; border-bottom-right-radius: 4px; }
         .cc-ai { background: #f3f4f6; color: #111827; align-self: flex-start; border-bottom-left-radius: 4px; border: 1px solid #e5e7eb; }
         
         .cc-footer { padding: 15px; background: #f9fafb; border-top: 1px solid #e5e7eb; display: flex; gap: 10px; align-items: center; }
+        
+        /* Layout Customizations for Input Fields */
         .cc-input { 
             flex: 1; background: #ffffff; border: 1px solid #d1d5db; color: #111827; outline: none; 
             padding: ${typebarSize === 'large' ? '14px 18px' : '10px 14px'};
@@ -91,6 +92,7 @@
         }
         .cc-input:focus { border-color: ${themeColor}; }
         
+        /* Customizations for Action Trigger Button layout presets */
         .cc-btn { 
             background: ${themeColor}; border: none; color: #ffffff; cursor: pointer; font-weight: bold; display: flex; align-items: center; justify-content: center;
             padding: ${sendButtonStyle === 'pill' ? '10px 20px' : '0 16px'};
@@ -99,13 +101,13 @@
         }
         
         .cc-mic-btn {
-            background: none; border: none; font-size: 18px; cursor: pointer; padding: 4px 8px; display: ${voiceEnabled ? 'block' : 'none'};
-            transition: transform 0.2s;
+            background: none; border: none; font-size: 18px; cursor: pointer; padding: 4px 8px; 
+            display: ${voiceEnabled ? 'block' : 'none'};
         }
         .cc-mic-btn.recording { color: #ef4444; animation: ccPulse 1.5s infinite; }
-        @keyframes ccPulse { 0% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.1); opacity: 0.7; } 100% { transform: scale(1); opacity: 1; } }
+        @keyframes ccPulse { 0% { transform: scale(1); } 50% { transform: scale(1.1); } 100% { transform: scale(1); } }
 
-        /* Multi-variation Loader Configurations */
+        /* Loader Animation Type Mappings */
         .cc-typing-indicator { display: none; align-self: flex-start; color: #64748b; font-size: 13px; font-style: italic; padding: 4px 12px; }
         .cc-loading-dots::after { content: ''; animation: ccDots 1.5s steps(4, end) infinite; }
         @keyframes ccDots { 0% { content: ''; } 25% { content: '.'; } 50% { content: '..'; } 75% { content: '...'; } }
@@ -116,10 +118,9 @@
     `;
     document.head.appendChild(style);
 
-    // 4. Mount Bubble Trigger Framework Element
+    // 3. Render Widget Bubble elements
     const bubble = document.createElement('div');
     bubble.id = 'cc-widget-bubble';
-    
     if (config.logoBase64) {
         bubble.style.backgroundImage = `url('${config.logoBase64}')`;
     } else {
@@ -127,7 +128,7 @@
     }
     document.body.appendChild(bubble);
 
-    // 5. Build Widget Containers
+    // 4. Create Main Chat Containers 
     const windowContainer = document.createElement('div');
     windowContainer.id = 'cc-widget-window';
     windowContainer.innerHTML = `
@@ -147,7 +148,6 @@
     `;
     document.body.appendChild(windowContainer);
 
-    // View state operations
     bubble.onclick = () => {
         windowContainer.style.display = windowContainer.style.display === 'flex' ? 'none' : 'flex';
     };
@@ -155,7 +155,7 @@
         windowContainer.style.display = 'none';
     };
 
-    // 6. Messaging Action Handler
+    // 5. Message Core Transmitter Logic
     async function sendMessage() {
         const input = document.getElementById('ccInputField');
         const chatBox = document.getElementById('ccChatBox');
@@ -168,7 +168,7 @@
         input.value = '';
         chatBox.scrollTop = chatBox.scrollHeight;
 
-        // Render loading animations mapped directly to saved selection preferences
+        // Toggle Selected Visual Loading State Matches
         typingIndicator.style.display = 'block';
         if (loadingAnim === 'spinner') {
             typingIndicator.className = 'cc-typing-indicator';
@@ -191,8 +191,7 @@
             const data = await response.json();
             typingIndicator.style.display = 'none';
             
-            const finalReply = data.reply || data.answer || "No response generated.";
-            chatBox.innerHTML += `<div class="cc-bubble cc-ai">${finalReply}</div>`;
+            chatBox.innerHTML += `<div class="cc-bubble cc-ai">${data.answer}</div>`;
         } catch (error) {
             typingIndicator.style.display = 'none';
             chatBox.innerHTML += `<div class="cc-bubble cc-ai">Connection interrupted.</div>`;
@@ -200,18 +199,16 @@
         chatBox.scrollTop = chatBox.scrollHeight;
     }
 
-    // Attach functional trigger links
     document.getElementById('ccSendBtn').onclick = sendMessage;
     document.getElementById('ccInputField').onkeypress = (e) => { if (e.key === 'Enter') sendMessage(); };
 
-    // 7. Initialize Voice Capture Engines loops if requested
+    // 6. Native Audio Recognition Engines
     if (voiceEnabled) {
         const micBtn = document.getElementById('ccMicBtn');
         const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
         
         if (SpeechRecognition) {
             const recognition = new SpeechRecognition();
-            
             micBtn.onclick = () => {
                 if (micBtn.classList.contains('recording')) {
                     recognition.stop();
@@ -220,13 +217,11 @@
                     recognition.start();
                 }
             };
-
             recognition.onresult = (e) => {
                 document.getElementById('ccInputField').value = e.results[0][0].transcript;
                 micBtn.classList.remove('recording');
                 sendMessage();
             };
-
             recognition.onerror = () => { micBtn.classList.remove('recording'); };
             recognition.onend = () => { micBtn.classList.remove('recording'); };
         }
