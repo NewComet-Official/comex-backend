@@ -1,8 +1,7 @@
 import Groq from 'groq-sdk';
 import { initializeApp } from 'firebase/app';
-import { getFirestore, doc, getDoc, collection, addDoc } from 'firebase/firestore';
+import { getFirestore, doc, getDoc } from 'firebase/firestore';
 
-// Your static Firebase web application settings configuration
 const firebaseConfig = {
     apiKey: "AIzaSyD0q99R9wn-r6e5aygL2zzg7e-Gc439ssY",
     authDomain: "cometchat-ai-platform.firebaseapp.com",
@@ -13,122 +12,58 @@ const firebaseConfig = {
 };
 
 export default async function handler(req, res) {
-    // 🌐 HANDLE CORS CROSS-ORIGIN RESOURCE SHARING HEADERS FOR THE CHAT WIDGET
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
-    res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version, Authorization');
+    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
-    // Handle standard browser preflight request requirements
-    if (req.method === 'OPTIONS') {
-        res.status(200).end();
-        return;
-    }
+    if (req.method === 'OPTIONS') return res.status(200).end();
+    if (req.method !== 'POST') return res.status(405).json({ success: false, message: 'Method Not Allowed' });
 
     try {
-        // Destructure incoming attributes sent by either your dashboard sandbox panel or live code script
-        const { businessId, message, question, conversationId } = req.body;
-        
-        // 🛠️ PARAMETER MAPPING: Fallback fallback mechanism to keep compatibility across versions
-        const activeUserText = message || question;
+        // Accept either 'question' (widget) or 'message' (dashboard index.html)
+        const { businessId, question, message } = req.body;
+        const queryText = question || message;
 
-        // Initialize connection sessions safely inside the environment execution space
+        if (!businessId || !queryText) {
+            return res.status(400).json({ success: false, answer: "Missing payload details.", reply: "Missing payload details." });
+        }
+
         const app = initializeApp(firebaseConfig);
         const db = getFirestore(app);
         const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-        // Guard validation to shield the script execution against missing arguments
-        if (!businessId) {
-            return res.status(200).json({ 
-                success: false, 
-                message: "Debug Error: The widget failed to send a businessId inside the request body." 
-            });
-        }
-
-        if (!activeUserText) {
-            return res.status(200).json({ 
-                success: false, 
-                message: "Debug Error: No prompt text provided in 'message' or 'question' parameter attributes." 
-            });
-        }
-
-        // Fetch corresponding document records for context injection parameters
         const docRef = doc(db, "user_bots", businessId);
         const docSnap = await getDoc(docRef);
 
-        if (!docSnap.exists()) {
-            return res.status(200).json({ 
-                success: false,
-                message: `Debug Alert: Bot document was not found matching ID: "${businessId}". Check your Firestore collection path parameters.` 
-            });
+        let systemContext = "You are a helpful customer service assistant.";
+        if (docSnap.exists()) {
+            const botData = docSnap.data();
+            if (botData.knowledgeContext && botData.knowledgeContext.systemPrompt) {
+                systemContext = botData.knowledgeContext.systemPrompt;
+            } else if (botData.context) {
+                systemContext = `You are a helpful customer support assistant. Use this context: ${botData.context}`;
+            }
         }
 
-        const botData = docSnap.data();
-        
-        // Dynamic key detection logic targeting business background text files
-        const activeContext = botData.context || botData.text || botData.scrapedData || "";
-
-        // Establish boundaries for system behavioral instruction prompt profiles
-        const systemContext = `You are a professional customer support assistant. 
-        Use ONLY the following context to answer the user's questions:
-        ---
-        ${activeContext}
-        ---
-        If the answer cannot be found in the context, politely say you don't know.`;
-
-        // 🚀 REQUEST GENERATION PIPELINE - Formatted properly with explicit system and content attributes
         const chatCompletion = await groq.chat.completions.create({
             messages: [
                 { role: "system", content: systemContext },
-                { role: "user", content: activeUserText } 
+                { role: "user", content: queryText }
             ],
-            model: "llama-3.1-8b-instant",
-            temperature: 0.2,
+            model: "llama3-8b-8192",
+            temperature: 0.2
         });
 
-        const botReply = chatCompletion.choices[0].message.content;
-
-        // 🧠 SMART INTENT DETECTION ENGINE
-        const cleanMsg = activeUserText.toLowerCase().trim();
-        const structuralGreetings = ['hi', 'hello', 'hey', 'test', 'hola', 'yo', 'sup', 'greetings', 'hi there'];
+        const replyText = chatCompletion.choices[0]?.message?.content || "No response generated.";
         
-        // A chat interaction is tagged as genuine ONLY if it is not a casual greeting and has baseline content length
-        let isGenuine = true;
-        if (structuralGreetings.includes(cleanMsg) || cleanMsg.length <= 4) {
-            isGenuine = false;
-        }
-
-        // Check if the user text patterns suggest customer lead contact info entry points
-        const containsLeadIndicator = cleanMsg.includes('@') || cleanMsg.includes('.com') || cleanMsg.match(/\b\d{10}\b/);
-
-        // Build a structured historical tracking footprint log to submit into analytics tracking collections
-        const chatLogPayload = {
-            conversationId: conversationId || `session-${Date.now()}`,
-            isEscalated: false,
-            isGenuineQuery: isGenuine, 
-            isLeadCaptured: !!containsLeadIndicator,
-            timestamp: new Date().toISOString(),
-            messages: [
-                { sender: "user", text: activeUserText },
-                { sender: "bot", text: botReply }
-            ]
-        };
-
-        // Write historical conversation properties dynamically into the nested target subcollection
-        const chatsSubcollectionRef = collection(db, "user_bots", businessId, "chats");
-        await addDoc(chatsSubcollectionRef, chatLogPayload);
-
-        // Return a structural wrapper response body layout providing cross-version property interfaces
-        res.status(200).json({ 
+        // Return dual properties to satisfy both frontend callers seamlessly
+        return res.status(200).json({ 
             success: true, 
-            reply: botReply,
-            answer: botReply 
+            answer: replyText, 
+            reply: replyText 
         });
-
     } catch (error) {
-        // Clean tracking trace returns for runtime exceptions encountered inside execution steps
-        res.status(200).json({ 
-            success: false, 
-            message: `Backend Error: ${error.message}` 
-        });
+        console.error("Error:", error);
+        return res.status(500).json({ success: false, answer: "Internal Server Error", reply: "Internal Server Error" });
     }
 }
