@@ -29,7 +29,7 @@ export default async function handler(req, res) {
         const docSnap = await getDoc(docRef);
 
         if (!docSnap.exists()) {
-            return res.status(404).json({ success: false, error: "Agent not found." });
+            return res.status(404).json({ success: false, error: "Configuration context profile not found." });
         }
 
         const botData = docSnap.data();
@@ -38,10 +38,11 @@ export default async function handler(req, res) {
             name: botData.name || "AI Assistant",
             position: botData.position || "bottom-right",
             logoBase64: botData.logoBase64 || null,
+            // Delivers all your customized design selectors securely
             designConfig: botData.designConfig || {}
         });
     } catch (error) {
         console.error("Config Fetch Error:", error);
-        return res.status(500).json({ success: false, error: "Internal Server Error" });
+        return res.status(500).json({ success: false, error: "Internal Server Fault." });
     }
 }
