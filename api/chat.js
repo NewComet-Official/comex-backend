@@ -30,6 +30,8 @@ export default async function handler(req, res) {
 
         const app = initializeApp(firebaseConfig);
         const db = getFirestore(app);
+        
+        // Initialize Groq client
         const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
         const docRef = doc(db, "user_bots", businessId);
@@ -45,19 +47,26 @@ export default async function handler(req, res) {
             }
         }
 
-        // UPGRADED TO LLAMA 3.1 PRODUCTION MODEL EXPLICITLY
+        // Generate completion using Groq and Llama 3.1
         const chatCompletion = await groq.chat.completions.create({
             messages: [
-                { role: "system", content: systemContext },
-                { role: "user", content: promptText }
+                {
+                    role: "system",
+                    content: systemContext
+                },
+                {
+                    role: "user",
+                    content: promptText
+                }
             ],
-            model: "llama-3.1-8b-instant",
-            temperature: 0.2
+            model: "llama-3.1-8b-instant", // You can switch to 'llama-3.1-70b-versatile' if you need the larger model
+            temperature: 0.7,
+            max_tokens: 1024,
         });
 
         const replyText = chatCompletion.choices[0]?.message?.content || "No response generated.";
         
-        // Return both properties so it satisfies both widget.js and your index.html playground 
+        // Return both properties to satisfy the widget and dashboard playground 
         return res.status(200).json({ 
             success: true,
             answer: replyText, 
