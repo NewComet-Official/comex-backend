@@ -20,7 +20,6 @@ export default async function handler(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ message: 'Method Not Allowed' });
 
     try {
-        // Fallback checks for both standard dashboards ('message') and custom widgets ('question')
         const { businessId, question, message } = req.body;
         const promptText = question || message;
 
@@ -31,42 +30,44 @@ export default async function handler(req, res) {
         const app = initializeApp(firebaseConfig);
         const db = getFirestore(app);
         
-        // Initialize Groq client
         const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
         const docRef = doc(db, "user_bots", businessId);
         const docSnap = await getDoc(docRef);
 
+        // 1. Build the dynamic system context
         let systemContext = "You are a helpful customer service assistant.";
+        
         if (docSnap.exists()) {
             const botData = docSnap.data();
-            if (botData.knowledgeContext && botData.knowledgeContext.systemPrompt) {
-                systemContext = botData.knowledgeContext.systemPrompt;
+            const knowledge = botData.knowledgeContext || {};
+
+            // Start with custom instructions if they exist
+            if (knowledge.systemPrompt) {
+                systemContext = knowledge.systemPrompt;
             } else if (botData.context) {
                 systemContext = `You are a helpful customer support assistant. Use this context: ${botData.context}`;
             }
+
+            // 2. Inject file contents if they exist in the database
+            if (knowledge.fileContents) {
+                systemContext += `\n\n[REFERENCE DATA]:\n${knowledge.fileContents}`;
+            }
         }
 
-        // Generate completion using Groq and Llama 3.1
+        // 3. Generate completion using the more capable 70b model
         const chatCompletion = await groq.chat.completions.create({
             messages: [
-                {
-                    role: "system",
-                    content: systemContext
-                },
-                {
-                    role: "user",
-                    content: promptText
-                }
+                { role: "system", content: systemContext },
+                { role: "user", content: promptText }
             ],
-            model: "llama-3.1-8b-instant", // You can switch to 'llama-3.1-70b-versatile' if you need the larger model
-            temperature: 0.7,
+            model: "llama-3.1-70b-versatile",
+            temperature: 0.5,
             max_tokens: 1024,
         });
 
         const replyText = chatCompletion.choices[0]?.message?.content || "No response generated.";
         
-        // Return both properties to satisfy the widget and dashboard playground 
         return res.status(200).json({ 
             success: true,
             answer: replyText, 
