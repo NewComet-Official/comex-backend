@@ -36,23 +36,30 @@ export default async function handler(req, res) {
         let systemContext = "You are a helpful customer service assistant.";
         let ownerEmail = "unknown";
         let botName = "Agent";
+        let integrations = {};
 
         if (docSnap.exists()) {
             const botData = docSnap.data();
             const knowledge = botData.knowledgeContext || {};
             ownerEmail = botData.owner;
             botName = botData.name;
+            integrations = botData.integrations || {};
 
-            // UNICORN UPGRADE: The Lead Generation Prompt
+            // The Lead Generation Prompt
             const leadGenPrompt = `\n\nCRITICAL INSTRUCTION: You are a lead generation agent. If the user asks for pricing, booking, or specialized help, proactively ask for their email or phone number to 'have the team reach out'.`;
             
-            if (knowledge.systemPrompt) systemContext = knowledge.systemPrompt + leadGenPrompt;
-            else if (botData.context) systemContext = `Use this context: ${botData.context}` + leadGenPrompt;
+            if (knowledge.systemPrompt) {
+                systemContext = knowledge.systemPrompt + leadGenPrompt;
+            } else if (botData.context) {
+                systemContext = `Use this context: ${botData.context}` + leadGenPrompt;
+            }
 
-            if (knowledge.fileContents) systemContext += `\n\n[REFERENCE DATA]:\n${knowledge.fileContents}`;
+            if (knowledge.fileContents) {
+                systemContext += `\n\n[REFERENCE DATA]:\n${knowledge.fileContents}`;
+            }
         }
 
-        // 1. Generate AI Response
+        // Generate AI Response
         const chatCompletion = await groq.chat.completions.create({
             messages: [
                 { role: "system", content: systemContext },
@@ -65,8 +72,7 @@ export default async function handler(req, res) {
 
         const replyText = chatCompletion.choices[0]?.message?.content || "No response generated.";
 
-        // 2. UNICORN UPGRADE: Lead Extraction Engine
-        // Simple regex to catch emails and basic phone numbers
+        // Lead Extraction Engine
         const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
         const phoneRegex = /(\+\d{1,2}\s?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}/g;
         
@@ -74,18 +80,42 @@ export default async function handler(req, res) {
         const foundPhones = promptText.match(phoneRegex) || [];
 
         if (foundEmails.length > 0 || foundPhones.length > 0) {
-            // Save the captured lead to Firestore
-            await addDoc(collection(db, "leads"), {
+            const contactString = [...foundEmails, ...foundPhones].join(", ");
+            const leadData = {
                 businessId: businessId,
                 botName: botName,
                 owner: ownerEmail,
-                contactInfo: [...foundEmails, ...foundPhones].join(", "),
-                contextReason: promptText.substring(0, 100) + "...", // Save what they were asking about
+                contactInfo: contactString,
+                contextReason: promptText.substring(0, 100) + "...", 
                 createdAt: new Date().toISOString()
-            });
+            };
 
-            // NOTE FOR FUTURE: This is exactly where you would trigger a 
-            // webhook to Twilio (WhatsApp) or Google Calendar API!
+            // Save to Database
+            await addDoc(collection(db, "leads"), leadData);
+
+            // Trigger Integrations (Webhooks to Zapier/Make/Custom endpoints)
+            const triggerWebhook = async (url, data) => {
+                if (!url) return;
+                try {
+                    await fetch(url, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(data)
+                    });
+                } catch (e) {
+                    console.error("Webhook trigger failed for:", url, e);
+                }
+            };
+
+            // Fire off the background requests
+            if (integrations.whatsappAlerts) {
+                // If they provided a raw phone number instead of a webhook, you'd integrate the Twilio API here.
+                // Assuming it's a webhook URL for simplicity in this architecture.
+                triggerWebhook(integrations.whatsappAlerts, leadData);
+            }
+            if (integrations.googleCalendar) {
+                triggerWebhook(integrations.googleCalendar, leadData);
+            }
         }
         
         return res.status(200).json({ success: true, answer: replyText, reply: replyText });
