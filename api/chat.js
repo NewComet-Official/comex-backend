@@ -90,7 +90,7 @@ export default async function handler(req, res) {
                 createdAt: new Date().toISOString()
             };
 
-            // Save to Database
+            // Save to Database Analytics
             await addDoc(collection(db, "leads"), leadData);
 
             // Trigger Integrations (Webhooks to Zapier/Make/Custom endpoints)
@@ -102,20 +102,11 @@ export default async function handler(req, res) {
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify(data)
                     });
-                } catch (e) {
-                    console.error("Webhook trigger failed for:", url, e);
-                }
+                } catch (e) { console.error("Webhook trigger failed for:", url, e); }
             };
 
-            // Fire off the background requests
-            if (integrations.whatsappAlerts) {
-                // If they provided a raw phone number instead of a webhook, you'd integrate the Twilio API here.
-                // Assuming it's a webhook URL for simplicity in this architecture.
-                triggerWebhook(integrations.whatsappAlerts, leadData);
-            }
-            if (integrations.googleCalendar) {
-                triggerWebhook(integrations.googleCalendar, leadData);
-            }
+            if (integrations.whatsappAlerts) triggerWebhook(integrations.whatsappAlerts, leadData);
+            if (integrations.googleCalendar) triggerWebhook(integrations.googleCalendar, leadData);
         }
         
         return res.status(200).json({ success: true, answer: replyText, reply: replyText });
