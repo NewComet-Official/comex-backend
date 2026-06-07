@@ -65,7 +65,7 @@ export default async function handler(req, res) {
                 { role: "system", content: systemContext },
                 { role: "user", content: promptText }
             ],
-            model: "llama-3.1-70b-versatile",
+            model: "llama-3.1-78b-instant",
             temperature: 0.5,
             max_tokens: 1024,
         });
