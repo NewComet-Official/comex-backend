@@ -14,6 +14,18 @@ const firebaseConfig = {
 const app = !getApps().length ? initializeApp(firebaseConfig) : getApp();
 const db = getFirestore(app);
 
+// Helper function to handle webhooks smoothly
+const triggerWebhook = async (url, data) => {
+    if (!url) return;
+    try {
+        await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data)
+        });
+    } catch (e) { console.error("Webhook trigger failed for:", url, e); }
+};
+
 export default async function handler(req, res) {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
@@ -45,7 +57,6 @@ export default async function handler(req, res) {
             botName = botData.name;
             integrations = botData.integrations || {};
 
-            // Balanced Prompt: Gives it clear rules for when to chat vs when to book
             const leadGenPrompt = `\n\nCRITICAL INSTRUCTION: You are an automation assistant for CometNotes PRO.
 - If the user explicitly asks to book, schedule, or reserve an appointment, meeting, or call, use the 'bookAppointment' tool.
 - If the user asks general informational questions (like "What is CometNotes PRO?", "hi", "hello"), simply reply to them using helpful conversational text. Do NOT use tools for general conversations.
@@ -71,10 +82,7 @@ export default async function handler(req, res) {
                     parameters: {
                         type: "object",
                         properties: {
-                            purpose: { 
-                                type: "string", 
-                                description: "The reason for the appointment request." 
-                            }
+                            purpose: { type: "string", description: "The reason or details for the appointment." }
                         },
                         required: ["purpose"]
                     }
@@ -82,7 +90,6 @@ export default async function handler(req, res) {
             }
         ];
 
-        // Generate AI Response
         const chatCompletion = await groq.chat.completions.create({
             messages: [
                 { role: "system", content: systemContext },
@@ -91,16 +98,36 @@ export default async function handler(req, res) {
             model: "llama-3.1-8b-instant",
             tools: toolsDefinition,
             tool_choice: "auto",
-            temperature: 0.4, // Bumped slightly to allow flexible, smooth conversational text responses
+            temperature: 0.4,
             max_tokens: 1024,
         });
 
         const choice = chatCompletion.choices[0]?.message;
         
-        // 1. SAFELY CHECK FOR TOOL CALLS FIRST
+        // INTERCEPT BOOKING TOOL CALLS AND WRITE TO DATABASE + TRIGGER WEBHOOKS
         if (choice?.tool_calls && choice.tool_calls.length > 0) {
             const toolCall = choice.tool_calls[0];
             if (toolCall.function.name === "bookAppointment") {
+                
+                const appointmentData = {
+                    businessId: businessId,
+                    botName: botName,
+                    owner: ownerEmail,
+                    purpose: "Appointment Request: " + promptText,
+                    status: "requested",
+                    createdAt: new Date().toISOString()
+                };
+
+                // Save to global appointments collection so dashboard picks it up instantly
+                await addDoc(collection(db, "appointments"), appointmentData);
+
+                // Also save under bot subcollection for absolute redundancy safety
+                await addDoc(collection(db, "user_bots", businessId, "appointments"), appointmentData);
+
+                // Instantly sync data onto third-party webhooks (Google Calendar & WhatsApp alerts)
+                if (integrations.googleCalendar) await triggerWebhook(integrations.googleCalendar, appointmentData);
+                if (integrations.whatsappAlerts) await triggerWebhook(integrations.whatsappAlerts, appointmentData);
+
                 return res.status(200).json({ 
                     success: true, 
                     answer: "Success in booking: Your appointment has been requested.",
@@ -110,11 +137,22 @@ export default async function handler(req, res) {
             }
         }
 
-        // 2. FALLBACK CLEANUP: If the model mistakenly prints out a raw text tool call string, catch it
         let replyText = choice?.content || "";
         
+        // Text fallback interception logic
         if (replyText.includes("bookAppointment=") || replyText.includes("brave_search=")) {
             if (replyText.includes("bookAppointment")) {
+                const appointmentData = {
+                    businessId: businessId,
+                    botName: botName,
+                    owner: ownerEmail,
+                    purpose: "Appointment Request",
+                    status: "requested",
+                    createdAt: new Date().toISOString()
+                };
+                await addDoc(collection(db, "appointments"), appointmentData);
+                if (integrations.googleCalendar) await triggerWebhook(integrations.googleCalendar, appointmentData);
+                
                 return res.status(200).json({ 
                     success: true, 
                     answer: "Success in booking: Your appointment has been requested.",
@@ -122,11 +160,11 @@ export default async function handler(req, res) {
                     triggerBookingUI: true 
                 });
             } else {
-                replyText = "I'm here to help answer questions about CometNotes PRO or assist you with booking an appointment! What can I do for you?";
+                replyText = "I can help answer questions about CometNotes PRO or assist you with booking an appointment! What can I do for you?";
             }
         }
 
-        // Lead Extraction Engine
+        // Standard Lead Extraction Engine
         const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
         const phoneRegex = /(\+\d{1,2}\s?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}/g;
         
@@ -146,22 +184,11 @@ export default async function handler(req, res) {
 
             await addDoc(collection(db, "leads"), leadData);
 
-            const triggerWebhook = async (url, data) => {
-                if (!url) return;
-                try {
-                    await fetch(url, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(data)
-                    });
-                } catch (e) { console.error("Webhook trigger failed for:", url, e); }
-            };
-
-            if (integrations.whatsappAlerts) triggerWebhook(integrations.whatsappAlerts, leadData);
-            if (integrations.googleCalendar) triggerWebhook(integrations.googleCalendar, leadData);
+            if (integrations.whatsappAlerts) await triggerWebhook(integrations.whatsappAlerts, leadData);
+            if (integrations.googleCalendar) await triggerWebhook(integrations.googleCalendar, leadData);
         }
         
-        if (!replyText) replyText = "I'm sorry, I didn't quite catch that. How can I help you with CometNotes PRO today?";
+        if (!replyText) replyText = "I'm here to answer your questions about CometNotes PRO! How can I help you today?";
         return res.status(200).json({ success: true, answer: replyText, reply: replyText });
 
     } catch (error) {
