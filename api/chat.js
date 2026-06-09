@@ -14,177 +14,206 @@ const firebaseConfig = {
 const app = !getApps().length ? initializeApp(firebaseConfig) : getApp();
 const db = getFirestore(app);
 
-// Safe Webhook Trigger
-const triggerWebhook = async (url, data) => {
-    if (!url || typeof url !== 'string' || !url.startsWith('http')) return;
+// ── NEW HELPER: REFRESH GOOGLE OAUTH & CREATE CALENDAR EVENT ──
+async function insertGoogleCalendarEvent(userEmail, appointment) {
     try {
-        await fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(data)
-        });
-    } catch (e) { console.error("Webhook failed:", e); }
-};
+        const userRef = doc(db, "users", userEmail);
+        const userSnap = await getDoc(userRef);
+        if (!userSnap.exists()) return console.log("User config not found for calendar injection.");
 
-// Helper function to calculate the calendar date for an upcoming day (e.g., "Thursday")
+        const userData = userSnap.data();
+        const googleAuth = userData.integrations?.google_calendar;
+        if (!googleAuth || !googleAuth.connected) return console.log("Google Calendar not connected for this user.");
+
+        // We use Google's token endpoint to get a fresh access token using our refresh token
+        let accessToken = googleAuth.access_token;
+        
+        const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+                client_id: process.env.GOOGLE_CLIENT_ID,
+                client_secret: process.env.GOOGLE_CLIENT_SECRET,
+                refresh_token: googleAuth.refresh_token,
+                grant_type: 'refresh_token'
+            })
+        });
+
+        const tokenData = await tokenResponse.json();
+        if (tokenData.access_token) {
+            accessToken = tokenData.access_token;
+        }
+
+        // Construct the date string for the Google Calendar event API
+        // Format: YYYY-MM-DDTHH:MM:SS
+        const startDateTime = `${appointment.date}T${appointment.time}:00`;
+        // Default to a 30-minute duration slot
+        const endDateTime = new Date(new Date(startDateTime).getTime() + 30 * 60000).toISOString().split('.')[0];
+
+        const eventPayload = {
+            summary: `Appointment with ${appointment.name}`,
+            description: `Contact Info: ${appointment.contact}\nCreated automatically by Comex AI.`,
+            start: { dateTime: startDateTime, timeZone: 'UTC' },
+            end: { dateTime: endDateTime, timeZone: 'UTC' }
+        };
+
+        await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${accessToken}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(eventPayload)
+        });
+        console.log("Successfully added event to Google Calendar!");
+    } catch (err) {
+        console.error("Failed to inject Google Calendar event:", err);
+    }
+}
+
+// ── NEW HELPER: META WHATSAPP BUSINESS API ALERT TRIGGER ──
+async function sendWhatsAppAlert(userEmail, appointment) {
+    try {
+        const userRef = doc(db, "users", userEmail);
+        const userSnap = await getDoc(userRef);
+        if (!userSnap.exists()) return;
+
+        const userData = userSnap.data();
+        const waConfig = userData.integrations?.whatsapp_business;
+        if (!waConfig || !waConfig.connected) return console.log("WhatsApp integration not active.");
+
+        const messageText = `Appointment booked on ${appointment.date} at ${appointment.time} with\n${appointment.name}\n${appointment.contact}\n\nThanks\n                  -Comex`;
+
+        await fetch(`https://graph.facebook.com/v17.0/${waConfig.phone_number_id}/messages`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${waConfig.access_token}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                messaging_product: "whatsapp",
+                recipient_type: "individual",
+                to: waConfig.phone_number_id, // Sends a business administration alert copy directly to yourself
+                type: "text",
+                text: { preview_url: false, body: messageText }
+            })
+        });
+        console.log("WhatsApp alert dispatched.");
+    } catch (err) {
+        console.error("WhatsApp alert pipeline exception:", err);
+    }
+}
+
 function getUpcomingDayDate(dayName) {
     const days = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
-    const targetDay = days.indexOf(dayName.toLowerCase().trim());
-    if (targetDay === -1) return "Upcoming Date";
-
-    const resultDate = new Date();
-    const currentDay = resultDate.getDay();
-    let daysToAdd = targetDay - currentDay;
-    if (daysToAdd <= 0) daysToAdd += 7; // Get next week's day if it already passed
-
-    resultDate.setDate(resultDate.getDate() + daysToAdd);
-    return resultDate.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
+    const targetIdx = days.indexOf(dayName.toLowerCase().trim());
+    if (targetIdx === -1) return new Date().toISOString().split('T')[0];
+    const today = new Date();
+    const currentIdx = today.getDay();
+    let daysToAdd = targetIdx - currentIdx;
+    if (daysToAdd <= 0) daysToAdd += 7;
+    today.setDate(today.getDate() + daysToAdd);
+    return today.toISOString().split('T')[0];
 }
 
 export default async function handler(req, res) {
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
     if (req.method === 'OPTIONS') return res.status(200).end();
-    if (req.method !== 'POST') return res.status(405).json({ message: 'Method Not Allowed' });
+    if (req.method !== 'POST') return res.status(405).json({ error: "Method not allowed" });
 
     try {
-        // Accept history array from the frontend to maintain multi-turn memory
-        const { businessId, question, message, history = [] } = req.body;
-        const promptText = question || message;
-
-        if (!businessId || !promptText) return res.status(400).json({ success: false, answer: "Missing prompt payload." });
-        if (!process.env.GROQ_API_KEY) return res.status(500).json({ success: false, answer: "Server config error." });
-
-        const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-        const docRef = doc(db, "user_bots", businessId);
-        const docSnap = await getDoc(docRef);
-
-        let systemContext = "You are a helpful customer service assistant.";
-        let ownerEmail = "unknown";
-        let botName = "Agent";
-        let integrations = {};
-
-        if (docSnap.exists()) {
-            const botData = docSnap.data();
-            const knowledge = botData.knowledgeContext || {};
-            ownerEmail = botData.owner;
-            botName = botData.name;
-            integrations = botData.integrations || {};
-            
-            // OPTIMIZED WORKFLOW PROMPT FOR LLAMA 3.1
-            const conversationalPrompt = `\n\nCRITICAL ASSISTANT WORKFLOW:
-You are an intelligent business assistant for CometNotes PRO. You have access to a tool called 'finalizeAppointmentBooking' which requires exactly four arguments: userName, contactInfo, appointmentDay, and appointmentTime.
-
-Follow this workflow strictly:
-1. If the user expresses intent to book an appointment, analyze the chat history to see what pieces of information are missing.
-2. If ANY information is missing (such as name, contact info, day, or time), DO NOT call the tool. Instead, ask the user naturally for the missing details.
-   - If contact info is missing, ask for their name and email/mobile number.
-   - If they gave their contact info but didn't state a day/time, say: "Thanks! What day and time slot would you prefer for the appointment?"
-3. NEVER guess or leave parameters blank. ONLY trigger the 'finalizeAppointmentBooking' function call when you have successfully collected ALL 4 parameters from the user's active inputs.
-4. If the user asks general info ("What is CometNotes PRO?", "hi"), reply conversationally.`;
-            
-            if (knowledge.systemPrompt) {
-                systemContext = knowledge.systemPrompt + conversationalPrompt;
-            } else if (botData.context) {
-                systemContext = `Use this context: ${botData.context}` + conversationalPrompt;
-            }
-
-            if (knowledge.fileContents) {
-                systemContext += `\n\n[REFERENCE DATA]:\n${knowledge.fileContents}`;
-            }
+        const { businessId, message, history = [] } = req.body;
+        if (!businessId || !message) {
+            return res.status(400).json({ success: false, answer: "Missing baseline payload constraints." });
         }
 
-        const toolsDefinition = [
-            {
-                type: "function",
-                function: {
-                    name: "finalizeAppointmentBooking",
-                    description: "Execute this tool ONLY after you have successfully collected the customer's name, contact info, and preferred day/time slot.",
-                    parameters: {
-                        type: "object",
-                        properties: {
-                            userName: { type: "string", description: "The customer's name" },
-                            contactInfo: { type: "string", description: "The customer's email or phone number" },
-                            appointmentDay: { type: "string", description: "The day requested, e.g., 'Thursday'" },
-                            appointmentTime: { type: "string", description: "The time slot requested, e.g., '2pm'" }
-                        },
-                        required: ["userName", "contactInfo", "appointmentDay", "appointmentTime"]
-                    }
-                }
-            }
-        ];
-
-        // Construct the full conversation timeline for Llama 3.1
-        let groqMessages = [{ role: "system", content: systemContext }];
-        if (Array.isArray(history) && history.length > 0) {
-            groqMessages = groqMessages.concat(history);
+        const botRef = doc(db, "user_bots", businessId);
+        const botSnap = await getDoc(botRef);
+        if (!botSnap.exists()) {
+            return res.status(404).json({ success: false, answer: "Target agent container profile missing." });
         }
-        groqMessages.push({ role: "user", content: promptText });
 
-        const chatCompletion = await groq.chat.completions.create({
-            messages: groqMessages,
+        const botData = botSnap.data();
+        const userOwnerEmail = botData.userId || businessId; // Linked owner mapping lookup pointer
+        const groqApiKey = botData.groqApiKey || process.env.GROQ_API_KEY;
+
+        if (!groqApiKey) {
+            return res.status(200).json({ success: true, answer: "System configuration warning: Groq Cloud API access key is unconfigured." });
+        }
+
+        const groq = new Groq({ apiKey: groqApiKey });
+        let systemContext = "You are a helpful customer scheduling executive assistant.";
+        
+        // Dynamic Temporal Clock Context Injection prevents the AI from choosing random dates
+        const now = new Date();
+        const timeContext = `\n[TEMPORAL CONTEXT]: Today is ${now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}. The current time is ${now.toLocaleTimeString('en-US')}.`;
+
+        if (botData.context) {
+            systemContext = `Use this context profile data parameters to answer queries: ${botData.context}` + timeContext;
+        }
+
+        const conversationalPrompt = `\n\nBooking Flow Instructions:\nIf the user wants to schedule an appointment, you MUST extract or ask for these 4 fields sequentially before finishing:\n1. Customer full name\n2. Contact details (Email or Mobile number)\n3. Target day or calendar date\n4. Preferred time slot window\n\nWhen (and ONLY when) you have gathered all 4 pieces of information, invoke your tool parameters via calling syntax or finalize by stating explicit schema JSON parameters inside double bracket block arrays like: [[BOOKING:{"name":"Name","contact":"Email/Phone","day":"DayName","time":"HH:MM"}]]`;
+
+        systemContext += conversationalPrompt;
+
+        const messages = [{ role: 'system', content: systemContext }];
+        history.forEach(msg => {
+            if (msg.role && msg.content) messages.push({ role: msg.role, content: msg.content });
+        });
+        messages.push({ role: 'user', content: message });
+
+        const completion = await groq.chat.completions.create({
             model: "llama-3.1-8b-instant",
-            tools: toolsDefinition,
-            tool_choice: "auto",
-            temperature: 0.3,
-            max_tokens: 1024,
+            messages: messages,
+            temperature: 0.4,
+            max_tokens: 500
         });
 
-        const choice = chatCompletion.choices[0]?.message;
+        const choice = completion.choices[0];
+        const replyText = choice?.message?.content || "";
 
-        // EXECUTE BOOKING AND RETURN FINAL STRING
-        if (choice?.tool_calls && choice.tool_calls.length > 0) {
-            const toolCall = choice.tool_calls[0];
-            if (toolCall.function.name === "finalizeAppointmentBooking") {
-                
-                const args = JSON.parse(toolCall.function.arguments);
+        // Check if the LLM output generated our booking confirmation bracket syntax
+        if (replyText.includes('[[BOOKING:')) {
+            const rawMatch = replyText.split('[[BOOKING:')[1].split(']]')[0];
+            const parsedData = JSON.parse(rawMatch);
 
-                // Fix potential empty or missing string parameters safely before formatting payloads
-                const finalizedDay = args.appointmentDay && args.appointmentDay.trim() !== "" ? args.appointmentDay : "Thursday";
-                const finalizedTime = args.appointmentTime && args.appointmentTime.trim() !== "" ? args.appointmentTime : "2:00 PM";
-                const finalizedName = args.userName && args.userName.trim() !== "" ? args.userName : "Customer";
-                const finalizedContact = args.contactInfo && args.contactInfo.trim() !== "" ? args.contactInfo : "Not Provided";
+            const finalizedName = parsedData.name;
+            const finalizedContact = parsedData.contact;
+            const finalizedDay = parsedData.day;
+            const finalizedTime = parsedData.time;
 
-                const calculatedDate = getUpcomingDayDate(finalizedDay);
-
-                const appointmentData = {
-                    businessId: businessId,
-                    botName: botName,
-                    owner: ownerEmail,
-                    customerName: finalizedName,
-                    contactInfo: finalizedContact,
-                    purpose: `Appointment with ${finalizedName} on ${finalizedDay} at ${finalizedTime}`,
-                    status: "requested",
-                    scheduledDate: calculatedDate,
-                    scheduledTime: finalizedTime,
-                    createdAt: new Date().toISOString()
-                };
-
-                await addDoc(collection(db, "appointments"), appointmentData);
-                await addDoc(collection(db, "user_bots", businessId, "appointments"), appointmentData);
-
-                if (integrations.googleCalendar) await triggerWebhook(integrations.googleCalendar, appointmentData);
-                if (integrations.whatsappAlerts) await triggerWebhook(integrations.whatsappAlerts, appointmentData);
-
-                // Formatting clean final confirmation string
-                const customizedReply = `${finalizedName}, Your appointment is booked for ${finalizedTime} on ${finalizedDay} (${calculatedDate}). Reply with 'CANCEL' if you want to cancel your appointment.`;
-
-                return res.status(200).json({ 
-                    success: true, 
-                    answer: customizedReply,
-                    reply: customizedReply,
-                    triggerBookingUI: true 
-                });
+            let calculatedDate = finalizedDay;
+            if (!finalizedDay.includes('-')) {
+                calculatedDate = getUpcomingDayDate(finalizedDay);
             }
+
+            const appointmentData = {
+                name: finalizedName,
+                contact: finalizedContact,
+                date: calculatedDate,
+                time: finalizedTime,
+                createdAt: new Date().toISOString()
+            };
+
+            // Commit record transactions into Firebase Firestore
+            await addDoc(collection(db, "global_appointments"), appointmentData);
+            await addDoc(collection(db, "user_bots", businessId, "appointments"), appointmentData);
+
+            // Trigger the integrations directly using the saved credentials
+            await insertGoogleCalendarEvent(userOwnerEmail, appointmentData);
+            await sendWhatsAppAlert(userOwnerEmail, appointmentData);
+
+            const customizedReply = `${finalizedName}, your appointment is successfully booked for ${finalizedTime} on ${calculatedDate}. A confirmation text has been dispatched to WhatsApp.`;
+            return res.status(200).json({ success: true, answer: customizedReply, reply: customizedReply });
         }
 
-        let replyText = choice?.content || "I'm here to answer your questions about CometNotes PRO! How can I help you today?";
         return res.status(200).json({ success: true, answer: replyText, reply: replyText });
 
     } catch (error) {
         console.error("Chat Flow Error:", error);
-        return res.status(200).json({ success: true, answer: "I can help you gather details and schedule that appointment right away! Could you please provide your name and phone/email?", reply: "I can help you gather details and schedule that appointment right away!" });
+        return res.status(200).json({ success: true, answer: "I can help you gather details and schedule an appointment right away! Could you please provide your name and phone/email?", reply: "Error processing conversation." });
     }
 }
