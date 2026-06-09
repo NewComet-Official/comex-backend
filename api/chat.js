@@ -33,16 +33,11 @@ function getUpcomingDayDate(dayName) {
     if (targetDay === -1) return "Upcoming Date";
 
     const resultDate = new Date();
-    // Use fixed current time context (June 9, 2026 is a Tuesday)
-    resultDate.setFullYear(2026, 5, 9); 
-
     const currentDay = resultDate.getDay();
     let daysToAdd = targetDay - currentDay;
     if (daysToAdd <= 0) daysToAdd += 7; // Get next week's day if it already passed
 
     resultDate.setDate(resultDate.getDate() + daysToAdd);
-    
-    // Format options: "June 11, 2026"
     return resultDate.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
 }
 
@@ -55,7 +50,8 @@ export default async function handler(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ message: 'Method Not Allowed' });
 
     try {
-        const { businessId, question, message } = req.body;
+        // Accept history array from the frontend to maintain multi-turn memory
+        const { businessId, question, message, history = [] } = req.body;
         const promptText = question || message;
 
         if (!businessId || !promptText) return res.status(400).json({ success: false, answer: "Missing prompt payload." });
@@ -77,17 +73,16 @@ export default async function handler(req, res) {
             botName = botData.name;
             integrations = botData.integrations || {};
 
-            // BRAND NEW MULTI-STEP APPOINTMENT LOGIC
+            // STRICT CONVERSATIONAL APPOINTMENT SCRIPT
             const conversationalPrompt = `\n\nCRITICAL ASSISTANT WORKFLOW:
-You are a smart business assistant for CometNotes PRO. You have access to a tool called 'finalizeAppointmentBooking'.
+You are an intelligent business assistant for CometNotes PRO. You have a tool called 'finalizeAppointmentBooking'.
 
-Follow this exact appointment scheduling script over the conversation:
-1. If the user asks to book an appointment (e.g., "I wanna book an appointment at Thursday 2pm"), do NOT call any tools yet. Instead, reply conversationally EXACTLY like this:
+Follow this exact appointment scheduling script:
+1. If the user asks to book an appointment (e.g., "I wanna book an appointment at Thursday 2pm"), you must check if they have provided their Name and Contact Info (Email or Phone).
+2. If the contact info is missing, DO NOT call the tool. Reply EXACTLY with:
    "I can do that for you, Can I get your name and Email or Mobile Number for booking the appointment?"
-   
-2. Once the user replies with their contact details (e.g., "Rahul, email@example.com and +91 6123456789"), look at the chat history or context, extract the details, and ONLY then execute the 'finalizeAppointmentBooking' tool with the arguments.
-
-3. If the user asks general info ("What is CometNotes PRO?", "hi", "hello"), reply normally using your knowledge context. Do not use tools for general questions.`;
+3. Once the user provides their name and contact info, you MUST call the 'finalizeAppointmentBooking' tool immediately.
+4. If the user asks general information ("What is CometNotes PRO?", "hi"), reply conversationally.`;
             
             if (knowledge.systemPrompt) {
                 systemContext = knowledge.systemPrompt + conversationalPrompt;
@@ -100,7 +95,6 @@ Follow this exact appointment scheduling script over the conversation:
             }
         }
 
-        // Tool declaration only triggers when gathering is complete
         const toolsDefinition = [
             {
                 type: "function",
@@ -121,11 +115,15 @@ Follow this exact appointment scheduling script over the conversation:
             }
         ];
 
+        // Construct the full conversation timeline for Llama 3.1
+        let groqMessages = [{ role: "system", content: systemContext }];
+        if (Array.isArray(history) && history.length > 0) {
+            groqMessages = groqMessages.concat(history);
+        }
+        groqMessages.push({ role: "user", content: promptText });
+
         const chatCompletion = await groq.chat.completions.create({
-            messages: [
-                { role: "system", content: systemContext },
-                { role: "user", content: promptText }
-            ],
+            messages: groqMessages,
             model: "llama-3.1-8b-instant",
             tools: toolsDefinition,
             tool_choice: "auto",
@@ -135,12 +133,11 @@ Follow this exact appointment scheduling script over the conversation:
 
         const choice = chatCompletion.choices[0]?.message;
 
-        // WHEN THE CHATBOT FINALLY TRIGGER THE BOOKING TOOL
+        // EXECUTE BOOKING AND RETURN FINAL STRING
         if (choice?.tool_calls && choice.tool_calls.length > 0) {
             const toolCall = choice.tool_calls[0];
             if (toolCall.function.name === "finalizeAppointmentBooking") {
                 
-                // Parse args cleanly from Llama's structural output
                 const args = JSON.parse(toolCall.function.arguments);
                 const calculatedDate = getUpcomingDayDate(args.appointmentDay || "Thursday");
 
@@ -157,16 +154,14 @@ Follow this exact appointment scheduling script over the conversation:
                     createdAt: new Date().toISOString()
                 };
 
-                // Save records to Firestore
                 await addDoc(collection(db, "appointments"), appointmentData);
                 await addDoc(collection(db, "user_bots", businessId, "appointments"), appointmentData);
 
-                // Run out-bound webhooks seamlessly
                 if (integrations.googleCalendar) await triggerWebhook(integrations.googleCalendar, appointmentData);
                 if (integrations.whatsappAlerts) await triggerWebhook(integrations.whatsappAlerts, appointmentData);
 
-                // Send back your perfect exact requested verification string phrase!
-                const customizedReply = `${args.userName}, Your appointment is booked for ${args.appointmentTime} on ${args.appointmentDay} (${calculatedDate}). Reply with 'CANCEL' if you want to cancel your appointment.`;
+                // Formatting exact requested final string
+                const customizedReply = `${args.userName}, Your appointment is booked for ${args.appointmentTime} on ${args.appointmentDay} ${calculatedDate}. Reply with 'CANCEL' if you want to cancel your appointment.`;
 
                 return res.status(200).json({ 
                     success: true, 
@@ -177,7 +172,6 @@ Follow this exact appointment scheduling script over the conversation:
             }
         }
 
-        // Return standard text conversation replies smoothly
         let replyText = choice?.content || "I'm here to answer your questions about CometNotes PRO! How can I help you today?";
         return res.status(200).json({ success: true, answer: replyText, reply: replyText });
 
