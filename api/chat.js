@@ -72,17 +72,18 @@ export default async function handler(req, res) {
             ownerEmail = botData.owner;
             botName = botData.name;
             integrations = botData.integrations || {};
-
+            
             // STRICT CONVERSATIONAL APPOINTMENT SCRIPT
-            const conversationalPrompt = `\n\nCRITICAL ASSISTANT WORKFLOW:
-You are an intelligent business assistant for CometNotes PRO. You have a tool called 'finalizeAppointmentBooking'.
+const conversationalPrompt = `\n\nCRITICAL ASSISTANT WORKFLOW:
+You are an intelligent business assistant for CometNotes PRO. You have access to a tool called 'finalizeAppointmentBooking' which requires four pieces of information: userName, contactInfo, appointmentDay, and appointmentTime.
 
-Follow this exact appointment scheduling script:
-1. If the user asks to book an appointment (e.g., "I wanna book an appointment at Thursday 2pm"), you must check if they have provided their Name and Contact Info (Email or Phone).
-2. If the contact info is missing, DO NOT call the tool. Reply EXACTLY with:
-   "I can do that for you, Can I get your name and Email or Mobile Number for booking the appointment?"
-3. Once the user provides their name and contact info, you MUST call the 'finalizeAppointmentBooking' tool immediately.
-4. If the user asks general information ("What is CometNotes PRO?", "hi"), reply conversationally.`;
+Follow this workflow strictly:
+1. If the user expresses intent to book an appointment, analyze the chat history to see what pieces of information are missing.
+2. If ANY information is missing (such as name, contact info, day, or time), DO NOT call the tool. Instead, ask the user naturally for the missing details.
+   - If contact info is missing, ask for their name and email/mobile number.
+   - If they gave their contact info but didn't state a day/time, say: "Thanks Rahul! What day and time would you prefer for the appointment?"
+3. ONLY trigger the 'finalizeAppointmentBooking' function call when you have collected ALL 4 required parameters from the conversation.
+4. If the user asks general info ("What is CometNotes PRO?", "hi"), reply conversationally.`;
             
             if (knowledge.systemPrompt) {
                 systemContext = knowledge.systemPrompt + conversationalPrompt;
