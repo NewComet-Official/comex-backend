@@ -14,16 +14,22 @@ const firebaseConfig = {
 const app = !getApps().length ? initializeApp(firebaseConfig) : getApp();
 const db = getFirestore(app);
 
-// Helper function to handle webhooks smoothly
+// FIX: Robust webhook validator to prevent blank or bad URLs from crashing the API
 const triggerWebhook = async (url, data) => {
-    if (!url) return;
+    if (!url || typeof url !== 'string' || !url.startsWith('http')) {
+        console.log("Skipping webhook: URL is not configured or invalid.");
+        return;
+    }
     try {
         await fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(data)
         });
-    } catch (e) { console.error("Webhook trigger failed for:", url, e); }
+        console.log("Webhook triggered successfully for:", url);
+    } catch (e) { 
+        console.error("Webhook trigger failed for:", url, e); 
+    }
 };
 
 export default async function handler(req, res) {
@@ -104,7 +110,7 @@ export default async function handler(req, res) {
 
         const choice = chatCompletion.choices[0]?.message;
         
-        // INTERCEPT BOOKING TOOL CALLS AND WRITE TO DATABASE + TRIGGER WEBHOOKS
+        // INTERCEPT BOOKING TOOL CALLS
         if (choice?.tool_calls && choice.tool_calls.length > 0) {
             const toolCall = choice.tool_calls[0];
             if (toolCall.function.name === "bookAppointment") {
@@ -118,15 +124,13 @@ export default async function handler(req, res) {
                     createdAt: new Date().toISOString()
                 };
 
-                // Save to global appointments collection so dashboard picks it up instantly
+                // Save to Firebase database collections smoothly
                 await addDoc(collection(db, "appointments"), appointmentData);
-
-                // Also save under bot subcollection for absolute redundancy safety
                 await addDoc(collection(db, "user_bots", businessId, "appointments"), appointmentData);
 
-                // Instantly sync data onto third-party webhooks (Google Calendar & WhatsApp alerts)
-                if (integrations.googleCalendar) await triggerWebhook(integrations.googleCalendar, appointmentData);
-                if (integrations.whatsappAlerts) await triggerWebhook(integrations.whatsappAlerts, appointmentData);
+                // These calls are now completely safe and won't crash if unconfigured!
+                await triggerWebhook(integrations.googleCalendar, appointmentData);
+                await triggerWebhook(integrations.whatsappAlerts, appointmentData);
 
                 return res.status(200).json({ 
                     success: true, 
@@ -139,7 +143,7 @@ export default async function handler(req, res) {
 
         let replyText = choice?.content || "";
         
-        // Text fallback interception logic
+        // Secondary safety trap fallback text checker
         if (replyText.includes("bookAppointment=") || replyText.includes("brave_search=")) {
             if (replyText.includes("bookAppointment")) {
                 const appointmentData = {
@@ -151,7 +155,7 @@ export default async function handler(req, res) {
                     createdAt: new Date().toISOString()
                 };
                 await addDoc(collection(db, "appointments"), appointmentData);
-                if (integrations.googleCalendar) await triggerWebhook(integrations.googleCalendar, appointmentData);
+                await triggerWebhook(integrations.googleCalendar, appointmentData);
                 
                 return res.status(200).json({ 
                     success: true, 
@@ -184,8 +188,8 @@ export default async function handler(req, res) {
 
             await addDoc(collection(db, "leads"), leadData);
 
-            if (integrations.whatsappAlerts) await triggerWebhook(integrations.whatsappAlerts, leadData);
-            if (integrations.googleCalendar) await triggerWebhook(integrations.googleCalendar, leadData);
+            await triggerWebhook(integrations.whatsappAlerts, leadData);
+            await triggerWebhook(integrations.googleCalendar, leadData);
         }
         
         if (!replyText) replyText = "I'm here to answer your questions about CometNotes PRO! How can I help you today?";
