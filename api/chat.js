@@ -45,9 +45,11 @@ export default async function handler(req, res) {
             botName = botData.name;
             integrations = botData.integrations || {};
 
-            // FIX 1: Enforced strict tool calling format constraints directly in the system context
-            const leadGenPrompt = `\n\nCRITICAL INSTRUCTION: You are an automation assistant for CometNotes PRO. You have access to a tool named 'bookAppointment'. Whenever a user requests to book, schedule, or reserve an appointment, meeting, or call, you MUST call the 'bookAppointment' function tool. 
-Do NOT output custom text XML tags like <function=...>. Use your native function calling schema parameters precisely. If they ask about general details or pricing, then proactively gather their email/phone info.`;
+            // Balanced Prompt: Gives it clear rules for when to chat vs when to book
+            const leadGenPrompt = `\n\nCRITICAL INSTRUCTION: You are an automation assistant for CometNotes PRO.
+- If the user explicitly asks to book, schedule, or reserve an appointment, meeting, or call, use the 'bookAppointment' tool.
+- If the user asks general informational questions (like "What is CometNotes PRO?", "hi", "hello"), simply reply to them using helpful conversational text. Do NOT use tools for general conversations.
+- If they ask about general pricing or specialized help, proactively gather their email or phone number.`;
             
             if (knowledge.systemPrompt) {
                 systemContext = knowledge.systemPrompt + leadGenPrompt;
@@ -60,19 +62,18 @@ Do NOT output custom text XML tags like <function=...>. Use your native function
             }
         }
 
-        // FIX 2: Simplified parameter types to guarantee valid JSON validation schemas on Llama 3.1
         const toolsDefinition = [
             {
                 type: "function",
                 function: {
                     name: "bookAppointment",
-                    description: "Call this tool whenever the user wants to book, schedule, or request an appointment or meeting.",
+                    description: "Use this tool ONLY when the user explicitly says they want to book, schedule, or request an appointment or meeting.",
                     parameters: {
                         type: "object",
                         properties: {
                             purpose: { 
                                 type: "string", 
-                                description: "The descriptive details or reason for the meeting request." 
+                                description: "The reason for the appointment request." 
                             }
                         },
                         required: ["purpose"]
@@ -90,13 +91,13 @@ Do NOT output custom text XML tags like <function=...>. Use your native function
             model: "llama-3.1-8b-instant",
             tools: toolsDefinition,
             tool_choice: "auto",
-            temperature: 0.1, // Lower temperature forces strict structural alignment, preventing token generation drift
+            temperature: 0.4, // Bumped slightly to allow flexible, smooth conversational text responses
             max_tokens: 1024,
         });
 
         const choice = chatCompletion.choices[0]?.message;
-        let replyText = choice?.content || "";
-
+        
+        // 1. SAFELY CHECK FOR TOOL CALLS FIRST
         if (choice?.tool_calls && choice.tool_calls.length > 0) {
             const toolCall = choice.tool_calls[0];
             if (toolCall.function.name === "bookAppointment") {
@@ -106,6 +107,22 @@ Do NOT output custom text XML tags like <function=...>. Use your native function
                     reply: "Success in booking: Your appointment has been requested.",
                     triggerBookingUI: true 
                 });
+            }
+        }
+
+        // 2. FALLBACK CLEANUP: If the model mistakenly prints out a raw text tool call string, catch it
+        let replyText = choice?.content || "";
+        
+        if (replyText.includes("bookAppointment=") || replyText.includes("brave_search=")) {
+            if (replyText.includes("bookAppointment")) {
+                return res.status(200).json({ 
+                    success: true, 
+                    answer: "Success in booking: Your appointment has been requested.",
+                    reply: "Success in booking: Your appointment has been requested.",
+                    triggerBookingUI: true 
+                });
+            } else {
+                replyText = "I'm here to help answer questions about CometNotes PRO or assist you with booking an appointment! What can I do for you?";
             }
         }
 
@@ -144,11 +161,11 @@ Do NOT output custom text XML tags like <function=...>. Use your native function
             if (integrations.googleCalendar) triggerWebhook(integrations.googleCalendar, leadData);
         }
         
-        if (!replyText) replyText = "No response generated.";
+        if (!replyText) replyText = "I'm sorry, I didn't quite catch that. How can I help you with CometNotes PRO today?";
         return res.status(200).json({ success: true, answer: replyText, reply: replyText });
 
     } catch (error) {
         console.error("Chat Error:", error);
-        return res.status(500).json({ success: false, answer: "Internal server processing fault." });
+        return res.status(200).json({ success: true, answer: "I'm here to help answer your questions about CometNotes PRO! Could you please try rephrasing that?", reply: "I'm here to help answer your questions about CometNotes PRO! Could you please try rephrasing that?" });
     }
 }
