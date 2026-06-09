@@ -193,6 +193,6 @@ export default async function handler(req, res) {
 
     } catch (error) {
         console.error("Chat Error:", error);
-        return res.status(200).json({ success: true, answer: "I didnt quite get that, Could you please try rephrasing that?", reply: "I didnt quite get that, Could you please try rephrasing that?"" });
+        return res.status(200).json({ success: true, answer: "I'm here to help answer your questions about CometNotes PRO! Could you please try rephrasing that?", reply: "I'm here to help answer your questions about CometNotes PRO! Could you please try rephrasing that?" });
     }
 }
