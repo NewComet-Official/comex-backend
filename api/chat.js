@@ -45,8 +45,8 @@ export default async function handler(req, res) {
             botName = botData.name;
             integrations = botData.integrations || {};
 
-            // The Lead Generation Prompt
-            const leadGenPrompt = `\n\nCRITICAL INSTRUCTION: You are a lead generation agent. If the user asks for pricing, booking, or specialized help, proactively ask for their email or phone number to 'have the team reach out'.`;
+            // 1. UPDATED PROMPT: Directs the LLM to use the function call for booking requests
+            const leadGenPrompt = `\n\nCRITICAL INSTRUCTION: You are an automation assistant for CometNotes PRO. You have access to a tool named 'bookAppointment'. Whenever a user explicitly requests to book, schedule, or reserve an appointment, meeting, or call, you MUST call the 'bookAppointment' function tool. Do NOT output a conversational response saying you cannot book or that you are just a browser extension. Use your system tools. If they ask about simple pricing or general sales, then proactively gather their email/phone info.`;
             
             if (knowledge.systemPrompt) {
                 systemContext = knowledge.systemPrompt + leadGenPrompt;
@@ -59,20 +59,55 @@ export default async function handler(req, res) {
             }
         }
 
-        // Generate AI Response
+        // 2. ADDED TOOLS SCHEMA: Let Groq Llama 3.1 understand it has a function to call
+        const toolsDefinition = [
+            {
+                type: "function",
+                function: {
+                    name: "bookAppointment",
+                    description: "Triggers the system appointment registration UI workflow when a user requests a custom meeting, call slot, or appointment reservation.",
+                    parameters: {
+                        type: "object",
+                        properties: {
+                            purpose: { type: "string", description: "The reason or context for scheduling the appointment." }
+                        },
+                        required: ["purpose"]
+                    }
+                }
+            }
+        ];
+
+        // Generate AI Response with tool configuration enabled
         const chatCompletion = await groq.chat.completions.create({
             messages: [
                 { role: "system", content: systemContext },
                 { role: "user", content: promptText }
             ],
             model: "llama-3.1-8b-instant",
-            temperature: 0.5,
+            tools: toolsDefinition,
+            tool_choice: "auto",
+            temperature: 0.3, // Lowered slightly for more deterministic tool selection execution
             max_tokens: 1024,
         });
 
-        const replyText = chatCompletion.choices[0]?.message?.content || "No response generated.";
+        const choice = chatCompletion.choices[0]?.message;
+        let replyText = choice?.content || "";
 
-        // Lead Extraction Engine
+        // 3. CHECK FOR TOOL CALL RESPONSES:
+        if (choice?.tool_calls && choice.tool_calls.length > 0) {
+            const toolCall = choice.tool_calls[0];
+            if (toolCall.function.name === "bookAppointment") {
+                // If Llama decides to call the tool, intercept it and instruct your frontend to surface the booking UI card 
+                return res.status(200).json({ 
+                    success: true, 
+                    answer: "Success in booking: Your appointment has been requested.",
+                    reply: "Success in booking: Your appointment has been requested.",
+                    triggerBookingUI: true // Custom flag your frontend script can read to render the appointment form!
+                });
+            }
+        }
+
+        // Lead Extraction Engine (Runs if it's normal conversational response)
         const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
         const phoneRegex = /(\+\d{1,2}\s?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}/g;
         
@@ -90,10 +125,8 @@ export default async function handler(req, res) {
                 createdAt: new Date().toISOString()
             };
 
-            // Save to Database Analytics
             await addDoc(collection(db, "leads"), leadData);
 
-            // Trigger Integrations (Webhooks to Zapier/Make/Custom endpoints)
             const triggerWebhook = async (url, data) => {
                 if (!url) return;
                 try {
@@ -109,6 +142,7 @@ export default async function handler(req, res) {
             if (integrations.googleCalendar) triggerWebhook(integrations.googleCalendar, leadData);
         }
         
+        if (!replyText) replyText = "No response generated.";
         return res.status(200).json({ success: true, answer: replyText, reply: replyText });
 
     } catch (error) {
