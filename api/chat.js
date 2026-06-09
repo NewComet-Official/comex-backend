@@ -73,16 +73,16 @@ export default async function handler(req, res) {
             botName = botData.name;
             integrations = botData.integrations || {};
             
-            // STRICT CONVERSATIONAL APPOINTMENT SCRIPT
-const conversationalPrompt = `\n\nCRITICAL ASSISTANT WORKFLOW:
-You are an intelligent business assistant for CometNotes PRO. You have access to a tool called 'finalizeAppointmentBooking' which requires four pieces of information: userName, contactInfo, appointmentDay, and appointmentTime.
+            // OPTIMIZED WORKFLOW PROMPT FOR LLAMA 3.1
+            const conversationalPrompt = `\n\nCRITICAL ASSISTANT WORKFLOW:
+You are an intelligent business assistant for CometNotes PRO. You have access to a tool called 'finalizeAppointmentBooking' which requires exactly four arguments: userName, contactInfo, appointmentDay, and appointmentTime.
 
 Follow this workflow strictly:
 1. If the user expresses intent to book an appointment, analyze the chat history to see what pieces of information are missing.
 2. If ANY information is missing (such as name, contact info, day, or time), DO NOT call the tool. Instead, ask the user naturally for the missing details.
    - If contact info is missing, ask for their name and email/mobile number.
-   - If they gave their contact info but didn't state a day/time, say: "Thanks Rahul! What day and time would you prefer for the appointment?"
-3. ONLY trigger the 'finalizeAppointmentBooking' function call when you have collected ALL 4 required parameters from the conversation.
+   - If they gave their contact info but didn't state a day/time, say: "Thanks! What day and time slot would you prefer for the appointment?"
+3. NEVER guess or leave parameters blank. ONLY trigger the 'finalizeAppointmentBooking' function call when you have successfully collected ALL 4 parameters from the user's active inputs.
 4. If the user asks general info ("What is CometNotes PRO?", "hi"), reply conversationally.`;
             
             if (knowledge.systemPrompt) {
@@ -140,18 +140,25 @@ Follow this workflow strictly:
             if (toolCall.function.name === "finalizeAppointmentBooking") {
                 
                 const args = JSON.parse(toolCall.function.arguments);
-                const calculatedDate = getUpcomingDayDate(args.appointmentDay || "Thursday");
+
+                // Fix potential empty or missing string parameters safely before formatting payloads
+                const finalizedDay = args.appointmentDay && args.appointmentDay.trim() !== "" ? args.appointmentDay : "Thursday";
+                const finalizedTime = args.appointmentTime && args.appointmentTime.trim() !== "" ? args.appointmentTime : "2:00 PM";
+                const finalizedName = args.userName && args.userName.trim() !== "" ? args.userName : "Customer";
+                const finalizedContact = args.contactInfo && args.contactInfo.trim() !== "" ? args.contactInfo : "Not Provided";
+
+                const calculatedDate = getUpcomingDayDate(finalizedDay);
 
                 const appointmentData = {
                     businessId: businessId,
                     botName: botName,
                     owner: ownerEmail,
-                    customerName: args.userName || "Customer",
-                    contactInfo: args.contactInfo || "Not Provided",
-                    purpose: `Appointment with ${args.userName} on ${args.appointmentDay} at ${args.appointmentTime}`,
+                    customerName: finalizedName,
+                    contactInfo: finalizedContact,
+                    purpose: `Appointment with ${finalizedName} on ${finalizedDay} at ${finalizedTime}`,
                     status: "requested",
                     scheduledDate: calculatedDate,
-                    scheduledTime: args.appointmentTime || "2pm",
+                    scheduledTime: finalizedTime,
                     createdAt: new Date().toISOString()
                 };
 
@@ -161,8 +168,8 @@ Follow this workflow strictly:
                 if (integrations.googleCalendar) await triggerWebhook(integrations.googleCalendar, appointmentData);
                 if (integrations.whatsappAlerts) await triggerWebhook(integrations.whatsappAlerts, appointmentData);
 
-                // Formatting exact requested final string
-                const customizedReply = `${args.userName}, Your appointment is booked for ${args.appointmentTime} on ${args.appointmentDay} ${calculatedDate}. Reply with 'CANCEL' if you want to cancel your appointment.`;
+                // Formatting clean final confirmation string
+                const customizedReply = `${finalizedName}, Your appointment is booked for ${finalizedTime} on ${finalizedDay} (${calculatedDate}). Reply with 'CANCEL' if you want to cancel your appointment.`;
 
                 return res.status(200).json({ 
                     success: true, 
