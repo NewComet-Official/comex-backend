@@ -1,7 +1,7 @@
 import Groq from 'groq-sdk';
 import { initializeApp, getApps, getApp } from 'firebase/app';
 import { getFirestore, doc, getDoc, collection, addDoc, updateDoc } from 'firebase/firestore';
-import { createGoogleCalendarEvent, sendWhatsAppNotification, checkCalendarAvailability } from '../api-integrations.js';
+import { createGoogleCalendarEvent, sendWhatsAppNotification, checkCalendarAvailability } from './integrations.js';
 
 const firebaseConfig = {
     apiKey: "AIzaSyD0q99R9wn-r6e5aygL2zzg7e-Gc439ssY",
@@ -65,9 +65,13 @@ For non-booking questions, respond naturally and helpfully.
 `;
 
 export default async function handler(req, res) {
+    // ============================================================================
+    // CORS HEADERS - CRITICAL FIX
+    // ============================================================================
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS, GET');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Access-Control-Max-Age', '86400');
 
     if (req.method === 'OPTIONS') return res.status(200).end();
     if (req.method !== 'POST') return res.status(405).json({ message: 'Method Not Allowed' });
