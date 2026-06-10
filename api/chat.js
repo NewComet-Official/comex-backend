@@ -24,11 +24,23 @@ You also have the ability to book appointments when the user explicitly asks for
 APPOINTMENT BOOKING RULES:
 - Only start collecting booking info if the user clearly asks to book, schedule, or make an appointment.
 - Collect info naturally in conversation — do NOT interrogate with rapid-fire questions.
-- You only need: name, contact (email or phone), preferred date, and preferred time.
+- You need to collect: name, contact (email or phone), preferred date, and preferred time.
 - CRITICAL: Read the entire conversation history before asking for anything. If the user already told you their name, do NOT ask for it again. If they gave their email, do NOT ask again.
-- Once you have all 4 pieces confirmed, call the appointmentBooking function.
+- Once you have all 4 pieces confirmed by the user, call the appointmentBooking function.
 - Never ask for info that is already present in the chat history.
 - Keep a friendly, natural tone throughout — this is a conversation, not a form.
+
+When calling appointmentBooking:
+- userName: The customer's full name (REQUIRED)
+- contactInfo: Email or phone number (REQUIRED)
+- appointmentDay: The day name like "Thursday" or "Monday" (REQUIRED - ALWAYS include this!)
+- appointmentTime: Time in 12-hour format like "2:00 PM" (REQUIRED)
+- appointmentDate: Full ISO date like "2026-06-15" (OPTIONAL - you can omit this)
+
+CRITICAL: The appointmentDay parameter is REQUIRED. Always extract or infer the day name from what the user said:
+- If they said "2026-06-15", that's a Sunday, so set appointmentDay to "Sunday"
+- If they said "Thursday", set appointmentDay to "Thursday"
+- Never omit appointmentDay - it is ALWAYS required
 `;
 
 export default async function handler(req, res) {
@@ -84,20 +96,34 @@ export default async function handler(req, res) {
             systemContext += `\n\n${APPOINTMENT_ADDON_PROMPT}`;
         }
 
+        // ============================================================================
+        // TOOL DEFINITION - CRITICAL: All 4 required params must match the prompt
+        // ============================================================================
         const toolsDefinition = [
             {
                 type: "function",
                 function: {
                     name: "appointmentBooking",
-                    description: "Book an appointment ONLY when you have collected name, contact info, date, and time from the conversation. Never call this if any of the 4 fields are missing.",
+                    description: "Book an appointment. Call ONLY when you have collected: name, contact, day, and time from the conversation.",
                     parameters: {
                         type: "object",
                         properties: {
-                            userName: { type: "string", description: "Customer's full name" },
-                            contactInfo: { type: "string", description: "Customer's email or phone number" },
-                            appointmentDay: { type: "string", description: "Day name or date" },
-                            appointmentTime: { type: "string", description: "Time in 12hr format (e.g. 2:00 PM)" },
-                            appointmentDate: { type: "string", description: "Full ISO date YYYY-MM-DD if determinable" }
+                            userName: { 
+                                type: "string", 
+                                description: "Customer's full name (e.g., 'John Smith')" 
+                            },
+                            contactInfo: { 
+                                type: "string", 
+                                description: "Customer's email or phone number (e.g., 'john@example.com' or '+1234567890')" 
+                            },
+                            appointmentDay: { 
+                                type: "string", 
+                                description: "The day name ONLY (e.g., 'Monday', 'Thursday', 'Sunday'). DO NOT include the date here - just the day name!" 
+                            },
+                            appointmentTime: { 
+                                type: "string", 
+                                description: "Time in 12-hour format (e.g., '2:00 PM', '9:30 AM')" 
+                            }
                         },
                         required: ["userName", "contactInfo", "appointmentDay", "appointmentTime"]
                     }
@@ -130,10 +156,20 @@ export default async function handler(req, res) {
             if (toolCall.function.name === "appointmentBooking") {
                 const args = JSON.parse(toolCall.function.arguments);
 
-                const finalizedName = (args.userName && args.userName.trim()) || "Guest";
-                const finalizedContact = (args.contactInfo && args.contactInfo.trim()) || "Not Provided";
-                const finalizedDay = (args.appointmentDay && args.appointmentDay.trim()) || "TBD";
-                const finalizedTime = (args.appointmentTime && args.appointmentTime.trim()) || "TBD";
+                // Validate all required fields are present
+                if (!args.userName || !args.contactInfo || !args.appointmentDay || !args.appointmentTime) {
+                    console.error("Missing required appointment fields:", args);
+                    return res.status(200).json({
+                        success: true,
+                        answer: "I need to collect a bit more information. Could you please provide your name, contact info, preferred date, and time?",
+                        reply: "Missing information to complete booking"
+                    });
+                }
+
+                const finalizedName = args.userName.trim() || "Guest";
+                const finalizedContact = args.contactInfo.trim() || "Not Provided";
+                const finalizedDay = args.appointmentDay.trim() || "TBD";
+                const finalizedTime = args.appointmentTime.trim() || "TBD";
 
                 let appointmentDateISO = args.appointmentDate;
                 if (!appointmentDateISO) {
@@ -224,10 +260,15 @@ export default async function handler(req, res) {
     }
 }
 
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
 function parseAppointmentDate(dateString) {
     const days = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
     const today = new Date();
     const dayIndex = days.indexOf(dateString.toLowerCase().trim());
+    
     if (dayIndex !== -1) {
         const resultDate = new Date(today);
         let daysToAdd = dayIndex - today.getDay();
@@ -235,6 +276,7 @@ function parseAppointmentDate(dateString) {
         resultDate.setDate(resultDate.getDate() + daysToAdd);
         return resultDate;
     }
+    
     const parsed = new Date(dateString);
     if (!isNaN(parsed.getTime())) return parsed;
     return today;
