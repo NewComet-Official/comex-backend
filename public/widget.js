@@ -7,7 +7,9 @@
         return;
     }
 
-    // Baseline fallback defaults if the document has no custom entries yet
+    // ── Conversation history memory — persists for the lifetime of the widget session ──
+    let chatHistory = [];
+
     let config = {
         name: "AI Assistant",
         position: "bottom-right",
@@ -21,7 +23,6 @@
         }
     };
 
-    // 1. Asynchronously load customization profiles directly from your backend
     try {
         const response = await fetch(`https://comex-backend.vercel.app/api/config?businessId=${businessId}`);
         const result = await response.json();
@@ -32,12 +33,11 @@
             config.designConfig = { ...config.designConfig, ...result.designConfig };
         }
     } catch (err) {
-        console.warn("Comex Widget: Could not fetch configuration settings, using defaults.", err);
+        console.warn("Comex Widget: Could not fetch config, using defaults.", err);
     }
 
     const { themeColor, typebarSize, sendButtonStyle, loadingAnim, voiceEnabled } = config.designConfig;
 
-    // Determine target location window rules based on position property parameters
     let bubblePositioningStyles = '';
     let windowPositioningStyles = '';
 
@@ -55,7 +55,6 @@
         windowPositioningStyles = 'top: 100px; left: 25px;';
     }
 
-    // 2. Inject completely variable styling values into host head target nodes
     const style = document.createElement('style');
     style.innerHTML = `
         #cc-widget-bubble {
@@ -67,7 +66,6 @@
             background-size: cover; background-position: center; border: 2px solid #ffffff;
         }
         #cc-widget-bubble:hover { transform: scale(1.05); }
-        
         #cc-widget-window {
             position: fixed; ${windowPositioningStyles}
             width: 360px; height: 500px; background-color: #ffffff;
@@ -80,34 +78,23 @@
         .cc-bubble { max-width: 85%; padding: 12px 16px; border-radius: 14px; font-size: 14px; line-height: 1.4; }
         .cc-user { background: ${themeColor}; color: #ffffff; align-self: flex-end; border-bottom-right-radius: 4px; }
         .cc-ai { background: #f3f4f6; color: #111827; align-self: flex-start; border-bottom-left-radius: 4px; border: 1px solid #e5e7eb; }
-        
         .cc-footer { padding: 15px; background: #f9fafb; border-top: 1px solid #e5e7eb; display: flex; gap: 10px; align-items: center; }
-        
-        /* Layout Customizations for Input Fields */
-        .cc-input { 
-            flex: 1; background: #ffffff; border: 1px solid #d1d5db; color: #111827; outline: none; 
+        .cc-input {
+            flex: 1; background: #ffffff; border: 1px solid #d1d5db; color: #111827; outline: none;
             padding: ${typebarSize === 'large' ? '14px 18px' : '10px 14px'};
             font-size: ${typebarSize === 'large' ? '15px' : '14px'};
             border-radius: 8px;
         }
         .cc-input:focus { border-color: ${themeColor}; }
-        
-        /* Customizations for Action Trigger Button layout presets */
-        .cc-btn { 
+        .cc-btn {
             background: ${themeColor}; border: none; color: #ffffff; cursor: pointer; font-weight: bold; display: flex; align-items: center; justify-content: center;
             padding: ${sendButtonStyle === 'pill' ? '10px 20px' : '0 16px'};
             height: 40px;
             border-radius: ${sendButtonStyle === 'pill' ? '20px' : '8px'};
         }
-        
-        .cc-mic-btn {
-            background: none; border: none; font-size: 18px; cursor: pointer; padding: 4px 8px; 
-            display: ${voiceEnabled ? 'block' : 'none'};
-        }
+        .cc-mic-btn { background: none; border: none; font-size: 18px; cursor: pointer; padding: 4px 8px; display: ${voiceEnabled ? 'block' : 'none'}; }
         .cc-mic-btn.recording { color: #ef4444; animation: ccPulse 1.5s infinite; }
         @keyframes ccPulse { 0% { transform: scale(1); } 50% { transform: scale(1.1); } 100% { transform: scale(1); } }
-
-        /* Loader Animation Type Mappings */
         .cc-typing-indicator { display: none; align-self: flex-start; color: #64748b; font-size: 13px; font-style: italic; padding: 4px 12px; }
         .cc-loading-dots::after { content: ''; animation: ccDots 1.5s steps(4, end) infinite; }
         @keyframes ccDots { 0% { content: ''; } 25% { content: '.'; } 50% { content: '..'; } 75% { content: '...'; } }
@@ -118,7 +105,6 @@
     `;
     document.head.appendChild(style);
 
-    // 3. Render Widget Bubble elements
     const bubble = document.createElement('div');
     bubble.id = 'cc-widget-bubble';
     if (config.logoBase64) {
@@ -128,7 +114,6 @@
     }
     document.body.appendChild(bubble);
 
-    // 4. Create Main Chat Containers 
     const windowContainer = document.createElement('div');
     windowContainer.id = 'cc-widget-window';
     windowContainer.innerHTML = `
@@ -155,7 +140,6 @@
         windowContainer.style.display = 'none';
     };
 
-    // 5. Message Core Transmitter Logic
     async function sendMessage() {
         const input = document.getElementById('ccInputField');
         const chatBox = document.getElementById('ccChatBox');
@@ -164,18 +148,22 @@
 
         if (!question) return;
 
+        // Render user message
         chatBox.innerHTML += `<div class="cc-bubble cc-user">${question}</div>`;
         input.value = '';
         chatBox.scrollTop = chatBox.scrollHeight;
 
-        // Toggle Selected Visual Loading State Matches
+        // Add to history BEFORE sending, so the backend has full context
+        chatHistory.push({ role: "user", content: question });
+
+        // Loading animation
         typingIndicator.style.display = 'block';
         if (loadingAnim === 'spinner') {
             typingIndicator.className = 'cc-typing-indicator';
             typingIndicator.innerHTML = '<span class="cc-loading-spinner"></span> Analyzing...';
         } else if (loadingAnim === 'pulse') {
             typingIndicator.className = 'cc-typing-indicator cc-loading-pulse';
-            typingIndicator.innerText = 'Thinking deeply...';
+            typingIndicator.innerText = 'Thinking...';
         } else {
             typingIndicator.className = 'cc-typing-indicator cc-loading-dots';
             typingIndicator.innerText = 'Typing';
@@ -186,15 +174,25 @@
             const response = await fetch('https://comex-backend.vercel.app/api/chat', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ businessId, question })
+                body: JSON.stringify({
+                    businessId,
+                    question,
+                    // ── Send history so the AI never forgets what was already said ──
+                    history: chatHistory.slice(-10)  // last 10 turns is plenty, keeps payload small
+                })
             });
             const data = await response.json();
             typingIndicator.style.display = 'none';
-            
-            chatBox.innerHTML += `<div class="cc-bubble cc-ai">${data.answer}</div>`;
+
+            const reply = data.answer || data.reply || "Sorry, I couldn't process that.";
+            chatBox.innerHTML += `<div class="cc-bubble cc-ai">${reply}</div>`;
+
+            // Add assistant reply to history so next turn has full context
+            chatHistory.push({ role: "assistant", content: reply });
+
         } catch (error) {
             typingIndicator.style.display = 'none';
-            chatBox.innerHTML += `<div class="cc-bubble cc-ai">Connection interrupted.</div>`;
+            chatBox.innerHTML += `<div class="cc-bubble cc-ai">Connection interrupted. Please try again.</div>`;
         }
         chatBox.scrollTop = chatBox.scrollHeight;
     }
@@ -202,11 +200,10 @@
     document.getElementById('ccSendBtn').onclick = sendMessage;
     document.getElementById('ccInputField').onkeypress = (e) => { if (e.key === 'Enter') sendMessage(); };
 
-    // 6. Native Audio Recognition Engines
     if (voiceEnabled) {
         const micBtn = document.getElementById('ccMicBtn');
         const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-        
+
         if (SpeechRecognition) {
             const recognition = new SpeechRecognition();
             micBtn.onclick = () => {
