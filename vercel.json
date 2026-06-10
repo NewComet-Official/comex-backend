@@ -6,6 +6,10 @@
       "dest": "/public/widget.js"
     },
     {
+      "source": "/api/oauth/google/callback",
+      "dest": "/api/oauth/google/callback.js"
+    },
+    {
       "source": "/api/(.*)",
       "dest": "/api/$1.js"
     }
