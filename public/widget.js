@@ -9,6 +9,9 @@
 
     // ── Conversation history memory — persists for the lifetime of the widget session ──
     let chatHistory = [];
+    
+    // ── GENERATE UNIQUE CONVERSATION ID FOR THIS SESSION ──
+    const conversationId = `conv-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
     let config = {
         name: "AI Assistant",
@@ -177,8 +180,8 @@
                 body: JSON.stringify({
                     businessId,
                     question,
-                    // ── Send history so the AI never forgets what was already said ──
-                    history: chatHistory.slice(-10)  // last 10 turns is plenty, keeps payload small
+                    conversationId: conversationId, // ── PASS CONVERSATION ID ──
+                    history: chatHistory.slice(-10)
                 })
             });
             const data = await response.json();
