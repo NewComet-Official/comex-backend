@@ -143,9 +143,7 @@ export default async function handler(req, res) {
                 const finalizedDay = args.appointmentDay.trim() || "TBD";
                 const finalizedTime = args.appointmentTime.trim() || "TBD";
 
-                // ============================================================================
-                // FIXED: PROPER DATETIME PARSING FOR GOOGLE CALENDAR
-                // ============================================================================
+                // Parse appointment date properly
                 let appointmentDateISO = args.appointmentDate;
                 if (!appointmentDateISO) {
                     const dateObj = parseAppointmentDate(finalizedDay);
@@ -157,7 +155,7 @@ export default async function handler(req, res) {
                 const combinedDateTime = `${appointmentDateISO}T${timeObj}`;
 
                 let availabilityCheck = { available: true };
-                if (integrations.googleCalendar) {
+                if (integrations.googleCalendar?.connected) {
                     availabilityCheck = await checkCalendarAvailability(db, ownerEmail, appointmentDateISO, finalizedTime);
                 }
 
@@ -179,7 +177,7 @@ export default async function handler(req, res) {
                     appointmentTime: finalizedTime,
                     scheduledDate: appointmentDateISO,
                     scheduledTime: finalizedTime,
-                    scheduledDateTime: combinedDateTime, // Full ISO datetime for calendar
+                    scheduledDateTime: combinedDateTime,
                     status: "confirmed",
                     createdAt: new Date().toISOString(),
                     googleCalendarEventId: null,
@@ -192,12 +190,15 @@ export default async function handler(req, res) {
                     }
                 }
 
+                // Save appointment to main collection
                 const appointmentRef = await addDoc(collection(db, "appointments"), appointmentData);
+                
+                // Also save to user's bot subcollection
                 await addDoc(collection(db, "user_bots", businessId, "appointments"), appointmentData);
 
+                // Try to add to Google Calendar
                 let calendarResult = { success: false };
-                if (integrations.googleCalendar) {
-                    // Pass the fixed datetime to calendar function
+                if (integrations.googleCalendar?.connected) {
                     calendarResult = await createGoogleCalendarEvent(db, ownerEmail, appointmentData);
                     if (calendarResult.success) {
                         await updateDoc(appointmentRef, {
@@ -207,25 +208,38 @@ export default async function handler(req, res) {
                     }
                 }
 
+                // Try to send WhatsApp notification
                 let whatsappResult = { success: false };
-                if (integrations.whatsappAlerts && isValidPhoneNumber(finalizedContact)) {
-                    appointmentData.customerWhatsApp = finalizedContact;
-                    whatsappResult = await sendWhatsAppNotification(appointmentData);
+                if (integrations.whatsappAlerts?.connected) {
+                    whatsappResult = await sendWhatsAppNotification(db, ownerEmail, appointmentData);
                     if (whatsappResult.success) {
                         await updateDoc(appointmentRef, { whatsappMessageId: whatsappResult.messageId });
                     }
                 }
 
+                // Build confirmation message
                 let confirmationMessage = `✅ Appointment Confirmed!\n\n📅 Date: ${appointmentDateISO}\n🕐 Time: ${finalizedTime}\n👤 Name: ${finalizedName}\n📧 Contact: ${finalizedContact}`;
-                if (calendarResult.success) confirmationMessage += `\n\n✓ Added to Google Calendar`;
-                if (whatsappResult.success) confirmationMessage += `\n✓ WhatsApp confirmation sent`;
+                
+                if (calendarResult.success) {
+                    confirmationMessage += `\n\n✓ Added to Google Calendar`;
+                } else if (integrations.googleCalendar?.connected) {
+                    confirmationMessage += `\n\n⚠️ Calendar sync pending`;
+                }
+                
+                if (whatsappResult.success) {
+                    confirmationMessage += `\n✓ WhatsApp confirmation sent`;
+                } else if (integrations.whatsappAlerts?.connected) {
+                    confirmationMessage += `\n⚠️ WhatsApp notification pending`;
+                }
+                
                 confirmationMessage += `\n\nIs there anything else I can help you with?`;
 
                 return res.status(200).json({
                     success: true,
                     answer: confirmationMessage,
                     appointmentId: appointmentRef.id,
-                    calendarEvent: calendarResult.success ? calendarResult.eventLink : null
+                    calendarEvent: calendarResult.success ? calendarResult.eventLink : null,
+                    whatsappSent: whatsappResult.success
                 });
             }
         }
@@ -244,7 +258,7 @@ export default async function handler(req, res) {
 }
 
 // ============================================================================
-// HELPER FUNCTIONS - FIXED
+// HELPER FUNCTIONS
 // ============================================================================
 
 function parseAppointmentDate(dateString) {
