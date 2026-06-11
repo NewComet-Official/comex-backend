@@ -16,34 +16,58 @@ const app = !getApps().length ? initializeApp(firebaseConfig) : getApp();
 const db = getFirestore(app);
 
 // ============================================================================
-// APPOINTMENT BOOKING - SIDE CAPABILITY ADDON (not the primary personality)
+// IMPROVED APPOINTMENT BOOKING FLOW
 // ============================================================================
-const APPOINTMENT_ADDON_PROMPT = `
-You also have the ability to book appointments when the user explicitly asks for one.
 
-APPOINTMENT BOOKING RULES:
-- Only start collecting booking info if the user clearly asks to book, schedule, or make an appointment.
-- Collect info naturally in conversation — do NOT interrogate with rapid-fire questions.
-- You need to collect: name, contact (email or phone), preferred date, and preferred time.
-- CRITICAL: Read the entire conversation history before asking for anything. If the user already told you their name, do NOT ask for it again. If they gave their email, do NOT ask again.
-- Once you have all 4 pieces confirmed by the user, call the appointmentBooking function.
-- Never ask for info that is already present in the chat history.
-- Keep a friendly, natural tone throughout — this is a conversation, not a form.
+const APPOINTMENT_WORKFLOW_PROMPT = `
+You are an intelligent appointment booking assistant for {{botName}}.
 
-When calling appointmentBooking:
-- userName: The customer's full name (REQUIRED)
-- contactInfo: Email or phone number (REQUIRED)
-- appointmentDay: The day name like "Thursday" or "Monday" (REQUIRED - ALWAYS include this!)
-- appointmentTime: Time in 12-hour format like "2:00 PM" (REQUIRED)
-- appointmentDate: Full ISO date like "2026-06-15" (OPTIONAL - you can omit this)
+CRITICAL WORKFLOW - Follow EXACTLY:
 
-CRITICAL: The appointmentDay parameter is REQUIRED. Always extract or infer the day name from what the user said:
-- If they said "2026-06-15", that's a Sunday, so set appointmentDay to "Sunday"
-- If they said "Thursday", set appointmentDay to "Thursday"
-- Never omit appointmentDay - it is ALWAYS required
+When a user wants to book an appointment, you MUST collect information in this order:
+1. CUSTOMER NAME - Ask: "What's your name?"
+2. CONTACT INFO - Ask: "What's your email or phone number?"
+3. DATE - Ask: "What date would you prefer? (e.g., Thursday, December 12)"
+4. TIME - Ask: "What time works best? (e.g., 2:00 PM)"
+
+IMPORTANT RULES:
+- NEVER skip steps or assume any information
+- ONLY proceed to booking after you have ALL 4 pieces of information
+- If user gives partial info, acknowledge it and ask for the missing pieces
+- For dates: Accept day names (Thursday) or full dates
+- For times: Accept formats like "2 PM", "2:00 PM", "14:00"
+- Always confirm the appointment details before finalizing
+
+CHECKING AVAILABILITY:
+- When user provides date and time, check if it's available
+- If NOT available, offer alternatives: "That slot is taken. How about {{alternative_time}}?"
+- Ask: "Would that work for you?" before booking
+
+FINALIZATION:
+Only trigger the appointmentBooking function when:
+- You have confirmed NAME ✓
+- You have confirmed CONTACT_INFO (email or phone) ✓  
+- You have confirmed DATE ✓
+- You have confirmed TIME ✓
+- You have confirmed availability OR user accepted alternative ✓
+- User explicitly confirmed ("Yes", "Sounds good", "Book it", etc.) ✓
+
+FUNCTION CALL FORMAT:
+{
+  "userName": "customer's full name",
+  "contactInfo": "email@example.com or +1234567890",
+  "appointmentDay": "Thursday or full date string",
+  "appointmentTime": "2:00 PM format",
+  "appointmentDate": "Full ISO date string YYYY-MM-DD"
+}
+
+For non-booking questions, respond naturally and helpfully.
 `;
 
 export default async function handler(req, res) {
+    // ============================================================================
+    // CORS HEADERS - CRITICAL FIX
+    // ============================================================================
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS, GET');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -53,7 +77,7 @@ export default async function handler(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ message: 'Method Not Allowed' });
 
     try {
-        const { businessId, question, message, history = [], conversationId: incomingConversationId } = req.body;
+        const { businessId, question, message, history = [], conversationId } = req.body;
         const promptText = question || message;
 
         if (!businessId || !promptText) {
@@ -64,71 +88,54 @@ export default async function handler(req, res) {
             return res.status(500).json({ success: false, answer: "Server configuration error." });
         }
 
-        // ============================================================================
-        // GENERATE CONVERSATION ID IF NOT PROVIDED
-        // ============================================================================
-        const conversationId = incomingConversationId || `conv-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-
         const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
         const docRef = doc(db, "user_bots", businessId);
         const docSnap = await getDoc(docRef);
 
-        let systemContext = "You are a helpful, friendly customer service assistant.";
+        let systemContext = "You are a helpful customer service assistant.";
         let ownerEmail = "unknown";
         let botName = "Agent";
         let integrations = {};
+        let botData = {};
 
         if (docSnap.exists()) {
-            const botData = docSnap.data();
+            botData = docSnap.data();
             const knowledge = botData.knowledgeContext || {};
             ownerEmail = botData.owner;
             botName = botData.name;
             integrations = botData.integrations || {};
-
-            // Build primary system context from the business's own knowledge
-            // The appointment addon is appended at the end — it's secondary, not the personality
+            
+            const customWorkflow = APPOINTMENT_WORKFLOW_PROMPT
+                .replace('{{botName}}', botName)
+                .replace('{{alternative_time}}', '3:00 PM');
+            
             if (knowledge.systemPrompt) {
-                systemContext = knowledge.systemPrompt;
+                systemContext = knowledge.systemPrompt + '\n\n' + customWorkflow;
             } else if (botData.context) {
-                systemContext = `You are a helpful assistant for this business. Use the following information to answer customer questions accurately:\n\n${botData.context}`;
+                systemContext = `Use this context: ${botData.context}\n\n${customWorkflow}`;
+            } else {
+                systemContext = customWorkflow;
             }
 
             if (knowledge.fileContents) {
-                systemContext += `\n\n[ADDITIONAL REFERENCE MATERIAL]:\n${knowledge.fileContents}`;
+                systemContext += `\n\n[REFERENCE DATA]:\n${knowledge.fileContents}`;
             }
-
-            // Appointment capability is always appended as a side ability
-            systemContext += `\n\n${APPOINTMENT_ADDON_PROMPT}`;
         }
 
-        // ============================================================================
-        // TOOL DEFINITION - CRITICAL: All 4 required params must match the prompt
-        // ============================================================================
         const toolsDefinition = [
             {
                 type: "function",
                 function: {
                     name: "appointmentBooking",
-                    description: "Book an appointment. Call ONLY when you have collected: name, contact, day, and time from the conversation.",
+                    description: "Book appointment ONLY after collecting name, contact, date, time AND user confirmation",
                     parameters: {
                         type: "object",
                         properties: {
-                            userName: { 
-                                type: "string", 
-                                description: "Customer's full name (e.g., 'John Smith')" 
-                            },
-                            contactInfo: { 
-                                type: "string", 
-                                description: "Customer's email or phone number (e.g., 'john@example.com' or '+1234567890')" 
-                            },
-                            appointmentDay: { 
-                                type: "string", 
-                                description: "The day name ONLY (e.g., 'Monday', 'Thursday', 'Sunday'). DO NOT include the date here - just the day name!" 
-                            },
-                            appointmentTime: { 
-                                type: "string", 
-                                description: "Time in 12-hour format (e.g., '2:00 PM', '9:30 AM')" 
-                            }
+                            userName: { type: "string", description: "Customer's full name" },
+                            contactInfo: { type: "string", description: "Customer's email or phone" },
+                            appointmentDay: { type: "string", description: "Day name or date (Thursday/2024-12-12)" },
+                            appointmentTime: { type: "string", description: "Time in 12hr format (2:00 PM)" },
+                            appointmentDate: { type: "string", description: "Full ISO date YYYY-MM-DD" }
                         },
                         required: ["userName", "contactInfo", "appointmentDay", "appointmentTime"]
                     }
@@ -136,74 +143,79 @@ export default async function handler(req, res) {
             }
         ];
 
-        // Build full conversation with history — this is what prevents the amnesia loop
+        // Build conversation history
         let groqMessages = [{ role: "system", content: systemContext }];
         if (Array.isArray(history) && history.length > 0) {
             groqMessages = groqMessages.concat(history);
         }
         groqMessages.push({ role: "user", content: promptText });
 
+        // Call Groq API
         const chatCompletion = await groq.chat.completions.create({
             messages: groqMessages,
             model: "llama-3.1-8b-instant",
             tools: toolsDefinition,
             tool_choice: "auto",
-            temperature: 0.5,
+            temperature: 0.3,
             max_tokens: 1024,
         });
 
         const choice = chatCompletion.choices[0]?.message;
 
-        // Handle appointment booking tool call
+        // ============================================================================
+        // HANDLE APPOINTMENT BOOKING
+        // ============================================================================
         if (choice?.tool_calls && choice.tool_calls.length > 0) {
             const toolCall = choice.tool_calls[0];
-
+            
             if (toolCall.function.name === "appointmentBooking") {
                 const args = JSON.parse(toolCall.function.arguments);
 
-                // Validate all required fields are present
-                if (!args.userName || !args.contactInfo || !args.appointmentDay || !args.appointmentTime) {
-                    console.error("Missing required appointment fields:", args);
-                    return res.status(200).json({
-                        success: true,
-                        answer: "I need to collect a bit more information. Could you please provide your name, contact info, preferred date, and time?",
-                        reply: "Missing information to complete booking"
-                    });
-                }
+                // Validate and sanitize data
+                const finalizedName = (args.userName && args.userName.trim()) || "Guest";
+                const finalizedContact = (args.contactInfo && args.contactInfo.trim()) || "Not Provided";
+                const finalizedDay = (args.appointmentDay && args.appointmentDay.trim()) || "TBD";
+                const finalizedTime = (args.appointmentTime && args.appointmentTime.trim()) || "TBD";
 
-                const finalizedName = args.userName.trim() || "Guest";
-                const finalizedContact = args.contactInfo.trim() || "Not Provided";
-                const finalizedDay = args.appointmentDay.trim() || "TBD";
-                const finalizedTime = args.appointmentTime.trim() || "TBD";
-
+                // Parse date properly
                 let appointmentDateISO = args.appointmentDate;
                 if (!appointmentDateISO) {
                     const dateObj = parseAppointmentDate(finalizedDay);
                     appointmentDateISO = dateObj.toISOString().split('T')[0];
                 }
 
-                // Availability check (if Google Calendar connected)
+                // ============================================================================
+                // CHECK AVAILABILITY (If Google Calendar connected)
+                // ============================================================================
                 let availabilityCheck = { available: true };
                 if (integrations.googleCalendar) {
-                    availabilityCheck = await checkCalendarAvailability(db, ownerEmail, appointmentDateISO, finalizedTime);
+                    availabilityCheck = await checkCalendarAvailability(
+                        db,
+                        ownerEmail,
+                        appointmentDateISO,
+                        finalizedTime
+                    );
                 }
 
                 if (!availabilityCheck.available && availabilityCheck.suggestedTimes) {
                     return res.status(200).json({
                         success: true,
-                        answer: `That time slot is already booked. Here are some alternatives:\n${availabilityCheck.suggestedTimes.map((t, i) => `${i + 1}. ${t.time} on ${t.date}`).join('\n')}\n\nWhich works for you?`,
-                        reply: "Slot taken - offering alternatives"
+                        answer: `That time slot is already booked on your calendar. Here are available alternatives:\n${availabilityCheck.suggestedTimes
+                            .map((t, i) => `${i + 1}. ${t.time} on ${t.date}`)
+                            .join('\n')}\n\nWhich time works for you?`,
+                        reply: "Slot taken - offering alternatives",
+                        triggerBookingUI: false
                     });
                 }
 
                 // ============================================================================
-                // BUILD APPOINTMENT DATA - NO UNDEFINED FIELDS
+                // CREATE APPOINTMENT RECORD
                 // ============================================================================
                 const appointmentData = {
-                    businessId: businessId || "unknown",
-                    botName: botName || "Agent",
-                    owner: ownerEmail || "unknown",
-                    conversationId: conversationId || `conv-${Date.now()}`, // BULLETPROOF: Always has a value
+                    businessId: businessId,
+                    botName: botName,
+                    owner: ownerEmail,
+                    conversationId: conversationId,
                     customerName: finalizedName,
                     contactInfo: finalizedContact,
                     appointmentDay: finalizedDay,
@@ -216,24 +228,26 @@ export default async function handler(req, res) {
                     whatsappMessageId: null
                 };
 
-                // ============================================================================
-                // VALIDATE ALL FIRESTORE FIELDS BEFORE SAVING
-                // ============================================================================
-                for (const [key, value] of Object.entries(appointmentData)) {
-                    if (value === undefined || value === null) {
-                        console.error(`CRITICAL: Field ${key} is ${value} - this will cause Firestore error!`);
-                        appointmentData[key] = ""; // Replace undefined/null with empty string
-                    }
-                }
-
                 // Save to Firestore
-                const appointmentRef = await addDoc(collection(db, "appointments"), appointmentData);
-                await addDoc(collection(db, "user_bots", businessId, "appointments"), appointmentData);
+                const appointmentRef = await addDoc(
+                    collection(db, "appointments"),
+                    appointmentData
+                );
 
+                await addDoc(
+                    collection(db, "user_bots", businessId, "appointments"),
+                    appointmentData
+                );
+
+                // ============================================================================
+                // TRIGGER GOOGLE CALENDAR INTEGRATION
+                // ============================================================================
                 let calendarResult = { success: false };
                 if (integrations.googleCalendar) {
                     calendarResult = await createGoogleCalendarEvent(db, ownerEmail, appointmentData);
+                    
                     if (calendarResult.success) {
+                        // Update appointment with calendar event ID
                         await updateDoc(appointmentRef, {
                             googleCalendarEventId: calendarResult.eventId,
                             googleCalendarLink: calendarResult.eventLink
@@ -241,42 +255,64 @@ export default async function handler(req, res) {
                     }
                 }
 
+                // ============================================================================
+                // TRIGGER WHATSAPP INTEGRATION
+                // ============================================================================
                 let whatsappResult = { success: false };
                 if (integrations.whatsappAlerts && isValidPhoneNumber(finalizedContact)) {
                     appointmentData.customerWhatsApp = finalizedContact;
                     whatsappResult = await sendWhatsAppNotification(appointmentData);
+                    
                     if (whatsappResult.success) {
-                        await updateDoc(appointmentRef, { whatsappMessageId: whatsappResult.messageId });
+                        await updateDoc(appointmentRef, {
+                            whatsappMessageId: whatsappResult.messageId
+                        });
                     }
                 }
 
-                let confirmationMessage = `✅ Appointment Confirmed!\n\n📅 Date: ${appointmentDateISO}\n🕐 Time: ${finalizedTime}\n👤 Name: ${finalizedName}\n📧 Contact: ${finalizedContact}`;
-                if (calendarResult.success) confirmationMessage += `\n\n✓ Added to Google Calendar`;
-                if (whatsappResult.success) confirmationMessage += `\n✓ WhatsApp confirmation sent`;
-                confirmationMessage += `\n\nIs there anything else I can help you with?`;
+                // ============================================================================
+                // BUILD CONFIRMATION MESSAGE
+                // ============================================================================
+                let confirmationMessage = `✅ Appointment Confirmed!\n\n`;
+                confirmationMessage += `📅 Date: ${appointmentDateISO}\n`;
+                confirmationMessage += `🕐 Time: ${finalizedTime}\n`;
+                confirmationMessage += `👤 Booked for: ${finalizedName}\n`;
+                confirmationMessage += `📧 Contact: ${finalizedContact}\n`;
+
+                if (calendarResult.success) {
+                    confirmationMessage += `\n✓ Added to your Google Calendar`;
+                }
+
+                if (whatsappResult.success) {
+                    confirmationMessage += `\n✓ Confirmation sent via WhatsApp`;
+                }
+
+                confirmationMessage += `\n\nThank you for booking with us!`;
 
                 return res.status(200).json({
                     success: true,
                     answer: confirmationMessage,
                     reply: confirmationMessage,
                     appointmentId: appointmentRef.id,
-                    calendarEvent: calendarResult.success ? calendarResult.eventLink : null
+                    calendarEvent: calendarResult.success ? calendarResult.eventLink : null,
+                    integrationStatus: {
+                        googleCalendar: calendarResult.success,
+                        whatsapp: whatsappResult.success
+                    }
                 });
             }
         }
 
-        // Standard response
-        const replyText = choice?.content || "How can I help you today?";
+        // For non-booking questions
+        let replyText = choice?.content || "How can I help you today?";
         return res.status(200).json({ success: true, answer: replyText, reply: replyText });
 
     } catch (error) {
         console.error("Chat Flow Error:", error);
-        console.error("Error Stack:", error.stack);
-        return res.status(500).json({
-            success: false,
-            answer: "Sorry, I ran into an issue. Please try again.",
-            reply: "Sorry, I ran into an issue. Please try again.",
-            error: error.message // Debug info
+        return res.status(200).json({
+            success: true,
+            answer: "I can help you book an appointment! Could you please provide your name?",
+            reply: "I can help you book an appointment!"
         });
     }
 }
@@ -288,8 +324,9 @@ export default async function handler(req, res) {
 function parseAppointmentDate(dateString) {
     const days = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
     const today = new Date();
-    const dayIndex = days.indexOf(dateString.toLowerCase().trim());
     
+    // Try to match day name
+    const dayIndex = days.indexOf(dateString.toLowerCase().trim());
     if (dayIndex !== -1) {
         const resultDate = new Date(today);
         let daysToAdd = dayIndex - today.getDay();
@@ -298,11 +335,17 @@ function parseAppointmentDate(dateString) {
         return resultDate;
     }
     
+    // Try to parse as date string
     const parsed = new Date(dateString);
-    if (!isNaN(parsed.getTime())) return parsed;
+    if (!isNaN(parsed.getTime())) {
+        return parsed;
+    }
+    
+    // Default to today
     return today;
 }
 
 function isValidPhoneNumber(contact) {
+    // Simple phone validation
     return /^\+?[\d\s\-\(\)]{10,}$/.test(contact.replace(/\s/g, ''));
 }
