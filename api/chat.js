@@ -53,7 +53,7 @@ export default async function handler(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ message: 'Method Not Allowed' });
 
     try {
-        const { businessId, question, message, history = [], conversationId } = req.body;
+        const { businessId, question, message, history = [], conversationId: incomingConversationId } = req.body;
         const promptText = question || message;
 
         if (!businessId || !promptText) {
@@ -63,6 +63,11 @@ export default async function handler(req, res) {
         if (!process.env.GROQ_API_KEY) {
             return res.status(500).json({ success: false, answer: "Server configuration error." });
         }
+
+        // ============================================================================
+        // GENERATE CONVERSATION ID IF NOT PROVIDED
+        // ============================================================================
+        const conversationId = incomingConversationId || `conv-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
         const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
         const docRef = doc(db, "user_bots", businessId);
@@ -191,11 +196,14 @@ export default async function handler(req, res) {
                     });
                 }
 
+                // ============================================================================
+                // BUILD APPOINTMENT DATA - NO UNDEFINED FIELDS
+                // ============================================================================
                 const appointmentData = {
-                    businessId,
-                    botName,
-                    owner: ownerEmail,
-                    conversationId,
+                    businessId: businessId || "unknown",
+                    botName: botName || "Agent",
+                    owner: ownerEmail || "unknown",
+                    conversationId: conversationId || `conv-${Date.now()}`, // BULLETPROOF: Always has a value
                     customerName: finalizedName,
                     contactInfo: finalizedContact,
                     appointmentDay: finalizedDay,
@@ -208,6 +216,17 @@ export default async function handler(req, res) {
                     whatsappMessageId: null
                 };
 
+                // ============================================================================
+                // VALIDATE ALL FIRESTORE FIELDS BEFORE SAVING
+                // ============================================================================
+                for (const [key, value] of Object.entries(appointmentData)) {
+                    if (value === undefined || value === null) {
+                        console.error(`CRITICAL: Field ${key} is ${value} - this will cause Firestore error!`);
+                        appointmentData[key] = ""; // Replace undefined/null with empty string
+                    }
+                }
+
+                // Save to Firestore
                 const appointmentRef = await addDoc(collection(db, "appointments"), appointmentData);
                 await addDoc(collection(db, "user_bots", businessId, "appointments"), appointmentData);
 
@@ -252,10 +271,12 @@ export default async function handler(req, res) {
 
     } catch (error) {
         console.error("Chat Flow Error:", error);
+        console.error("Error Stack:", error.stack);
         return res.status(500).json({
             success: false,
             answer: "Sorry, I ran into an issue. Please try again.",
-            reply: "Sorry, I ran into an issue. Please try again."
+            reply: "Sorry, I ran into an issue. Please try again.",
+            error: error.message // Debug info
         });
     }
 }
