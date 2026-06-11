@@ -1,16 +1,16 @@
 import { getDoc, doc, updateDoc } from 'firebase/firestore';
 
 // ============================================================================
-// GOOGLE CALENDAR INTEGRATION
+// GOOGLE CALENDAR INTEGRATION - FIXED FOR PROPER DATETIME
 // ============================================================================
 
 export async function createGoogleCalendarEvent(db, userEmail, appointmentData) {
     try {
-        // 1. Fetch user's stored Google OAuth token from Firestore
         const userDocRef = doc(db, "users", userEmail);
         const userDoc = await getDoc(userDocRef);
         
         if (!userDoc.exists()) {
+            console.error("User profile not found for email:", userEmail);
             return { success: false, error: "User profile not found" };
         }
 
@@ -18,6 +18,7 @@ export async function createGoogleCalendarEvent(db, userEmail, appointmentData) 
         const googleAuth = userData?.integrations?.google_calendar;
         
         if (!googleAuth || !googleAuth.connected) {
+            console.error("Google Calendar not connected for user:", userEmail);
             return { success: false, error: "Google Calendar not connected" };
         }
 
@@ -49,9 +50,45 @@ export async function createGoogleCalendarEvent(db, userEmail, appointmentData) 
             }
         }
 
-        // Parse appointment date/time
-        const eventDate = new Date(`${appointmentData.scheduledDate}T${appointmentData.scheduledTime}:00`);
-        const endDate = new Date(eventDate.getTime() + 30 * 60000); // 30-minute duration
+        // ============================================================================
+        // FIXED: PROPER DATETIME PARSING
+        // ============================================================================
+        let eventDate, endDate;
+
+        // Use scheduledDateTime if available (full ISO format), otherwise construct from date+time
+        if (appointmentData.scheduledDateTime) {
+            // scheduledDateTime format: "2026-06-15T14:00:00"
+            eventDate = new Date(appointmentData.scheduledDateTime);
+        } else {
+            // Fallback: combine scheduledDate + parse time from scheduledTime
+            const timeMatch = appointmentData.scheduledTime.match(/(\d{1,2}):(\d{2})\s*(AM|PM|am|pm)/i);
+            let hours = 9, minutes = 0;
+
+            if (timeMatch) {
+                hours = parseInt(timeMatch[1], 10);
+                minutes = parseInt(timeMatch[2], 10);
+                const period = timeMatch[3].toUpperCase();
+
+                if (period === "PM" && hours !== 12) hours += 12;
+                if (period === "AM" && hours === 12) hours = 0;
+            }
+
+            eventDate = new Date(`${appointmentData.scheduledDate}T${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:00`);
+        }
+
+        // Ensure valid date
+        if (isNaN(eventDate.getTime())) {
+            console.error("Invalid event date:", appointmentData.scheduledDate, appointmentData.scheduledTime);
+            return { success: false, error: "Invalid appointment date/time" };
+        }
+
+        // 30-minute duration
+        endDate = new Date(eventDate.getTime() + 30 * 60000);
+
+        console.log("Creating Google Calendar event:");
+        console.log("  Start:", eventDate.toISOString());
+        console.log("  End:", endDate.toISOString());
+        console.log("  Customer:", appointmentData.customerName);
 
         // Create calendar event
         const eventResponse = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
@@ -62,7 +99,7 @@ export async function createGoogleCalendarEvent(db, userEmail, appointmentData) 
             },
             body: JSON.stringify({
                 summary: `Appointment with ${appointmentData.customerName}`,
-                description: `Contact: ${appointmentData.contactInfo}\nBooked via Comex AI`,
+                description: `Contact: ${appointmentData.contactInfo}\nBooked via Comex AI\nConversation: ${appointmentData.conversationId}`,
                 start: {
                     dateTime: eventDate.toISOString(),
                     timeZone: 'UTC'
@@ -70,6 +107,9 @@ export async function createGoogleCalendarEvent(db, userEmail, appointmentData) 
                 end: {
                     dateTime: endDate.toISOString(),
                     timeZone: 'UTC'
+                },
+                reminders: {
+                    useDefault: true
                 }
             })
         });
@@ -77,8 +117,11 @@ export async function createGoogleCalendarEvent(db, userEmail, appointmentData) 
         const eventData = await eventResponse.json();
         
         if (!eventResponse.ok) {
+            console.error("Google Calendar API error:", eventData);
             return { success: false, error: eventData.error?.message || "Failed to create event" };
         }
+
+        console.log("Calendar event created successfully:", eventData.id);
 
         return {
             success: true,
@@ -111,15 +154,13 @@ export async function sendWhatsAppNotification(appointmentData) {
             return { success: false, error: "Twilio credentials not configured" };
         }
 
-        // Format phone number - must be international format
         let toNumber = appointmentData.contactInfo;
         if (!toNumber.startsWith('+')) {
             toNumber = '+' + toNumber;
         }
 
-        const message = `Appointment booked on ${appointmentData.scheduledDate} at ${appointmentData.scheduledTime} with\n${appointmentData.customerName}\n${appointmentData.contactInfo}\n\nThanks\n     - Comex`;
+        const message = `✅ Appointment Confirmed\n\nDate: ${appointmentData.scheduledDate}\nTime: ${appointmentData.scheduledTime}\n\nWith: ${appointmentData.customerName}\n\nThanks!\n- Comex`;
 
-        // Use Twilio API directly via fetch
         const auth = Buffer.from(`${accountSid}:${authToken}`).toString('base64');
         
         const response = await fetch(
@@ -141,8 +182,11 @@ export async function sendWhatsAppNotification(appointmentData) {
         const data = await response.json();
 
         if (!response.ok) {
+            console.error("WhatsApp API error:", data);
             return { success: false, error: data.message || "Failed to send WhatsApp message" };
         }
+
+        console.log("WhatsApp message sent:", data.sid);
 
         return {
             success: true,
@@ -176,11 +220,24 @@ export async function checkCalendarAvailability(db, userEmail, date, timeSlot) {
 
         let accessToken = googleAuth.access_token;
 
-        // Parse the time
-        const eventDate = new Date(`${date}T${timeSlot}:00`);
+        // Parse the time properly
+        const timeMatch = timeSlot.match(/(\d{1,2}):(\d{2})\s*(AM|PM|am|pm)/i);
+        let hours = 9, minutes = 0;
+
+        if (timeMatch) {
+            hours = parseInt(timeMatch[1], 10);
+            minutes = parseInt(timeMatch[2], 10);
+            const period = timeMatch[3].toUpperCase();
+
+            if (period === "PM" && hours !== 12) hours += 12;
+            if (period === "AM" && hours === 12) hours = 0;
+        }
+
+        const eventDate = new Date(`${date}T${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:00`);
         const endDate = new Date(eventDate.getTime() + 60 * 60000); // 1 hour
 
-        // Query events for that time slot
+        console.log("Checking availability:", eventDate.toISOString(), "-", endDate.toISOString());
+
         const response = await fetch(
             `https://www.googleapis.com/calendar/v3/calendars/primary/events?` +
             `timeMin=${eventDate.toISOString()}&` +
@@ -196,6 +253,8 @@ export async function checkCalendarAvailability(db, userEmail, date, timeSlot) {
 
         const data = await response.json();
         const isBooked = data.items && data.items.length > 0;
+        
+        console.log("Availability check result:", isBooked ? "BOOKED" : "AVAILABLE", `(${data.items?.length || 0} conflicts)`);
         
         return {
             available: !isBooked,
@@ -213,11 +272,9 @@ function generateSuggestedTimes(baseDate) {
     const suggestions = [];
     let nextSlot = new Date(baseDate);
     
-    // Generate 3 alternative time slots
     for (let i = 0; i < 3; i++) {
         nextSlot.setHours(nextSlot.getHours() + 1);
         
-        // Skip if outside working hours (9 AM - 5 PM)
         if (nextSlot.getHours() >= 9 && nextSlot.getHours() < 17) {
             suggestions.push({
                 date: nextSlot.toLocaleDateString(),
