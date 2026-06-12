@@ -1,182 +1,97 @@
-import { initializeApp } from 'firebase/app';
-import { getFirestore, doc, setDoc } from 'firebase/firestore';
-
-const firebaseConfig = {
-    apiKey: "AIzaSyD0q99R9wn-r6e5aygL2zzg7e-Gc439ssY",
-    authDomain: "cometchat-ai-platform.firebaseapp.com",
-    projectId: "cometchat-ai-platform",
-    storageBucket: "cometchat-ai-platform.firebasestorage.app",
-    messagingSenderId: "604438924597",
-    appId: "1:604438924597:web:a180d59f7f00385138507c"
-};
-
-const app = initializeApp(firebaseConfig);
-const db = getFirestore(app);
-
-// ============================================================================
-// WHATSAPP VERIFICATION - GENERATE & SEND CODE
-// This endpoint generates a 6-digit code and sends it via Twilio WhatsApp
-// ============================================================================
+// api/whatsapp-verify.js
+// ─────────────────────────────────────────────────────────────────────────────
+// Step 1 of WhatsApp verification:
+//   • Generate a random 6-digit code
+//   • Store it in Firestore (via Admin SDK) under whatsapp_verifications/{email}
+//   • Send it FROM your Twilio number TO the user's number on WhatsApp
+// ─────────────────────────────────────────────────────────────────────────────
+import { getAdminDb } from './firebaseAdmin.js';
 
 export default async function handler(req, res) {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-
     if (req.method === 'OPTIONS') return res.status(200).end();
 
     try {
         const { userEmail, phoneNumber } = req.body;
 
-        console.log("[WhatsApp] Generating code for:", userEmail, "Phone:", phoneNumber);
-
         if (!userEmail || !phoneNumber) {
-            return res.status(400).json({ 
-                success: false, 
-                message: "Missing userEmail or phoneNumber" 
-            });
+            return res.status(400).json({ success: false, message: 'Missing userEmail or phoneNumber.' });
         }
 
-        // ====================================================================
-        // STEP 1: GENERATE 6-DIGIT CODE
-        // ====================================================================
-        const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
-        console.log("[WhatsApp] Generated code:", verificationCode);
+        // ── 1. Generate code ──────────────────────────────────────────────────
+        const code      = Math.floor(100000 + Math.random() * 900000).toString();
+        const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString(); // 10 min
 
-        // ====================================================================
-        // STEP 2: STORE IN FIREBASE WITH 10-MIN EXPIRY
-        // ====================================================================
-        const expiryTime = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-        
-        await setDoc(
-            doc(db, "whatsapp_verifications", userEmail),
-            {
-                verificationCode: verificationCode,
-                phoneNumber: phoneNumber,
-                status: "pending",
-                createdAt: new Date().toISOString(),
-                expiresAt: expiryTime,
-                attempts: 0
-            },
-            { merge: true }
-        );
-
-        console.log("[WhatsApp] Stored verification record in Firebase");
-
-        // ====================================================================
-        // STEP 3: GET TWILIO CREDENTIALS FROM ENV
-        // ====================================================================
-        const accountSid = process.env.TWILIO_ACCOUNT_SID;
-        const authToken = process.env.TWILIO_AUTH_TOKEN;
-        const twilioWhatsAppNumber = process.env.TWILIO_WHATSAPP_NUMBER;
-
-        console.log("[WhatsApp] Credentials check:", {
-            accountSid: accountSid ? "✓" : "✗ MISSING",
-            authToken: authToken ? "✓" : "✗ MISSING",
-            twilioNumber: twilioWhatsAppNumber ? "✓" : "✗ MISSING"
+        // ── 2. Persist in Firestore (Admin SDK, no rules issue) ───────────────
+        const db = getAdminDb();
+        await db.collection('whatsapp_verifications').doc(userEmail).set({
+            verificationCode: code,
+            phoneNumber,
+            status:    'pending',
+            createdAt: new Date().toISOString(),
+            expiresAt,
+            attempts:  0
         });
 
-        if (!accountSid || !authToken || !twilioWhatsAppNumber) {
-            console.error("[WhatsApp] Twilio credentials missing in environment variables");
+        // ── 3. Validate Twilio credentials ────────────────────────────────────
+        const accountSid      = process.env.TWILIO_ACCOUNT_SID;
+        const authToken       = process.env.TWILIO_AUTH_TOKEN;
+        const twilioWaNumber  = process.env.TWILIO_WHATSAPP_NUMBER; // e.g. +14155238886
+
+        if (!accountSid || !authToken || !twilioWaNumber) {
+            console.error('[WA-Verify] Missing Twilio env vars');
             return res.status(500).json({
                 success: false,
-                message: "WhatsApp service not configured on server. Contact support.",
-                debug: {
-                    accountSid: !!accountSid,
-                    authToken: !!authToken,
-                    twilioNumber: !!twilioWhatsAppNumber
-                }
+                message: 'WhatsApp service not configured on server. Check Twilio env vars.'
             });
         }
 
-        // ====================================================================
-        // STEP 4: NORMALIZE PHONE NUMBER
-        // ====================================================================
-        let toNumber = phoneNumber.trim();
-        
-        // Remove any spaces, dashes, parens
-        toNumber = toNumber.replace(/[\s\-\(\)]/g, '');
-        
-        // Add + if not present
-        if (!toNumber.startsWith('+')) {
-            toNumber = '+' + toNumber;
-        }
+        // ── 4. Normalize the destination number ───────────────────────────────
+        let toNumber = phoneNumber.replace(/[\s\-\(\)]/g, '');
+        if (!toNumber.startsWith('+')) toNumber = '+' + toNumber;
 
-        console.log("[WhatsApp] Normalized phone:", toNumber);
+        // ── 5. Send via Twilio WhatsApp ───────────────────────────────────────
+        const basicAuth = Buffer.from(`${accountSid}:${authToken}`).toString('base64');
 
-        // ====================================================================
-        // STEP 5: SEND VIA TWILIO WHATSAPP
-        // ====================================================================
-        const auth = Buffer.from(`${accountSid}:${authToken}`).toString('base64');
-        
-        console.log("[WhatsApp] Sending code via Twilio...");
-
-        const whatsappResponse = await fetch(
+        const twilioRes = await fetch(
             `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`,
             {
                 method: 'POST',
                 headers: {
-                    'Authorization': `Basic ${auth}`,
+                    Authorization: `Basic ${basicAuth}`,
                     'Content-Type': 'application/x-www-form-urlencoded'
                 },
                 body: new URLSearchParams({
-                    From: `whatsapp:${twilioWhatsAppNumber}`,
-                    To: `whatsapp:${toNumber}`,
-                    Body: `🔐 Your Comex WhatsApp Verification Code:\n\n${verificationCode}\n\nThis code will expire in 10 minutes.\n\nDo NOT share this code with anyone.`
+                    From: `whatsapp:${twilioWaNumber}`,
+                    To:   `whatsapp:${toNumber}`,
+                    Body: `Your Verification code for WhatsApp integration is ${code}.`
                 })
             }
         );
 
-        const whatsappData = await whatsappResponse.json();
+        const twilioData = await twilioRes.json();
 
-        console.log("[WhatsApp] Twilio Response:", {
-            status: whatsappResponse.status,
-            success: whatsappResponse.ok,
-            messageSid: whatsappData.sid ? "✓" : "✗",
-            error: whatsappData.error || whatsappData.message
-        });
-
-        if (!whatsappResponse.ok) {
-            console.error("[WhatsApp] Twilio API Error:", whatsappData);
-            
-            // Return detailed error for debugging
+        if (!twilioRes.ok) {
+            console.error('[WA-Verify] Twilio error:', twilioData);
             return res.status(500).json({
                 success: false,
-                message: whatsappData.message || "Failed to send WhatsApp message",
-                error: whatsappData.error || whatsappData.code,
-                debug: {
-                    twilioStatus: whatsappData.status,
-                    twilioErrorCode: whatsappData.code,
-                    phoneNumber: toNumber,
-                    timestamp: new Date().toISOString()
-                }
+                message: twilioData.message || 'Failed to send WhatsApp message.',
+                twilioCode: twilioData.code
             });
         }
 
-        console.log("[WhatsApp] ✓ Code sent successfully! MessageId:", whatsappData.sid);
+        console.log('[WA-Verify] ✓ Code sent to', toNumber, '| SID:', twilioData.sid);
 
-        // ====================================================================
-        // STEP 6: RETURN SUCCESS
-        // ====================================================================
         return res.status(200).json({
-            success: true,
-            message: `Verification code sent to ${phoneNumber}. Check your WhatsApp within 10 seconds.`,
-            messageId: whatsappData.sid,
-            verificationId: userEmail,
-            debug: {
-                sentTo: toNumber,
-                expiresAt: expiryTime,
-                timestamp: new Date().toISOString()
-            }
+            success:   true,
+            message:   `Verification code sent to WhatsApp ${toNumber}.`,
+            messageId: twilioData.sid
         });
 
-    } catch (error) {
-        console.error("[WhatsApp] Unexpected Error:", error);
-        return res.status(500).json({
-            success: false,
-            message: error.message || "Unknown error sending WhatsApp code",
-            error: error.toString(),
-            timestamp: new Date().toISOString()
-        });
+    } catch (err) {
+        console.error('[WA-Verify] Unexpected error:', err);
+        return res.status(500).json({ success: false, message: err.message });
     }
 }
