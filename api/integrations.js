@@ -1,336 +1,221 @@
-import { getDoc, doc, updateDoc } from 'firebase/firestore';
+// api/integrations.js
+import { getAdminDb } from './firebaseAdmin.js';
 
-// ============================================================================
-// GOOGLE CALENDAR INTEGRATION - FIXED FOR PROPER DATETIME
-// ============================================================================
-
-export async function createGoogleCalendarEvent(db, userEmail, appointmentData) {
+// ─────────────────────────────────────────────────────────────────────────────
+// GOOGLE CALENDAR — create event
+// ─────────────────────────────────────────────────────────────────────────────
+export async function createGoogleCalendarEvent(userEmail, appointmentData) {
     try {
-        const userDocRef = doc(db, "users", userEmail);
-        const userDoc = await getDoc(userDocRef);
-        
-        if (!userDoc.exists()) {
-            console.error("User profile not found for email:", userEmail);
-            return { success: false, error: "User profile not found" };
-        }
+        const db      = getAdminDb();
+        const userDoc = await db.collection('users').doc(userEmail).get();
 
-        const userData = userDoc.data();
-        const googleAuth = userData?.integrations?.google_calendar;
-        
-        if (!googleAuth || !googleAuth.connected) {
-            console.error("Google Calendar not connected for user:", userEmail);
-            return { success: false, error: "Google Calendar not connected" };
-        }
+        if (!userDoc.exists) return { success: false, error: 'User not found' };
+
+        const googleAuth = userDoc.data()?.integrations?.google_calendar;
+        if (!googleAuth?.connected) return { success: false, error: 'Google Calendar not connected' };
 
         let accessToken = googleAuth.access_token;
-        
-        // Refresh token if expired
-        if (googleAuth.refresh_token && googleAuth.expiry_date) {
-            const expiryTime = new Date(googleAuth.expiry_date).getTime();
-            if (expiryTime < Date.now()) {
-                try {
-                    const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                        body: new URLSearchParams({
-                            client_id: process.env.GOOGLE_CLIENT_ID,
-                            client_secret: process.env.GOOGLE_CLIENT_SECRET,
-                            refresh_token: googleAuth.refresh_token,
-                            grant_type: 'refresh_token'
-                        })
-                    });
 
-                    const tokenData = await tokenResponse.json();
-                    if (tokenData.access_token) {
-                        accessToken = tokenData.access_token;
-                        // Update token in database
-                        await updateDoc(userDocRef, {
-                            "integrations.google_calendar.access_token": tokenData.access_token,
-                            "integrations.google_calendar.expiry_date": new Date(Date.now() + (tokenData.expires_in * 1000)).toISOString()
-                        });
-                    }
-                } catch (err) {
-                    console.error("Token refresh failed:", err);
+        // ── Refresh token if expired ──────────────────────────────────────────
+        if (googleAuth.refresh_token) {
+            const expiry = new Date(googleAuth.expiry_date).getTime();
+            if (expiry < Date.now()) {
+                const tr = await fetch('https://oauth2.googleapis.com/token', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: new URLSearchParams({
+                        client_id:     process.env.GOOGLE_CLIENT_ID,
+                        client_secret: process.env.GOOGLE_CLIENT_SECRET,
+                        refresh_token: googleAuth.refresh_token,
+                        grant_type:    'refresh_token'
+                    })
+                });
+                const td = await tr.json();
+                if (td.access_token) {
+                    accessToken = td.access_token;
+                    await db.collection('users').doc(userEmail).update({
+                        'integrations.google_calendar.access_token': td.access_token,
+                        'integrations.google_calendar.expiry_date':
+                            new Date(Date.now() + td.expires_in * 1000).toISOString()
+                    });
                 }
             }
         }
 
-        // ============================================================================
-        // CRITICAL FIX: Parse datetime correctly for UTC calendar
-        // ============================================================================
-        let eventDate, endDate;
-
-        // Parse appointment time properly
-        const timeMatch = appointmentData.scheduledTime.match(/(\d{1,2}):(\d{2})\s*(AM|PM|am|pm)/i);
+        // ── Build start/end datetime ──────────────────────────────────────────
+        const timeMatch = appointmentData.scheduledTime.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
         let hours = 9, minutes = 0;
-
         if (timeMatch) {
-            hours = parseInt(timeMatch[1], 10);
+            hours   = parseInt(timeMatch[1], 10);
             minutes = parseInt(timeMatch[2], 10);
-            const period = timeMatch[3].toUpperCase();
-
-            if (period === "PM" && hours !== 12) hours += 12;
-            if (period === "AM" && hours === 12) hours = 0;
+            const pm = timeMatch[3].toUpperCase() === 'PM';
+            if (pm && hours !== 12) hours += 12;
+            if (!pm && hours === 12) hours = 0;
         }
+        const startISO = `${appointmentData.scheduledDate}T${String(hours).padStart(2,'0')}:${String(minutes).padStart(2,'0')}:00`;
+        const startDt  = new Date(startISO);
+        const endDt    = new Date(startDt.getTime() + 30 * 60000);
 
-        // Construct ISO datetime from date and time
-        const timeString = `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:00`;
-        const isoDateTime = `${appointmentData.scheduledDate}T${timeString}`;
-        
-        eventDate = new Date(isoDateTime);
+        if (isNaN(startDt.getTime())) return { success: false, error: 'Invalid date/time' };
 
-        // Ensure valid date
-        if (isNaN(eventDate.getTime())) {
-            console.error("Invalid event date:", appointmentData.scheduledDate, appointmentData.scheduledTime);
-            return { success: false, error: "Invalid appointment date/time format" };
-        }
-
-        // 30-minute duration
-        endDate = new Date(eventDate.getTime() + 30 * 60000);
-
-        console.log("Creating Google Calendar event:");
-        console.log("  Start (ISO):", eventDate.toISOString());
-        console.log("  End (ISO):", endDate.toISOString());
-        console.log("  Customer:", appointmentData.customerName);
-        console.log("  Scheduled Date:", appointmentData.scheduledDate);
-        console.log("  Scheduled Time:", appointmentData.scheduledTime);
-
-        // Create calendar event with proper timezone handling
-        const eventResponse = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${accessToken}`,
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                summary: `Appointment: ${appointmentData.customerName}`,
-                description: `📞 Contact: ${appointmentData.contactInfo}\n🤖 Booked via Comex AI\n💬 Conversation ID: ${appointmentData.conversationId}`,
-                start: {
-                    dateTime: eventDate.toISOString(),
-                    timeZone: 'UTC'
+        // ── Create the event ──────────────────────────────────────────────────
+        const evRes = await fetch(
+            'https://www.googleapis.com/calendar/v3/calendars/primary/events',
+            {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${accessToken}`,
+                    'Content-Type': 'application/json'
                 },
-                end: {
-                    dateTime: endDate.toISOString(),
-                    timeZone: 'UTC'
-                },
-                reminders: {
-                    useDefault: true,
-                    overrides: [
-                        { method: 'email', minutes: 1440 },  // 24 hours before
-                        { method: 'popup', minutes: 30 }      // 30 minutes before
-                    ]
-                },
-                visibility: 'public'
-            })
-        });
+                body: JSON.stringify({
+                    summary: `Appointment: ${appointmentData.customerName}`,
+                    description:
+                        `Contact: ${appointmentData.contactInfo}\nBooked via Comex AI`,
+                    start: { dateTime: startDt.toISOString(), timeZone: 'UTC' },
+                    end:   { dateTime: endDt.toISOString(),   timeZone: 'UTC' },
+                    reminders: { useDefault: true }
+                })
+            }
+        );
+        const evData = await evRes.json();
+        if (!evRes.ok) return { success: false, error: evData.error?.message || 'Calendar API error' };
 
-        const eventData = await eventResponse.json();
-        
-        if (!eventResponse.ok) {
-            console.error("Google Calendar API error:", eventData);
-            return { 
-                success: false, 
-                error: eventData.error?.message || JSON.stringify(eventData) 
-            };
-        }
+        console.log('[Calendar] ✓ Event created:', evData.id);
+        return { success: true, eventId: evData.id, eventLink: evData.htmlLink };
 
-        console.log("✅ Calendar event created successfully:", eventData.id);
-
-        return {
-            success: true,
-            eventId: eventData.id,
-            eventLink: eventData.htmlLink,
-            message: "Calendar event created"
-        };
-
-    } catch (error) {
-        console.error("Google Calendar Error:", error);
-        return {
-            success: false,
-            error: error.message || "Failed to create calendar event"
-        };
+    } catch (err) {
+        console.error('[Calendar] Error:', err);
+        return { success: false, error: err.message };
     }
 }
 
-// ============================================================================
-// WHATSAPP INTEGRATION (via Twilio) - FIXED FOR VERIFIED CONTACTS
-// ============================================================================
-
-export async function sendWhatsAppNotification(db, userEmail, appointmentData) {
+// ─────────────────────────────────────────────────────────────────────────────
+// WHATSAPP — send appointment confirmation to the BUSINESS OWNER's number
+//
+// Message format (exactly as requested):
+//   Appointment booked on {{Date}} at {{time}}
+//   with {{name}}
+//   {{email}}
+//
+//   Thanks
+//                  -Comex AI platform
+// ─────────────────────────────────────────────────────────────────────────────
+export async function sendWhatsAppNotification(userEmail, appointmentData) {
     try {
-        // Verify WhatsApp is connected and get the phone number
-        const userDocRef = doc(db, "users", userEmail);
-        const userDoc = await getDoc(userDocRef);
-        
-        if (!userDoc.exists()) {
-            console.log("User profile not found, cannot send WhatsApp");
-            return { success: false, error: "User profile not found" };
-        }
+        const db      = getAdminDb();
+        const userDoc = await db.collection('users').doc(userEmail).get();
+        if (!userDoc.exists) return { success: false, error: 'User not found' };
 
-        const userData = userDoc.data();
-        const whatsappAuth = userData?.integrations?.whatsappAlerts;
-
-        if (!whatsappAuth || !whatsappAuth.connected) {
-            console.log("WhatsApp not connected for user:", userEmail);
-            return { success: false, error: "WhatsApp not connected" };
-        }
+        const waAuth = userDoc.data()?.integrations?.whatsappAlerts;
+        if (!waAuth?.connected) return { success: false, error: 'WhatsApp not connected' };
 
         const accountSid = process.env.TWILIO_ACCOUNT_SID;
-        const authToken = process.env.TWILIO_AUTH_TOKEN;
-        const twilioWhatsAppNumber = process.env.TWILIO_WHATSAPP_NUMBER;
+        const authToken  = process.env.TWILIO_AUTH_TOKEN;
+        const fromNumber = process.env.TWILIO_WHATSAPP_NUMBER;
 
-        if (!accountSid || !authToken || !twilioWhatsAppNumber) {
-            console.log("WhatsApp not fully configured on server");
-            return { success: false, error: "Twilio credentials not configured" };
+        if (!accountSid || !authToken || !fromNumber) {
+            return { success: false, error: 'Twilio credentials not set' };
         }
 
-        // Use customer's WhatsApp number from appointment data
-        let toNumber = appointmentData.contactInfo || whatsappAuth.phoneNumber;
-        if (!toNumber.startsWith('+')) {
-            toNumber = '+' + toNumber;
-        }
+        // Send to the BUSINESS owner's verified WhatsApp number
+        let toNumber = waAuth.phoneNumber.replace(/[\s\-\(\)]/g, '');
+        if (!toNumber.startsWith('+')) toNumber = '+' + toNumber;
 
-        // Format appointment details
-        const message = `✅ *Appointment Confirmed*
+        // ── Exact message format requested ────────────────────────────────────
+        const messageBody =
+            `Appointment booked on ${appointmentData.scheduledDate} at ${appointmentData.scheduledTime}\n` +
+            `with ${appointmentData.customerName}\n` +
+            `${appointmentData.contactInfo}\n\n` +
+            `Thanks\n` +
+            `               -Comex AI platform`;
 
-📅 *Date:* ${appointmentData.scheduledDate}
-🕐 *Time:* ${appointmentData.scheduledTime}
-👤 *With:* ${appointmentData.customerName}
+        const basicAuth = Buffer.from(`${accountSid}:${authToken}`).toString('base64');
 
-📞 *Contact:* ${appointmentData.contactInfo}
-
-Thank you for booking with us!
-_Confirmation ID: ${appointmentData.conversationId}_`;
-
-        const auth = Buffer.from(`${accountSid}:${authToken}`).toString('base64');
-        
-        const response = await fetch(
+        const twRes = await fetch(
             `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`,
             {
                 method: 'POST',
                 headers: {
-                    'Authorization': `Basic ${auth}`,
+                    Authorization: `Basic ${basicAuth}`,
                     'Content-Type': 'application/x-www-form-urlencoded'
                 },
                 body: new URLSearchParams({
-                    From: `whatsapp:${twilioWhatsAppNumber}`,
-                    To: `whatsapp:${toNumber}`,
-                    Body: message
+                    From: `whatsapp:${fromNumber}`,
+                    To:   `whatsapp:${toNumber}`,
+                    Body: messageBody
                 })
             }
         );
+        const twData = await twRes.json();
 
-        const data = await response.json();
-
-        if (!response.ok) {
-            console.error("WhatsApp API error:", data);
-            return { success: false, error: data.message || "Failed to send WhatsApp message" };
+        if (!twRes.ok) {
+            console.error('[WhatsApp] Twilio error:', twData);
+            return { success: false, error: twData.message };
         }
 
-        console.log("✅ WhatsApp message sent:", data.sid);
+        console.log('[WhatsApp] ✓ Appointment notification sent | SID:', twData.sid);
+        return { success: true, messageId: twData.sid };
 
-        return {
-            success: true,
-            messageId: data.sid,
-            message: "WhatsApp notification sent"
-        };
-
-    } catch (error) {
-        console.error("WhatsApp Error:", error);
-        return {
-            success: false,
-            error: error.message || "Failed to send WhatsApp message"
-        };
+    } catch (err) {
+        console.error('[WhatsApp] Error:', err);
+        return { success: false, error: err.message };
     }
 }
 
-// ============================================================================
-// AVAILABILITY CHECKING (Calendar Conflict Detection)
-// ============================================================================
-
-export async function checkCalendarAvailability(db, userEmail, date, timeSlot) {
+// ─────────────────────────────────────────────────────────────────────────────
+// CALENDAR AVAILABILITY CHECK
+// ─────────────────────────────────────────────────────────────────────────────
+export async function checkCalendarAvailability(userEmail, date, timeSlot) {
     try {
-        const userDocRef = doc(db, "users", userEmail);
-        const userDoc = await getDoc(userDocRef);
-        
-        if (!userDoc.exists()) {
-            return { available: true, reason: "User not found - proceeding with booking" };
-        }
+        const db      = getAdminDb();
+        const userDoc = await db.collection('users').doc(userEmail).get();
+        if (!userDoc.exists) return { available: true };
 
-        const userData = userDoc.data();
-        const googleAuth = userData?.integrations?.google_calendar;
-        
-        if (!googleAuth || !googleAuth.connected) {
-            return { available: true, reason: "Calendar not synced" };
-        }
+        const googleAuth = userDoc.data()?.integrations?.google_calendar;
+        if (!googleAuth?.connected) return { available: true };
 
-        let accessToken = googleAuth.access_token;
-
-        // Parse the time properly
-        const timeMatch = timeSlot.match(/(\d{1,2}):(\d{2})\s*(AM|PM|am|pm)/i);
+        const timeMatch = timeSlot.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
         let hours = 9, minutes = 0;
-
         if (timeMatch) {
-            hours = parseInt(timeMatch[1], 10);
+            hours   = parseInt(timeMatch[1], 10);
             minutes = parseInt(timeMatch[2], 10);
-            const period = timeMatch[3].toUpperCase();
-
-            if (period === "PM" && hours !== 12) hours += 12;
-            if (period === "AM" && hours === 12) hours = 0;
+            const pm = timeMatch[3].toUpperCase() === 'PM';
+            if (pm && hours !== 12) hours += 12;
+            if (!pm && hours === 12) hours = 0;
         }
+        const startISO = `${date}T${String(hours).padStart(2,'0')}:${String(minutes).padStart(2,'0')}:00`;
+        const startDt  = new Date(startISO);
+        const endDt    = new Date(startDt.getTime() + 60 * 60000);
 
-        const timeString = `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:00`;
-        const isoDateTime = `${date}T${timeString}`;
-        const eventDate = new Date(isoDateTime);
-        const endDate = new Date(eventDate.getTime() + 60 * 60000); // 1 hour
-
-        console.log("Checking calendar availability:", eventDate.toISOString(), "-", endDate.toISOString());
-
-        const response = await fetch(
-            `https://www.googleapis.com/calendar/v3/calendars/primary/events?` +
-            `timeMin=${eventDate.toISOString()}&` +
-            `timeMax=${endDate.toISOString()}&` +
-            `singleEvents=true&` +
-            `showDeleted=false`,
-            {
-                headers: {
-                    'Authorization': `Bearer ${accessToken}`,
-                    'Content-Type': 'application/json'
-                }
-            }
+        const qRes = await fetch(
+            `https://www.googleapis.com/calendar/v3/calendars/primary/events` +
+            `?timeMin=${startDt.toISOString()}&timeMax=${endDt.toISOString()}&singleEvents=true`,
+            { headers: { Authorization: `Bearer ${googleAuth.access_token}` } }
         );
+        const qData = await qRes.json();
+        const booked = qData.items?.length > 0;
 
-        const data = await response.json();
-        const isBooked = data.items && data.items.length > 0;
-        
-        console.log("Availability check result:", isBooked ? "BOOKED" : "AVAILABLE", `(${data.items?.length || 0} conflicts)`);
-        
         return {
-            available: !isBooked,
-            bookedEvents: isBooked ? data.items : [],
-            suggestedTimes: isBooked ? generateSuggestedTimes(eventDate) : null
+            available:    !booked,
+            suggestedTimes: booked ? generateSlots(startDt) : null
         };
-
-    } catch (error) {
-        console.error("Availability Check Error:", error);
-        return { available: true, reason: "Could not verify - proceeding with booking" };
+    } catch (err) {
+        console.error('[Availability] Error:', err);
+        return { available: true };
     }
 }
 
-function generateSuggestedTimes(baseDate) {
-    const suggestions = [];
-    let nextSlot = new Date(baseDate);
-    
-    for (let i = 0; i < 3; i++) {
-        nextSlot.setHours(nextSlot.getHours() + 1);
-        
-        if (nextSlot.getHours() >= 9 && nextSlot.getHours() < 17) {
-            suggestions.push({
-                date: nextSlot.toLocaleDateString(),
-                time: nextSlot.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true })
+function generateSlots(base) {
+    const slots = [];
+    const d = new Date(base);
+    for (let i = 1; i <= 3; i++) {
+        d.setHours(d.getHours() + 1);
+        if (d.getHours() >= 9 && d.getHours() < 17) {
+            slots.push({
+                date: d.toLocaleDateString(),
+                time: d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true })
             });
         }
     }
-    
-    return suggestions;
+    return slots;
 }
