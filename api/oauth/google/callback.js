@@ -1,103 +1,71 @@
-import { initializeApp, getApps, getApp } from 'firebase/app';
-import { getFirestore, doc, setDoc } from 'firebase/firestore';
-
-const firebaseConfig = {
-    apiKey: "AIzaSyD0q99R9wn-r6e5aygL2zzg7e-Gc439ssY",
-    authDomain: "cometchat-ai-platform.firebaseapp.com",
-    projectId: "cometchat-ai-platform",
-    storageBucket: "cometchat-ai-platform.firebasestorage.app",
-    messagingSenderId: "604438924597",
-    appId: "1:604438924597:web:a180d59f7f00385138507c"
-};
-
-const app = !getApps().length ? initializeApp(firebaseConfig) : getApp();
-const db = getFirestore(app);
+// api/oauth/callback.js  (also used by api/oauth/google/callback.js — same file)
+import { getAdminDb } from '../firebaseAdmin.js';
 
 export default async function handler(req, res) {
     const { code, state, error } = req.query;
 
-    if (error) {
-        return res.status(400).send(`OAuth Error: ${error}`);
-    }
+    if (error) return res.status(400).send(`OAuth Error: ${error}`);
+    if (!code || !state) return res.status(400).send('Missing code or state.');
 
-    if (!code || !state) {
-        return res.status(400).send("Missing code or state parameters.");
-    }
-
-    let email = "";
-    let origin = "";
-
+    let email = '', origin = '';
     try {
-        // Decode state parameter (JSON containing email and original site origin)
-        const decodedState = JSON.parse(Buffer.from(state, 'base64').toString('utf-8'));
-        email = decodedState.email;
-        origin = decodedState.origin;
-    } catch (e) {
-        // Fallback if state was not base64 encoded JSON
-        email = state;
+        const decoded = JSON.parse(Buffer.from(state, 'base64').toString('utf-8'));
+        email  = decoded.email;
+        origin = decoded.origin;
+    } catch {
+        email  = state;
         origin = `https://${req.headers.host}`;
     }
 
-    const clientId = process.env.GOOGLE_CLIENT_ID;
+    const clientId     = process.env.GOOGLE_CLIENT_ID;
     const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+    const redirectUri  = process.env.GOOGLE_REDIRECT_URI || `https://${req.headers.host}/api/oauth/callback`;
 
     if (!clientId || !clientSecret) {
-        return res.status(500).send("Server configuration missing client credentials.");
+        return res.status(500).send('Server config error: missing Google credentials.');
     }
 
-    const redirectUri = process.env.GOOGLE_REDIRECT_URI || `https://${req.headers.host}/api/oauth/callback`;
-
     try {
-        // Exchange code for tokens
-        const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
+        // ── 1. Exchange auth code for tokens ──────────────────────────────────
+        const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
             method: 'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
             body: new URLSearchParams({
-                code,
-                client_id: clientId,
-                client_secret: clientSecret,
-                redirect_uri: redirectUri,
-                grant_type: 'authorization_code'
+                code, client_id: clientId, client_secret: clientSecret,
+                redirect_uri: redirectUri, grant_type: 'authorization_code'
             })
         });
-
-        const tokens = await tokenResponse.json();
+        const tokens = await tokenRes.json();
 
         if (tokens.error) {
-            return res.status(400).send(`Token Exchange Failed: ${tokens.error_description || tokens.error}`);
+            return res.status(400).send(`Token exchange failed: ${tokens.error_description || tokens.error}`);
         }
 
-        // Calculate absolute token expiry date
-        const expiryDate = tokens.expires_in 
-            ? new Date(Date.now() + tokens.expires_in * 1000).toISOString() 
-            : new Date(Date.now() + 3500 * 1000).toISOString();
-
-        // Save tokens to Firestore
-        const userRef = doc(db, "users", email);
+        // ── 2. Save to Firestore via Admin SDK (bypasses security rules) ──────
+        const db = getAdminDb();
         const calendarData = {
-            connected: true,
+            connected:    true,
             access_token: tokens.access_token,
-            expiry_date: expiryDate
+            expiry_date:  tokens.expires_in
+                ? new Date(Date.now() + tokens.expires_in * 1000).toISOString()
+                : new Date(Date.now() + 3500 * 1000).toISOString()
         };
+        if (tokens.refresh_token) calendarData.refresh_token = tokens.refresh_token;
 
-        // If Google returned a refresh token (typically on the first consent prompt), save it
-        if (tokens.refresh_token) {
-            calendarData.refresh_token = tokens.refresh_token;
-        }
+        await db.collection('users').doc(email).set(
+            { integrations: { google_calendar: calendarData } },
+            { merge: true }
+        );
 
-        await setDoc(userRef, {
-            integrations: {
-                google_calendar: calendarData
-            }
-        }, { merge: true });
+        console.log('[OAuth] ✓ Google Calendar tokens saved for', email);
 
-        // Redirect user back to the application integrations panel
-        // Ensure origin does not end with trailing slash if adding relative hash
+        // ── 3. Redirect back to app ───────────────────────────────────────────
         const cleanOrigin = origin.endsWith('/') ? origin.slice(0, -1) : origin;
         return res.redirect(`${cleanOrigin}/#integrationsView`);
 
     } catch (err) {
-        console.error("OAuth Callback Handler Error:", err);
-        return res.status(500).send("Internal Server Error during OAuth callback processing.");
+        console.error('[OAuth] Error:', err);
+        const cleanOrigin = origin.endsWith('/') ? origin.slice(0, -1) : origin;
+        return res.redirect(`${cleanOrigin}/#integrationsView?calendar_error=1`);
     }
 }
