@@ -10,7 +10,9 @@ export default async function handler(req, res) {
     if (req.method !== 'POST')   return res.status(405).json({ success: false, message: 'Method Not Allowed' });
 
     const { businessId, url } = req.body;
-    if (!url || !businessId) return res.status(400).json({ success: false, message: 'Missing businessId or url.' });
+    if (!url || !businessId) {
+        return res.status(400).json({ success: false, message: 'Missing businessId or url.' });
+    }
 
     try {
         const pageRes = await fetch(url, {
@@ -30,7 +32,11 @@ export default async function handler(req, res) {
             { merge: true }
         );
 
-        return res.json({ success: true, message: `Scraped and saved ${text.length} chars.`, snippet: text.substring(0,200) });
+        return res.json({
+            success: true,
+            message: `Scraped and saved ${text.length} chars.`,
+            snippet: text.substring(0, 200)
+        });
     } catch (err) {
         console.error('[Scrape] Error:', err);
         return res.status(500).json({ success: false, message: err.message });
