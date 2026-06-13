@@ -1,11 +1,5 @@
 // api/whatsapp-verify-confirm.js
-// ─────────────────────────────────────────────────────────────────────────────
-// Step 2 of WhatsApp verification:
-//   • Read the pending verification record (Admin SDK)
-//   • Validate the code the user typed
-//   • On success → save whatsappAlerts integration to users/{email}
-//   • On failure → increment attempts, lock out after 3
-// ─────────────────────────────────────────────────────────────────────────────
+// Step 2: Validate the code the user entered; save WhatsApp integration on success
 import { getAdminDb } from './firebaseAdmin.js';
 
 export default async function handler(req, res) {
@@ -13,6 +7,7 @@ export default async function handler(req, res) {
     res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
     if (req.method === 'OPTIONS') return res.status(200).end();
+    if (req.method !== 'POST')   return res.status(405).json({ success: false });
 
     try {
         const { userEmail, verificationCode } = req.body;
@@ -28,29 +23,29 @@ export default async function handler(req, res) {
         if (!verSnap.exists) {
             return res.status(404).json({
                 success: false,
-                message: 'No verification request found. Please scan the QR and send the message again.'
+                message: 'No pending verification found. Please start again.'
             });
         }
 
         const data = verSnap.data();
 
-        // ── Expiry check ──────────────────────────────────────────────────────
+        // Check expiry
         if (Date.now() > new Date(data.expiresAt).getTime()) {
             await verRef.delete();
             return res.status(400).json({
                 success: false,
-                message: 'Verification code has expired. Please try again.'
+                message: 'Verification code has expired. Please request a new one.'
             });
         }
 
-        // ── Code match ────────────────────────────────────────────────────────
+        // Check attempts
+        const attempts = (data.attempts || 0) + 1;
         if (data.verificationCode !== verificationCode.trim()) {
-            const attempts = (data.attempts || 0) + 1;
             if (attempts >= 3) {
                 await verRef.delete();
                 return res.status(400).json({
                     success: false,
-                    message: 'Too many incorrect attempts. Please start again.'
+                    message: 'Too many incorrect attempts. Please start the verification again.'
                 });
             }
             await verRef.update({ attempts });
@@ -60,7 +55,7 @@ export default async function handler(req, res) {
             });
         }
 
-        // ── ✓ Code is correct — save integration ─────────────────────────────
+        // ✓ Code is correct — save WhatsApp integration
         const phoneNumber = data.phoneNumber;
 
         await db.collection('users').doc(userEmail).set(
@@ -68,7 +63,7 @@ export default async function handler(req, res) {
                 integrations: {
                     whatsappAlerts: {
                         connected:   true,
-                        phoneNumber, // the BUSINESS owner's number
+                        phoneNumber,
                         service:     'twilio',
                         verifiedAt:  new Date().toISOString(),
                         status:      'active'
@@ -78,14 +73,14 @@ export default async function handler(req, res) {
             { merge: true }
         );
 
-        // Clean up temp record
+        // Clean up verification record
         await verRef.delete();
 
         console.log('[WA-Confirm] ✓ WhatsApp connected for', userEmail, 'phone:', phoneNumber);
 
         return res.status(200).json({
             success:     true,
-            message:     'WhatsApp connected successfully!',
+            message:     '✅ WhatsApp connected successfully!',
             phoneNumber
         });
 
