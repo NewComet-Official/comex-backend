@@ -2,7 +2,7 @@
 import { getAdminDb } from './firebaseAdmin.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GOOGLE CALENDAR — create event
+// GOOGLE CALENDAR — create calendar event
 // ─────────────────────────────────────────────────────────────────────────────
 export async function createGoogleCalendarEvent(userEmail, appointmentData) {
     try {
@@ -16,12 +16,12 @@ export async function createGoogleCalendarEvent(userEmail, appointmentData) {
 
         let accessToken = googleAuth.access_token;
 
-        // ── Refresh token if expired ──────────────────────────────────────────
+        // Refresh token if expired
         if (googleAuth.refresh_token) {
             const expiry = new Date(googleAuth.expiry_date).getTime();
             if (expiry < Date.now()) {
                 const tr = await fetch('https://oauth2.googleapis.com/token', {
-                    method: 'POST',
+                    method:  'POST',
                     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
                     body: new URLSearchParams({
                         client_id:     process.env.GOOGLE_CLIENT_ID,
@@ -42,7 +42,7 @@ export async function createGoogleCalendarEvent(userEmail, appointmentData) {
             }
         }
 
-        // ── Build start/end datetime ──────────────────────────────────────────
+        // Parse the appointment time into start/end datetimes
         const timeMatch = appointmentData.scheduledTime.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
         let hours = 9, minutes = 0;
         if (timeMatch) {
@@ -52,25 +52,23 @@ export async function createGoogleCalendarEvent(userEmail, appointmentData) {
             if (pm && hours !== 12) hours += 12;
             if (!pm && hours === 12) hours = 0;
         }
+
         const startISO = `${appointmentData.scheduledDate}T${String(hours).padStart(2,'0')}:${String(minutes).padStart(2,'0')}:00`;
         const startDt  = new Date(startISO);
-        const endDt    = new Date(startDt.getTime() + 30 * 60000);
+        if (isNaN(startDt.getTime())) return { success: false, error: 'Invalid date/time for calendar event' };
+        const endDt    = new Date(startDt.getTime() + 30 * 60000); // 30-minute slot
 
-        if (isNaN(startDt.getTime())) return { success: false, error: 'Invalid date/time' };
-
-        // ── Create the event ──────────────────────────────────────────────────
         const evRes = await fetch(
             'https://www.googleapis.com/calendar/v3/calendars/primary/events',
             {
-                method: 'POST',
+                method:  'POST',
                 headers: {
-                    Authorization: `Bearer ${accessToken}`,
+                    Authorization:  `Bearer ${accessToken}`,
                     'Content-Type': 'application/json'
                 },
                 body: JSON.stringify({
-                    summary: `Appointment: ${appointmentData.customerName}`,
-                    description:
-                        `Contact: ${appointmentData.contactInfo}\nBooked via Comex AI`,
+                    summary:     `Appointment: ${appointmentData.customerName}`,
+                    description: `Contact: ${appointmentData.contactInfo}\nBooked via Comex AI`,
                     start: { dateTime: startDt.toISOString(), timeZone: 'UTC' },
                     end:   { dateTime: endDt.toISOString(),   timeZone: 'UTC' },
                     reminders: { useDefault: true }
@@ -90,9 +88,9 @@ export async function createGoogleCalendarEvent(userEmail, appointmentData) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WHATSAPP — send appointment confirmation to the BUSINESS OWNER's number
+// WHATSAPP — send appointment confirmation to BUSINESS OWNER via Twilio
 //
-// Message format (exactly as requested):
+// Message format (exact):
 //   Appointment booked on {{Date}} at {{time}}
 //   with {{name}}
 //   {{email}}
@@ -111,17 +109,15 @@ export async function sendWhatsAppNotification(userEmail, appointmentData) {
 
         const accountSid = process.env.TWILIO_ACCOUNT_SID;
         const authToken  = process.env.TWILIO_AUTH_TOKEN;
-        const fromNumber = process.env.TWILIO_WHATSAPP_NUMBER;
+        const fromNumber = process.env.TWILIO_WHATSAPP_NUMBER; // Twilio sandbox or approved number
 
         if (!accountSid || !authToken || !fromNumber) {
-            return { success: false, error: 'Twilio credentials not set' };
+            return { success: false, error: 'Twilio credentials not set in env vars' };
         }
 
-        // Send to the BUSINESS owner's verified WhatsApp number
         let toNumber = waAuth.phoneNumber.replace(/[\s\-\(\)]/g, '');
         if (!toNumber.startsWith('+')) toNumber = '+' + toNumber;
 
-        // ── Exact message format requested ────────────────────────────────────
         const messageBody =
             `Appointment booked on ${appointmentData.scheduledDate} at ${appointmentData.scheduledTime}\n` +
             `with ${appointmentData.customerName}\n` +
@@ -134,9 +130,9 @@ export async function sendWhatsAppNotification(userEmail, appointmentData) {
         const twRes = await fetch(
             `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`,
             {
-                method: 'POST',
+                method:  'POST',
                 headers: {
-                    Authorization: `Basic ${basicAuth}`,
+                    Authorization:  `Basic ${basicAuth}`,
                     'Content-Type': 'application/x-www-form-urlencoded'
                 },
                 body: new URLSearchParams({
@@ -183,6 +179,7 @@ export async function checkCalendarAvailability(userEmail, date, timeSlot) {
             if (pm && hours !== 12) hours += 12;
             if (!pm && hours === 12) hours = 0;
         }
+
         const startISO = `${date}T${String(hours).padStart(2,'0')}:${String(minutes).padStart(2,'0')}:00`;
         const startDt  = new Date(startISO);
         const endDt    = new Date(startDt.getTime() + 60 * 60000);
@@ -192,11 +189,11 @@ export async function checkCalendarAvailability(userEmail, date, timeSlot) {
             `?timeMin=${startDt.toISOString()}&timeMax=${endDt.toISOString()}&singleEvents=true`,
             { headers: { Authorization: `Bearer ${googleAuth.access_token}` } }
         );
-        const qData = await qRes.json();
+        const qData  = await qRes.json();
         const booked = qData.items?.length > 0;
 
         return {
-            available:    !booked,
+            available:      !booked,
             suggestedTimes: booked ? generateSlots(startDt) : null
         };
     } catch (err) {
