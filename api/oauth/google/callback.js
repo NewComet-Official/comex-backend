@@ -1,11 +1,11 @@
-// api/oauth/callback.js  (also used by api/oauth/google/callback.js — same file)
-import { getAdminDb } from '../firebaseAdmin.js';
+// api/oauth/google/callback.js
+import { getAdminDb } from '../../firebaseAdmin.js';
 
 export default async function handler(req, res) {
     const { code, state, error } = req.query;
 
     if (error) return res.status(400).send(`OAuth Error: ${error}`);
-    if (!code || !state) return res.status(400).send('Missing code or state.');
+    if (!code || !state) return res.status(400).send('Missing code or state parameters.');
 
     let email = '', origin = '';
     try {
@@ -19,20 +19,24 @@ export default async function handler(req, res) {
 
     const clientId     = process.env.GOOGLE_CLIENT_ID;
     const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-    const redirectUri  = process.env.GOOGLE_REDIRECT_URI || `https://${req.headers.host}/api/oauth/callback`;
+    const redirectUri  = process.env.GOOGLE_REDIRECT_URI ||
+                         `https://${req.headers.host}/api/oauth/google/callback`;
 
     if (!clientId || !clientSecret) {
-        return res.status(500).send('Server config error: missing Google credentials.');
+        return res.status(500).send('Server config error: missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET.');
     }
 
     try {
-        // ── 1. Exchange auth code for tokens ──────────────────────────────────
+        // Exchange auth code for access + refresh tokens
         const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
-            method: 'POST',
+            method:  'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
             body: new URLSearchParams({
-                code, client_id: clientId, client_secret: clientSecret,
-                redirect_uri: redirectUri, grant_type: 'authorization_code'
+                code,
+                client_id:     clientId,
+                client_secret: clientSecret,
+                redirect_uri:  redirectUri,
+                grant_type:    'authorization_code'
             })
         });
         const tokens = await tokenRes.json();
@@ -41,8 +45,7 @@ export default async function handler(req, res) {
             return res.status(400).send(`Token exchange failed: ${tokens.error_description || tokens.error}`);
         }
 
-        // ── 2. Save to Firestore via Admin SDK (bypasses security rules) ──────
-        const db = getAdminDb();
+        // Build calendar data object
         const calendarData = {
             connected:    true,
             access_token: tokens.access_token,
@@ -50,22 +53,25 @@ export default async function handler(req, res) {
                 ? new Date(Date.now() + tokens.expires_in * 1000).toISOString()
                 : new Date(Date.now() + 3500 * 1000).toISOString()
         };
-        if (tokens.refresh_token) calendarData.refresh_token = tokens.refresh_token;
+        if (tokens.refresh_token) {
+            calendarData.refresh_token = tokens.refresh_token;
+        }
 
+        // Save to Firestore via Admin SDK (bypasses security rules)
+        const db = getAdminDb();
         await db.collection('users').doc(email).set(
             { integrations: { google_calendar: calendarData } },
             { merge: true }
         );
 
-        console.log('[OAuth] ✓ Google Calendar tokens saved for', email);
+        console.log('[OAuth/Google] ✓ Tokens saved for:', email);
 
-        // ── 3. Redirect back to app ───────────────────────────────────────────
+        // Redirect back to the integrations panel
         const cleanOrigin = origin.endsWith('/') ? origin.slice(0, -1) : origin;
         return res.redirect(`${cleanOrigin}/#integrationsView`);
 
     } catch (err) {
-        console.error('[OAuth] Error:', err);
-        const cleanOrigin = origin.endsWith('/') ? origin.slice(0, -1) : origin;
-        return res.redirect(`${cleanOrigin}/#integrationsView?calendar_error=1`);
+        console.error('[OAuth/Google] Error:', err);
+        return res.status(500).send(`Internal server error: ${err.message}`);
     }
 }
