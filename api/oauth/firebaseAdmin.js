@@ -1,4 +1,4 @@
-\// api/firebaseAdmin.js
+// api/firebaseAdmin.js
 // Singleton Firebase Admin SDK — imported by every API route.
 // Requires env var: FIREBASE_SERVICE_ACCOUNT_JSON (base64-encoded service account JSON)
 
