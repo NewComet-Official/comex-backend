@@ -11,8 +11,8 @@ export default async function handler(req, res) {
     if (!businessId) return res.json({ success: false, message: 'Missing businessId.' });
 
     try {
-        const db    = getAdminDb();
-        const snap  = await db.collection('user_bots').doc(businessId).collection('chats').get();
+        const db   = getAdminDb();
+        const snap = await db.collection('user_bots').doc(businessId).collection('chats').get();
 
         let total = 0, genuine = 0, leads = 0;
         snap.forEach(d => {
@@ -23,19 +23,19 @@ export default async function handler(req, res) {
             if (c.isLeadCaptured || c.leadCaptured) leads++;
         });
 
-        const hoursSaved      = parseFloat(((genuine * 15) / 60).toFixed(1));
-        const supportSavings  = genuine * ((15 / 60) * 20);
-        const leadRevenue     = leads * 50;
-        const netROI          = supportSavings + leadRevenue;
-        const resolutionRate  = genuine > 0 ? Math.round(((genuine - leads) / genuine) * 100) : 100;
+        const hoursSaved     = parseFloat(((genuine * 15) / 60).toFixed(1));
+        const supportSavings = genuine * ((15 / 60) * 20);
+        const leadRevenue    = leads * 50;
+        const netROI         = supportSavings + leadRevenue;
+        const resolutionRate = genuine > 0 ? Math.round(((genuine - leads) / genuine) * 100) : 100;
 
         return res.json({
-            success:            true,
-            totalConversations: total,
+            success:              true,
+            totalConversations:   total,
             genuineConversations: genuine,
             hoursSaved,
-            moneySaved:         parseFloat(netROI.toFixed(2)),
-            leadsCaptured:      leads,
+            moneySaved:           parseFloat(netROI.toFixed(2)),
+            leadsCaptured:        leads,
             resolutionRate
         });
     } catch (err) {
