@@ -10,6 +10,10 @@
       "dest": "/api/oauth/google/callback.js"
     },
     {
+      "source": "/api/oauth/google",
+      "dest": "/api/oauth/google.js"
+    },
+    {
       "source": "/api/whatsapp-verify",
       "dest": "/api/whatsapp-verify.js"
     },
