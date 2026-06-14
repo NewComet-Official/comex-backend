@@ -1,29 +1,12 @@
 {
   "version": 2,
   "routes": [
-    {
-      "source": "/widget.js",
-      "dest": "/public/widget.js"
-    },
-    {
-      "source": "/api/oauth/google/callback",
-      "dest": "/api/oauth/google/callback.js"
-    },
-    {
-      "source": "/api/oauth/google",
-      "dest": "/api/oauth/google.js"
-    },
-    {
-      "source": "/api/whatsapp-verify",
-      "dest": "/api/whatsapp-verify.js"
-    },
-    {
-      "source": "/api/whatsapp-verify-confirm",
-      "dest": "/api/whatsapp-verify-confirm.js"
+    { "source": "/widget.js",
+    "dest": "/public/widget.js"
     },
     {
       "source": "/api/(.*)",
-      "dest": "/api/$1.js"
+      "dest": "/api/index.js" 
     }
   ]
 }
