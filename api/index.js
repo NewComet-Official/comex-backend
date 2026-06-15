@@ -21,7 +21,7 @@ function getDb() {
 function cors(res) {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 }
 
 // ─── Main Router ─────────────────────────────────────────────────────────────
@@ -124,11 +124,11 @@ async function handleConfig(req, res) {
         const b = snap.data();
         return res.status(200).json({
             success:      true,
-            name:         b.name                   || 'AI Assistant',
-            position:     b.position               || 'bottom-right',
-            logoBase64:   b.logoBase64             || null,
+            name:         b.name                     || 'AI Assistant',
+            position:     b.position                 || 'bottom-right',
+            logoBase64:   b.logoBase64               || null,
             themeColor:   b.designConfig?.themeColor || '#0f172a',
-            designConfig: b.designConfig           || {}
+            designConfig: b.designConfig             || {}
         });
     } catch (err) {
         console.error('[Config]', err.message);
@@ -138,6 +138,8 @@ async function handleConfig(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // 4. CHAT — AI responses + appointment booking
+// FIX: Upgraded system prompt to PREVENT JSON leakage from llama-3.1-8b-instant
+// FIX: tool_choice set to 'required' when all 4 fields are present in history
 // ════════════════════════════════════════════════════════════════════════════
 async function handleChat(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -156,7 +158,6 @@ async function handleChat(req, res) {
     const db = getDb();
 
     try {
-        // Load bot config
         const botSnap = await db.collection('user_bots').doc(businessId).get();
         let sysPrompt = 'You are a helpful, friendly customer service assistant.';
         let ownerEmail = '', botName = 'Assistant';
@@ -177,15 +178,34 @@ async function handleChat(req, res) {
             }
         }
 
-        sysPrompt += `\n\nAPPOINTMENT BOOKING: If the user wants to book, collect full name, contact (email/phone), day, and time ONE AT A TIME. Once you have all 4, call appointmentBooking immediately. Never re-ask for info already in the conversation.`;
+        // ── CRITICAL FIX: Strict booking prompt prevents JSON leakage ──
+        // llama-3.1-8b-instant sometimes prints tool call JSON as text instead
+        // of invoking the tool. These rules stop that behaviour.
+        sysPrompt += `
+
+APPOINTMENT BOOKING RULES — FOLLOW EXACTLY:
+1. Collect ONLY ONE piece of info per message: full name → contact (email or phone) → preferred day → preferred time. Ask them one at a time.
+2. Once you have all 4 pieces, SILENTLY call the appointmentBooking tool. Do NOT print JSON, do NOT print the arguments, do NOT say "I have all the info". Just call the tool immediately.
+3. NEVER output raw JSON, curly braces {}, or function arguments in your reply. That is a critical error.
+4. NEVER re-ask for information already provided in the conversation history.
+5. Accept flexible date/time formats: "Monday", "17 June", "3 pm", "3:00 PM", "next Tuesday" are all valid.
+6. After the tool is called and booking is confirmed, reply with the confirmation message only.`;
 
         const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
         const safeHistory = (Array.isArray(history) ? history : [])
             .slice(-10)
             .filter(m => m?.role && m?.content);
 
+        // Detect if all 4 booking fields are already in history to force tool call
+        const historyText = safeHistory.map(m => m.content).join(' ').toLowerCase();
+        const hasName    = /my name is|i('m| am)|name[:\s]+[a-z]/i.test(historyText);
+        const hasContact = /[@]|email|phone|number/i.test(historyText);
+        const hasDay     = /monday|tuesday|wednesday|thursday|friday|saturday|sunday|january|february|march|april|may|june|july|august|september|october|november|december|\d{1,2}[\s\/\-]\w+/i.test(historyText);
+        const hasTime    = /\d{1,2}(:\d{2})?\s*(am|pm)|morning|afternoon|evening|\d{1,2}\s*o'?clock/i.test(historyText);
+        const allFieldsPresent = hasName && hasContact && hasDay && hasTime;
+
         const completion = await groq.chat.completions.create({
-            model: 'llama-3.1-8b-instant',
+            model:       'llama-3.3-70b-versatile', // Upgraded: much better tool-calling than 8b-instant
             messages: [
                 { role: 'system', content: sysPrompt },
                 ...safeHistory,
@@ -195,25 +215,48 @@ async function handleChat(req, res) {
                 type: 'function',
                 function: {
                     name: 'appointmentBooking',
-                    description: 'Book appointment once name, contact, day, and time are all confirmed.',
+                    description: 'Call this function immediately and silently once you have collected: full name, contact info, appointment day, and appointment time. Do not print the arguments.',
                     parameters: {
                         type: 'object',
                         properties: {
-                            userName:        { type: 'string' },
-                            contactInfo:     { type: 'string' },
-                            appointmentDay:  { type: 'string' },
-                            appointmentTime: { type: 'string' }
+                            userName:        { type: 'string', description: 'Full name of the customer' },
+                            contactInfo:     { type: 'string', description: 'Email address or phone number' },
+                            appointmentDay:  { type: 'string', description: 'Day or date of the appointment' },
+                            appointmentTime: { type: 'string', description: 'Time of the appointment' }
                         },
                         required: ['userName', 'contactInfo', 'appointmentDay', 'appointmentTime']
                     }
                 }
             }],
-            tool_choice: 'auto',
-            temperature: 0.5,
-            max_tokens: 800
+            // Force tool call when all fields are detected in history
+            tool_choice:  allFieldsPresent ? { type: 'function', function: { name: 'appointmentBooking' } } : 'auto',
+            temperature:  0.3, // Lower = less hallucination / JSON leakage
+            max_tokens:   600
         });
 
         const choice = completion.choices[0]?.message;
+
+        // ── SAFETY NET: catch JSON leakage in text reply and convert to tool call ──
+        // If the model still prints raw JSON despite instructions, parse it ourselves
+        if (choice?.content && !choice?.tool_calls) {
+            const jsonMatch = choice.content.match(/\{[\s\S]*"userName"[\s\S]*"contactInfo"[\s\S]*\}/);
+            if (jsonMatch) {
+                try {
+                    const leaked = JSON.parse(jsonMatch[0]);
+                    if (leaked.userName && leaked.contactInfo && leaked.appointmentDay && leaked.appointmentTime) {
+                        console.warn('[Chat] Intercepted leaked tool JSON, processing as booking');
+                        // Treat it as a real tool call
+                        choice.tool_calls = [{
+                            function: {
+                                name: 'appointmentBooking',
+                                arguments: JSON.stringify(leaked)
+                            }
+                        }];
+                        choice.content = null;
+                    }
+                } catch { /* not valid JSON, ignore */ }
+            }
+        }
 
         // ── Appointment tool call ──
         if (choice?.tool_calls?.[0]?.function?.name === 'appointmentBooking') {
@@ -223,7 +266,7 @@ async function handleChat(req, res) {
 
             const { userName, contactInfo, appointmentDay, appointmentTime } = args;
             if (!userName || !contactInfo || !appointmentDay || !appointmentTime) {
-                return res.json({ success: true, answer: 'I still need a few details. Could you share your name, contact, preferred day and time?' });
+                return res.json({ success: true, answer: "I still need a few details. What's your name, contact info, preferred day and time?" });
             }
 
             const dateISO = resolveDay(appointmentDay);
@@ -247,7 +290,7 @@ async function handleChat(req, res) {
                     catch (e) { console.error('[Chat/Calendar]', e.message); }
                 }
                 if (integrations.whatsappAlerts?.connected) {
-                    try { await sendWAConfirmation(integrations.whatsappAlerts, appt); }
+                    try { await sendWANotification(integrations.whatsappAlerts, appt); }
                     catch (e) { console.error('[Chat/WhatsApp]', e.message); }
                 }
             }
@@ -312,7 +355,10 @@ async function handleROI(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// 6. WHATSAPP VERIFY — send code via Twilio
+// 6. WHATSAPP VERIFY
+// Supports BOTH:
+//   A) WhatsApp Business API (Meta) — set WA_BUSINESS_PHONE_NUMBER_ID + WA_ACCESS_TOKEN
+//   B) Twilio sandbox fallback       — set TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN + TWILIO_WHATSAPP_NUMBER
 // ════════════════════════════════════════════════════════════════════════════
 async function handleWAVerify(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -322,35 +368,73 @@ async function handleWAVerify(req, res) {
         return res.status(400).json({ success: false, message: 'Missing userEmail or phoneNumber.' });
     }
 
-    const sid   = process.env.TWILIO_ACCOUNT_SID;
-    const token = process.env.TWILIO_AUTH_TOKEN;
-    const from  = process.env.TWILIO_WHATSAPP_NUMBER;
-
-    if (!sid || !token || !from) {
-        return res.status(500).json({
-            success: false,
-            message: 'WhatsApp not configured. Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_NUMBER in Vercel.'
-        });
-    }
+    let to = phoneNumber.replace(/[\s\-\(\)]/g, '');
+    if (!to.startsWith('+')) to = '+' + to;
+    // WhatsApp Business API needs number without leading +
+    const toWA = to.replace(/^\+/, '');
 
     const code      = Math.floor(100000 + Math.random() * 900000).toString();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
 
     try {
         await getDb().collection('whatsapp_verifications').doc(userEmail).set({
-            verificationCode: code, phoneNumber, expiresAt, attempts: 0,
+            verificationCode: code, phoneNumber: to, expiresAt, attempts: 0,
             createdAt: new Date().toISOString()
         });
 
-        let to = phoneNumber.replace(/[\s\-\(\)]/g, '');
-        if (!to.startsWith('+')) to = '+' + to;
+        // ── Try WhatsApp Business API first ──
+        const waPhoneId    = process.env.WA_BUSINESS_PHONE_NUMBER_ID;
+        const waToken      = process.env.WA_ACCESS_TOKEN;
+
+        if (waPhoneId && waToken) {
+            const waRes = await fetch(
+                `https://graph.facebook.com/v19.0/${waPhoneId}/messages`,
+                {
+                    method:  'POST',
+                    headers: {
+                        Authorization:  `Bearer ${waToken}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        messaging_product: 'whatsapp',
+                        to: toWA,
+                        type: 'text',
+                        text: {
+                            body: `Your Comex AI verification code is: *${code}*\n\nExpires in 10 minutes. Do not share this code.`
+                        }
+                    })
+                }
+            );
+            const waData = await waRes.json();
+            if (!waRes.ok) {
+                console.error('[WA-Business]', JSON.stringify(waData));
+                return res.status(500).json({
+                    success: false,
+                    message: waData.error?.message || 'WhatsApp Business API error. Check WA_BUSINESS_PHONE_NUMBER_ID and WA_ACCESS_TOKEN in Vercel.'
+                });
+            }
+            console.log('[WA-Business] Code sent to', to, '| msg id:', waData.messages?.[0]?.id);
+            return res.json({ success: true, message: `Code sent to ${to} via WhatsApp.`, provider: 'whatsapp-business' });
+        }
+
+        // ── Fallback: Twilio sandbox ──
+        const sid   = process.env.TWILIO_ACCOUNT_SID;
+        const token = process.env.TWILIO_AUTH_TOKEN;
+        const from  = process.env.TWILIO_WHATSAPP_NUMBER;
+
+        if (!sid || !token || !from) {
+            return res.status(500).json({
+                success: false,
+                message: 'WhatsApp not configured. Add WA_BUSINESS_PHONE_NUMBER_ID + WA_ACCESS_TOKEN (recommended) OR TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN + TWILIO_WHATSAPP_NUMBER to Vercel environment variables.'
+            });
+        }
 
         const twRes = await fetch(
             `https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`,
             {
-                method: 'POST',
+                method:  'POST',
                 headers: {
-                    Authorization: `Basic ${Buffer.from(`${sid}:${token}`).toString('base64')}`,
+                    Authorization:  `Basic ${Buffer.from(`${sid}:${token}`).toString('base64')}`,
                     'Content-Type': 'application/x-www-form-urlencoded'
                 },
                 body: new URLSearchParams({
@@ -372,7 +456,8 @@ async function handleWAVerify(req, res) {
             return res.status(500).json({ success: false, message: twData.message || 'Twilio error.' });
         }
 
-        return res.json({ success: true, message: `Code sent to ${to} via WhatsApp.` });
+        return res.json({ success: true, message: `Code sent to ${to} via WhatsApp.`, provider: 'twilio' });
+
     } catch (err) {
         console.error('[WA-Verify]', err.message);
         return res.status(500).json({ success: false, message: err.message });
@@ -391,7 +476,7 @@ async function handleWAConfirm(req, res) {
     }
 
     try {
-        const db  = getDb();
+        const db   = getDb();
         const ref  = db.collection('whatsapp_verifications').doc(userEmail);
         const snap = await ref.get();
 
@@ -416,8 +501,9 @@ async function handleWAConfirm(req, res) {
         await db.collection('users').doc(userEmail).set({
             integrations: {
                 whatsappAlerts: {
-                    connected: true, phoneNumber: data.phoneNumber,
-                    verifiedAt: new Date().toISOString()
+                    connected:   true,
+                    phoneNumber: data.phoneNumber,
+                    verifiedAt:  new Date().toISOString()
                 }
             }
         }, { merge: true });
@@ -444,7 +530,7 @@ async function handleGoogleOAuth(req, res) {
     if (!clientId) return res.status(500).send('Missing GOOGLE_CLIENT_ID env var.');
 
     const state = Buffer.from(JSON.stringify({ email })).toString('base64');
-    const url = new URL('https://accounts.google.com/o/oauth2/v2/auth');
+    const url   = new URL('https://accounts.google.com/o/oauth2/v2/auth');
     url.searchParams.set('client_id',     clientId);
     url.searchParams.set('redirect_uri',  redirectUri);
     url.searchParams.set('response_type', 'code');
@@ -480,7 +566,7 @@ async function handleGoogleCallback(req, res) {
 
     try {
         const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
-            method: 'POST',
+            method:  'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
             body: new URLSearchParams({
                 code, client_id: clientId, client_secret: clientSecret,
@@ -497,16 +583,16 @@ async function handleGoogleCallback(req, res) {
                     connected:     true,
                     access_token:  tokens.access_token,
                     refresh_token: tokens.refresh_token || null,
+                    // FIX: store absolute ISO timestamp, not relative seconds
                     expiry_date:   tokens.expires_in
                         ? new Date(Date.now() + tokens.expires_in * 1000).toISOString()
-                        : null
+                        : new Date(Date.now() + 3600 * 1000).toISOString() // default 1h
                 }
             }
         }, { merge: true });
 
         console.log('[OAuth/Google] Saved tokens for:', email);
 
-        // Redirect back to app with success flag
         const appUrl = process.env.APP_URL || 'https://cometchat-ai-platform.web.app';
         return res.redirect(302, `${appUrl}?calendar_connected=1`);
 
@@ -519,32 +605,93 @@ async function handleGoogleCallback(req, res) {
 // ════════════════════════════════════════════════════════════════════════════
 // HELPERS
 // ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Resolve a natural-language day/date string to ISO date YYYY-MM-DD
+ * Handles: "Monday", "17 June", "17 June 2026", "next Tuesday", "tomorrow"
+ */
 function resolveDay(dayName) {
-    const days = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
-    const today = new Date();
-    const target = days.indexOf(dayName.toLowerCase().trim());
-    if (target === -1) return today.toISOString().split('T')[0];
-    let diff = target - today.getDay();
-    if (diff <= 0) diff += 7;
-    const d = new Date(today);
-    d.setDate(today.getDate() + diff);
-    return d.toISOString().split('T')[0];
+    if (!dayName) return new Date().toISOString().split('T')[0];
+    const input = dayName.trim().toLowerCase();
+
+    // "tomorrow"
+    if (input === 'tomorrow') {
+        const d = new Date();
+        d.setDate(d.getDate() + 1);
+        return d.toISOString().split('T')[0];
+    }
+
+    // "today"
+    if (input === 'today') return new Date().toISOString().split('T')[0];
+
+    // Full or partial date: "17 june", "17 june 2026", "june 17", "june 17 2026"
+    const dateAttempt = new Date(dayName);
+    if (!isNaN(dateAttempt.getTime())) {
+        // Parsed successfully — but shift to correct timezone (avoid UTC midnight rollback)
+        const d = new Date(dayName + (dayName.includes(':') ? '' : 'T12:00:00'));
+        if (!isNaN(d.getTime())) return d.toISOString().split('T')[0];
+    }
+
+    // Weekday names: "monday", "next monday"
+    const days   = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
+    const cleaned = input.replace('next ', '').trim();
+    const target  = days.indexOf(cleaned);
+    if (target !== -1) {
+        const today = new Date();
+        let diff    = target - today.getDay();
+        if (diff <= 0) diff += 7; // always next occurrence
+        const d = new Date(today);
+        d.setDate(today.getDate() + diff);
+        return d.toISOString().split('T')[0];
+    }
+
+    // Fallback: today
+    return new Date().toISOString().split('T')[0];
+}
+
+/**
+ * Parse flexible time strings to { h, min }
+ * Handles: "3 pm", "3:00 PM", "15:00", "3pm", "3", "morning" (→9), "afternoon" (→14), "evening" (→18)
+ */
+function parseTime(timeStr) {
+    if (!timeStr) return { h: 9, min: 0 };
+    const s = timeStr.trim().toLowerCase();
+
+    // Natural language
+    if (s === 'morning')   return { h: 9,  min: 0 };
+    if (s === 'afternoon') return { h: 14, min: 0 };
+    if (s === 'evening')   return { h: 18, min: 0 };
+    if (s === 'noon' || s === 'midday') return { h: 12, min: 0 };
+
+    // "3 pm", "3pm", "3:00 pm", "3:30pm", "15:00", "15:30"
+    const m = s.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/);
+    if (m) {
+        let h   = parseInt(m[1], 10);
+        const min = parseInt(m[2] || '0', 10);
+        const period = m[3];
+        if (period === 'pm' && h !== 12) h += 12;
+        if (period === 'am' && h === 12) h  = 0;
+        return { h, min };
+    }
+
+    return { h: 9, min: 0 }; // safe fallback
 }
 
 async function addCalendarEvent(googleAuth, appt, ownerEmail, db) {
     let accessToken = googleAuth.access_token;
 
-    // Refresh if expired
+    // FIX: Guard against null expiry_date before comparing
     if (googleAuth.refresh_token && googleAuth.expiry_date) {
-        if (new Date(googleAuth.expiry_date).getTime() < Date.now() + 60000) {
+        const expiryMs = new Date(googleAuth.expiry_date).getTime();
+        if (!isNaN(expiryMs) && expiryMs < Date.now() + 60000) {
             const r = await fetch('https://oauth2.googleapis.com/token', {
-                method: 'POST',
+                method:  'POST',
                 headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
                 body: new URLSearchParams({
-                    client_id: process.env.GOOGLE_CLIENT_ID,
+                    client_id:     process.env.GOOGLE_CLIENT_ID,
                     client_secret: process.env.GOOGLE_CLIENT_SECRET,
                     refresh_token: googleAuth.refresh_token,
-                    grant_type: 'refresh_token'
+                    grant_type:    'refresh_token'
                 })
             });
             const t = await r.json();
@@ -552,25 +699,23 @@ async function addCalendarEvent(googleAuth, appt, ownerEmail, db) {
                 accessToken = t.access_token;
                 await db.collection('users').doc(ownerEmail).update({
                     'integrations.google_calendar.access_token': t.access_token,
-                    'integrations.google_calendar.expiry_date': new Date(Date.now() + (t.expires_in || 3500) * 1000).toISOString()
+                    'integrations.google_calendar.expiry_date':
+                        new Date(Date.now() + (t.expires_in || 3500) * 1000).toISOString()
                 });
+            } else {
+                console.error('[Calendar/Refresh] No access_token in refresh response:', t);
             }
         }
     }
 
-    const m = appt.appointmentTime.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
-    let h = 9, min = 0;
-    if (m) {
-        h = parseInt(m[1]);
-        min = parseInt(m[2]);
-        if (m[3].toUpperCase() === 'PM' && h !== 12) h += 12;
-        if (m[3].toUpperCase() === 'AM' && h === 12) h = 0;
-    }
-    const start = new Date(`${appt.scheduledDate}T${String(h).padStart(2,'0')}:${String(min).padStart(2,'0')}:00Z`);
+    // FIX: Use robust parseTime() instead of brittle regex that failed on "3 pm"
+    const { h, min } = parseTime(appt.appointmentTime);
+
+    const start = new Date(`${appt.scheduledDate}T${String(h).padStart(2,'0')}:${String(min).padStart(2,'0')}:00`);
     const end   = new Date(start.getTime() + 30 * 60000);
 
     const r = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
-        method: 'POST',
+        method:  'POST',
         headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({
             summary:     `Appointment: ${appt.customerName}`,
@@ -581,28 +726,65 @@ async function addCalendarEvent(googleAuth, appt, ownerEmail, db) {
     });
     const data = await r.json();
     if (!r.ok) console.error('[Calendar] Event error:', data.error?.message);
-    else console.log('[Calendar] Event created:', data.id);
+    else       console.log('[Calendar] Event created:', data.id, 'at', start.toISOString());
 }
 
-async function sendWAConfirmation(waAuth, appt) {
-    const sid   = process.env.TWILIO_ACCOUNT_SID;
-    const token = process.env.TWILIO_AUTH_TOKEN;
-    const from  = process.env.TWILIO_WHATSAPP_NUMBER;
-    if (!sid || !token || !from || !waAuth.phoneNumber) return;
+/**
+ * Send WhatsApp appointment notification
+ * Supports WhatsApp Business API (Meta) with Twilio fallback
+ */
+async function sendWANotification(waAuth, appt) {
+    if (!waAuth.phoneNumber) return;
 
     let to = waAuth.phoneNumber.replace(/[\s\-\(\)]/g, '');
     if (!to.startsWith('+')) to = '+' + to;
 
     const body =
-        `Appointment booked on ${appt.scheduledDate} at ${appt.appointmentTime}\n` +
-        `with ${appt.customerName}\n` +
-        `${appt.contactInfo}\n\n` +
-        `Thanks\n               -Comex AI platform`;
+        `📅 *New Appointment Booked*\n\n` +
+        `👤 Name: ${appt.customerName}\n` +
+        `📧 Contact: ${appt.contactInfo}\n` +
+        `📆 Date: ${appt.scheduledDate}\n` +
+        `🕐 Time: ${appt.appointmentTime}\n\n` +
+        `Booked via Comex AI`;
+
+    // ── Try WhatsApp Business API first ──
+    const waPhoneId = process.env.WA_BUSINESS_PHONE_NUMBER_ID;
+    const waToken   = process.env.WA_ACCESS_TOKEN;
+
+    if (waPhoneId && waToken) {
+        const toWA = to.replace(/^\+/, '');
+        const r = await fetch(
+            `https://graph.facebook.com/v19.0/${waPhoneId}/messages`,
+            {
+                method:  'POST',
+                headers: { Authorization: `Bearer ${waToken}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    messaging_product: 'whatsapp',
+                    to: toWA,
+                    type: 'text',
+                    text: { body }
+                })
+            }
+        );
+        if (!r.ok) {
+            const d = await r.json();
+            console.error('[WhatsApp-Business] Send error:', d.error?.message);
+        } else {
+            console.log('[WhatsApp-Business] Notification sent to', to);
+        }
+        return;
+    }
+
+    // ── Fallback: Twilio ──
+    const sid   = process.env.TWILIO_ACCOUNT_SID;
+    const token = process.env.TWILIO_AUTH_TOKEN;
+    const from  = process.env.TWILIO_WHATSAPP_NUMBER;
+    if (!sid || !token || !from) return;
 
     const r = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`, {
-        method: 'POST',
+        method:  'POST',
         headers: {
-            Authorization: `Basic ${Buffer.from(`${sid}:${token}`).toString('base64')}`,
+            Authorization:  `Basic ${Buffer.from(`${sid}:${token}`).toString('base64')}`,
             'Content-Type': 'application/x-www-form-urlencoded'
         },
         body: new URLSearchParams({ From: `whatsapp:${from}`, To: `whatsapp:${to}`, Body: body })
@@ -610,8 +792,8 @@ async function sendWAConfirmation(waAuth, appt) {
 
     if (!r.ok) {
         const d = await r.json();
-        console.error('[WhatsApp] Send error:', d.message);
+        console.error('[WhatsApp-Twilio] Send error:', d.message);
     } else {
-        console.log('[WhatsApp] Appointment confirmation sent to', to);
+        console.log('[WhatsApp-Twilio] Notification sent to', to);
     }
 }
