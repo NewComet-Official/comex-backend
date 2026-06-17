@@ -86,12 +86,19 @@ async function sendWAImageMessage(to, caption) {
         return;
     }
 
+    const FROM_NUMBER = process.env.YCLOUD_FROM_NUMBER;
+    if (!FROM_NUMBER) {
+        console.warn('[YCloud] Missing YCLOUD_FROM_NUMBER env var');
+        return;
+    }
+
     const body = {
+        from: FROM_NUMBER,  // ← ADD THIS
         to: norm,
         type: 'image',
         image: {
             link:    BOOKING_IMAGE_URL,
-            caption: caption          // text appears below the image in WhatsApp
+            caption: caption
         }
     };
 
