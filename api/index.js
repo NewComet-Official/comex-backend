@@ -7,7 +7,7 @@ import Groq from 'groq-sdk';
 // Set these as Vercel environment variables. The hardcoded values below are
 // used as fallbacks so the app works immediately without any env-var setup.
 const WA_PHONE_ID  = process.env.WA_BUSINESS_PHONE_NUMBER_ID || '1199177256605148';
-const WA_TOKEN     = process.env.WA_ACCESS_TOKEN             || 'EAAZCdmKcvZCBIBRpdjQejV9JAoFv9GWw9xMWBqNnZCw3usJN2z8MEID6UzdB18DPDECEHAbEH7z28wHFJ9HjBJZAhZBHT2cGfdpyyp1ensUcqZCWBCP56k3cp79iJiZCD3oDXJQqQL8iMc9Nr8M8MTn6BXM6lqgbtU3bgWEACr0vOhPwfPsaS9QqpvTyoAsXsjROgZDZD';
+const WA_TOKEN     = process.env.WA_ACCESS_TOKEN             || 'EAAZCdmKcvZCBIBRpOGXwfVw0GPsXwdz47rAgjtAYYgYEKZCpqeZBZCDxXV1KqPp04ULjcoZBAvIADMRDvbXwUloWicQD0Cx3OawC004jlAkZCwbfR0CZBnWJ6ZCqRENYxIeG2tGPUWd3DmKv1zvgFOcA01bu6uh8FEiUiibKRcL8mZBLkQfTQFEKeDZBTmZCnN3WwF3YqAZDZD';
 
 function getDb() {
     if (!admin.apps.length) {
