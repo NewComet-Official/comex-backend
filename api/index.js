@@ -128,6 +128,13 @@ async function sendWATextMessage(to, text) {
         return;
     }
 
+    // ← ADD THIS: Your WhatsApp Business number (e.g. +1234567890)
+    const FROM_NUMBER = process.env.YCLOUD_FROM_NUMBER;
+    if (!FROM_NUMBER) {
+        console.warn('[YCloud] Missing YCLOUD_FROM_NUMBER env var');
+        return;
+    }
+
     const r = await fetch('https://api.ycloud.com/v2/whatsapp/messages', {
         method:  'POST',
         headers: {
@@ -135,6 +142,7 @@ async function sendWATextMessage(to, text) {
             'X-API-Key':    YCLOUD_API_KEY
         },
         body: JSON.stringify({
+            from: FROM_NUMBER,  // ← ADD THIS
             to:   norm,
             type: 'text',
             text: { body: text }
