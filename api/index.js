@@ -118,6 +118,9 @@ async function sendWAImageMessage(to, caption) {
 /**
  * Send a plain text WhatsApp message via YCloud (used for verification codes).
  */
+/**
+ * Send a plain text WhatsApp message via YCloud (used for verification codes).
+ */
 async function sendWATextMessage(to, text) {
     const norm = normalisePhone(to);
     if (!norm) {
@@ -146,7 +149,9 @@ async function sendWATextMessage(to, text) {
             from: FROM_NUMBER,
             to:   norm,
             type: 'text',
-            text: { body: text }
+            text: { 
+                value: text // ✅ Corrected from 'body' to 'value'
+            }
         })
     });
 
@@ -158,7 +163,6 @@ async function sendWATextMessage(to, text) {
     console.log('[YCloud] Text sent to', norm, '→ id:', data.id);
     return data;
 }
-
 /**
  * Build the WhatsApp booking confirmation caption.
  */
