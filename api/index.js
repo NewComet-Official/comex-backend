@@ -3,11 +3,12 @@
 import admin from 'firebase-admin';
 import Groq from 'groq-sdk';
 
-// ── WhatsApp Business API credentials ────────────────────────────────────────
-// Set these as Vercel environment variables. The hardcoded values below are
-// used as fallbacks so the app works immediately without any env-var setup.
-const WA_PHONE_ID  = process.env.WA_BUSINESS_PHONE_NUMBER_ID || '1199177256605148';
-const WA_TOKEN     = process.env.WA_ACCESS_TOKEN             || 'EAAZCdmKcvZCBIBRpOGXwfVw0GPsXwdz47rAgjtAYYgYEKZCpqeZBZCDxXV1KqPp04ULjcoZBAvIADMRDvbXwUloWicQD0Cx3OawC004jlAkZCwbfR0CZBnWJ6ZCqRENYxIeG2tGPUWd3DmKv1zvgFOcA01bu6uh8FEiUiibKRcL8mZBLkQfTQFEKeDZBTmZCnN3WwF3YqAZDZD';
+// ── YCloud WhatsApp API ───────────────────────────────────────────────────────
+// Set YCLOUD_API_KEY as a Vercel environment variable.
+const YCLOUD_API_KEY = process.env.YCLOUD_API_KEY || '';
+
+// Image shown at the top of every WhatsApp booking confirmation
+const BOOKING_IMAGE_URL = 'https://i.ibb.co/8nbzHx0N/Appointment-booking-cofirmed.png';
 
 function getDb() {
     if (!admin.apps.length) {
@@ -45,81 +46,126 @@ export default async function handler(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// WHATSAPP HELPERS
+// YCLOUD WHATSAPP HELPERS
 // ════════════════════════════════════════════════════════════════════════════
 
 /**
- * Normalise any phone string to E.164 (digits only, leading +).
- * Returns null if fewer than 7 digits remain after stripping.
+ * Normalise any phone string to E.164 (digits only with leading +).
+ * Returns null if fewer than 7 digits remain.
  */
 function normalisePhone(raw) {
     if (!raw) return null;
-    let digits = raw.replace(/[\s\-\(\)\.]/g, '');
+    let digits = String(raw).replace(/[\s\-\(\)\.]/g, '');
     if (!digits.startsWith('+')) digits = '+' + digits;
-    // Must have at least country code + 6 digits
     if (digits.replace(/\D/g, '').length < 7) return null;
     return digits;
 }
 
-/**
- * Returns true if the string looks like a phone number rather than an email.
- */
+/** True if the contact string looks like a phone number rather than an email. */
 function looksLikePhone(contact) {
     if (!contact) return false;
-    // Has more than 5 digit characters and no @ sign
-    return !contact.includes('@') && (contact.replace(/\D/g, '').length >= 7);
+    return !contact.includes('@') && contact.replace(/\D/g, '').length >= 7;
 }
 
 /**
- * Send a WhatsApp text message via the Cloud API.
- * `to` should be E.164 WITHOUT the leading '+', e.g. "919876543210".
+ * Send a WhatsApp IMAGE + caption message via YCloud.
+ * YCloud API docs: https://docs.ycloud.com/reference/whatsapp_send_message
+ *
+ * `to`      – E.164 phone number, e.g. "+919876543210"
+ * `caption` – text shown below the image (supports WhatsApp markdown: *bold*, _italic_)
  */
-async function sendWAMessage(toRaw, body) {
-    const norm = normalisePhone(toRaw);
+async function sendWAImageMessage(to, caption) {
+    const norm = normalisePhone(to);
     if (!norm) {
-        console.warn('[WA] Invalid phone, skipping:', toRaw);
+        console.warn('[YCloud] Invalid phone, skipping:', to);
         return;
     }
-    const to = norm.replace(/^\+/, ''); // Cloud API wants digits only
 
-    const r = await fetch(`https://graph.facebook.com/v19.0/${WA_PHONE_ID}/messages`, {
+    if (!YCLOUD_API_KEY) {
+        console.warn('[YCloud] No API key set — skipping WA send.');
+        return;
+    }
+
+    const body = {
+        to: norm,
+        type: 'image',
+        image: {
+            link:    BOOKING_IMAGE_URL,
+            caption: caption          // text appears below the image in WhatsApp
+        }
+    };
+
+    const r = await fetch('https://api.ycloud.com/v2/whatsapp/messages', {
         method:  'POST',
         headers: {
-            Authorization:  `Bearer ${WA_TOKEN}`,
-            'Content-Type': 'application/json'
+            'Content-Type': 'application/json',
+            'X-API-Key':    YCLOUD_API_KEY
+        },
+        body: JSON.stringify(body)
+    });
+
+    const data = await r.json();
+    if (!r.ok) {
+        console.error('[YCloud] Send error:', JSON.stringify(data));
+        throw new Error(data.message || data.error?.message || 'YCloud API error');
+    }
+    console.log('[YCloud] Message sent to', norm, '→ id:', data.id);
+    return data;
+}
+
+/**
+ * Send a plain text WhatsApp message via YCloud (used for verification codes).
+ */
+async function sendWATextMessage(to, text) {
+    const norm = normalisePhone(to);
+    if (!norm) {
+        console.warn('[YCloud] Invalid phone, skipping:', to);
+        return;
+    }
+
+    if (!YCLOUD_API_KEY) {
+        console.warn('[YCloud] No API key set — skipping WA send.');
+        return;
+    }
+
+    const r = await fetch('https://api.ycloud.com/v2/whatsapp/messages', {
+        method:  'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'X-API-Key':    YCLOUD_API_KEY
         },
         body: JSON.stringify({
-            messaging_product: 'whatsapp',
-            to,
+            to:   norm,
             type: 'text',
-            text: { body }
+            text: { body: text }
         })
     });
 
     const data = await r.json();
     if (!r.ok) {
-        console.error('[WA] Send error:', JSON.stringify(data.error));
-        throw new Error(data.error?.message || 'WhatsApp API error');
+        console.error('[YCloud] Text send error:', JSON.stringify(data));
+        throw new Error(data.message || data.error?.message || 'YCloud API error');
     }
-    console.log('[WA] Message sent to', to, '→ id:', data.messages?.[0]?.id);
+    console.log('[YCloud] Text sent to', norm, '→ id:', data.id);
     return data;
 }
 
 /**
- * Build the exact "APPOINTMENT BOOKED" message that matches the design.
+ * Build the WhatsApp booking confirmation caption.
+ * Matches the image exactly:
  *
- * ✅ APPOINTMENT BOOKED
+ *   APPOINTMENT BOOKED          ← bold (handled by the image graphic)
  *
- * Name: {name}
- * Contact: {email/phone}
- * Date: {date}
- * Time: {time}
+ *   Name: {name}
+ *   Contact: {email/phone}
+ *   Date: {date}
+ *   Time: {time}
  *
- * Team Comex
+ *   Team Comex
  */
-function buildBookingMessage(appt) {
+function buildBookingCaption(appt) {
     return (
-        `✅ *APPOINTMENT BOOKED*\n\n` +
+        `*APPOINTMENT BOOKED*\n\n` +
         `Name: ${appt.customerName}\n` +
         `Contact: ${appt.contactInfo}\n` +
         `Date: ${appt.scheduledDate}\n` +
@@ -224,7 +270,7 @@ async function handleChat(req, res) {
 
     try {
         const botSnap = await db.collection('user_bots').doc(businessId).get();
-        let sysPrompt = 'You are a helpful, friendly customer service assistant.';
+        let sysPrompt  = 'You are a helpful, friendly customer service assistant.';
         let ownerEmail = '', botName = 'Assistant';
 
         if (botSnap.exists) {
@@ -282,12 +328,9 @@ OTHER RULES:
             /my name is|i am|i'm|it'?s\s+[a-z]+|name[:\s]+/i.test(allText) ||
             safeHistory.some(m => m.role === 'user' && /^[A-Z][a-z]+ [A-Z][a-z]+/.test(m.content.trim()))
         );
-
         const hasContact = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/.test(allText) ||
                            /(\+?\d[\d\s\-]{6,}\d)/.test(allText);
-
-        const hasDay = /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|today|january|february|march|april|may|june|july|august|september|october|november|december|\d{1,2}[\s\/\-](jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\d{1,2}))\b/i.test(allTextLow);
-
+        const hasDay  = /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|today|january|february|march|april|may|june|july|august|september|october|november|december|\d{1,2}[\s\/\-](jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\d{1,2}))\b/i.test(allTextLow);
         const hasTime = /\b(\d{1,2}(:\d{2})?\s*(am|pm))\b/i.test(allText) ||
                         /\b(morning|afternoon|evening|noon|midday|midnight)\b/i.test(allTextLow) ||
                         /\b([01]?\d|2[0-3]):[0-5]\d\b/.test(allText);
@@ -351,14 +394,13 @@ OTHER RULES:
 
             const { userName, contactInfo, appointmentDay, appointmentTime } = args;
 
-            // Guard: time is missing or placeholder
+            // Guard: time missing or placeholder
             if (!appointmentTime || appointmentTime.trim() === '' || /^tbd$/i.test(appointmentTime.trim())) {
                 return res.json({
                     success: true,
                     answer: `Got it! Just one more thing — what time works best for you on ${appointmentDay}?`
                 });
             }
-
             if (!userName || !contactInfo || !appointmentDay) {
                 return res.json({
                     success: true,
@@ -377,15 +419,13 @@ OTHER RULES:
                     const avail = await checkCalendarAvailability(
                         integrations.google_calendar, dateISO, appointmentTime, ownerEmail, db
                     );
-
                     if (!avail.available) {
                         const alts = avail.suggestedTimes || [];
-                        let altText = alts.length > 0
+                        const altText = alts.length > 0
                             ? '\n\nHere are 3 available slots on that day:\n' +
                               alts.map((t, i) => `  ${i + 1}. ${t}`).join('\n') +
                               '\n\nWhich one works for you?'
                             : '\n\nWould you like to pick a different date or time?';
-
                         return res.json({
                             success: true,
                             answer: `Sorry, ${appointmentTime} on ${appointmentDay} is already booked.${altText}`
@@ -405,48 +445,53 @@ OTHER RULES:
             await db.collection('appointments').add(appt);
             await db.collection('user_bots').doc(businessId).collection('appointments').add(appt);
 
-            // ── Integrations ──────────────────────────────────────────────────
+            // ── Google Calendar event ─────────────────────────────────────────
             if (ownerEmail) {
                 const userSnap     = await db.collection('users').doc(ownerEmail).get();
                 const integrations = userSnap.exists ? (userSnap.data()?.integrations || {}) : {};
-
-                // Google Calendar event
                 if (integrations.google_calendar?.connected) {
                     try { await addCalendarEvent(integrations.google_calendar, appt, ownerEmail, db); }
                     catch (e) { console.error('[Chat/Calendar]', e.message); }
                 }
+            }
 
-                // ── WhatsApp notifications ────────────────────────────────────
-                const bookingMsg = buildBookingMessage(appt);
+            // ── WhatsApp notifications via YCloud ─────────────────────────────
+            // Sends image + caption to BOTH owner and customer (if phone given)
+            const caption = buildBookingCaption(appt);
 
-                // 1. Always notify the business owner (via their saved WA number)
-                if (integrations.whatsappAlerts?.connected && integrations.whatsappAlerts?.phoneNumber) {
-                    try {
-                        await sendWAMessage(integrations.whatsappAlerts.phoneNumber, bookingMsg);
-                        console.log('[WA] Owner notification sent to', integrations.whatsappAlerts.phoneNumber);
-                    } catch (e) {
-                        console.error('[WA] Owner notification failed:', e.message);
+            // 1. Fetch owner's WhatsApp number from Firestore and notify them
+            if (ownerEmail) {
+                try {
+                    const userSnap     = await db.collection('users').doc(ownerEmail).get();
+                    const integrations = userSnap.exists ? (userSnap.data()?.integrations || {}) : {};
+                    const ownerPhone   = integrations.whatsappAlerts?.phoneNumber;
+                    if (ownerPhone) {
+                        await sendWAImageMessage(ownerPhone, caption);
+                        console.log('[WA] Owner notified:', ownerPhone);
                     }
-                }
-
-                // 2. Notify the customer IF they provided a phone number (not email)
-                if (looksLikePhone(contactInfo)) {
-                    try {
-                        await sendWAMessage(contactInfo, bookingMsg);
-                        console.log('[WA] Customer notification sent to', contactInfo);
-                    } catch (e) {
-                        console.error('[WA] Customer notification failed:', e.message);
-                    }
+                } catch (e) {
+                    console.error('[WA] Owner notification failed:', e.message);
                 }
             }
 
+            // 2. Notify the customer if they gave a phone number (not email)
+            if (looksLikePhone(contactInfo)) {
+                try {
+                    await sendWAImageMessage(contactInfo, caption);
+                    console.log('[WA] Customer notified:', contactInfo);
+                } catch (e) {
+                    console.error('[WA] Customer notification failed:', e.message);
+                }
+            }
+
+            // ── Log chat ──────────────────────────────────────────────────────
             await db.collection('user_bots').doc(businessId).collection('chats').add({
                 conversationId: convId, question: userMsg,
                 answer: 'Appointment booked.', isGenuineQuery: true, isLeadCaptured: true,
                 createdAt: new Date().toISOString()
             });
 
-            // ── Confirmation message (shown in chat widget) ───────────────────
+            // ── In-chat confirmation message ──────────────────────────────────
             const pad = (label) => label.padEnd(8);
             const answer = [
                 '✅ APPOINTMENT BOOKED',
@@ -510,7 +555,7 @@ async function handleROI(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// WHATSAPP VERIFY — sends 6-digit code to the entered phone number
+// WHATSAPP VERIFY — sends 6-digit OTP via YCloud
 // ════════════════════════════════════════════════════════════════════════════
 async function handleWAVerify(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -519,50 +564,40 @@ async function handleWAVerify(req, res) {
         return res.status(400).json({ success: false, message: 'Missing userEmail or phoneNumber.' });
 
     const norm = normalisePhone(phoneNumber);
-    if (!norm) {
+    if (!norm)
         return res.status(400).json({ success: false, message: 'Invalid phone number. Please include your country code (e.g. +91 9876543210).' });
-    }
 
     const code      = Math.floor(100000 + Math.random() * 900000).toString();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
 
     try {
-        // Store the pending verification in Firestore
         await getDb().collection('whatsapp_verifications').doc(userEmail).set({
             verificationCode: code,
             phoneNumber:      norm,
             expiresAt,
-            attempts:   0,
-            createdAt:  new Date().toISOString()
+            attempts:  0,
+            createdAt: new Date().toISOString()
         });
 
-        // Send via WhatsApp Business Cloud API
-        const verificationMsg =
+        await sendWATextMessage(norm,
             `🔐 *Comex AI Verification*\n\n` +
-            `Your verification code is:\n\n` +
-            `*${code}*\n\n` +
-            `This code expires in 10 minutes. Do not share it with anyone.\n\n` +
-            `Team Comex`;
+            `Your verification code is:\n\n*${code}*\n\n` +
+            `Expires in 10 minutes. Do not share it.\n\nTeam Comex`
+        );
 
-        await sendWAMessage(norm, verificationMsg);
-
-        return res.json({
-            success:  true,
-            message:  `Verification code sent to ${norm} via WhatsApp.`,
-            provider: 'whatsapp-business'
-        });
+        return res.json({ success: true, message: `Verification code sent to ${norm} via WhatsApp.` });
 
     } catch (err) {
         console.error('[WA-Verify]', err.message);
         return res.status(500).json({
             success: false,
-            message: `Failed to send WhatsApp message: ${err.message}. Make sure the number has WhatsApp and is reachable.`
+            message: `Failed to send WhatsApp message: ${err.message}. Make sure the number has WhatsApp and your YCloud API key is set.`
         });
     }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// WHATSAPP CONFIRM — validates the 6-digit code
+// WHATSAPP CONFIRM — validates the OTP
 // ════════════════════════════════════════════════════════════════════════════
 async function handleWAConfirm(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -593,7 +628,7 @@ async function handleWAConfirm(req, res) {
             return res.status(400).json({ success: false, message: `Wrong code. ${3 - attempts} attempt(s) left.` });
         }
 
-        // ✅ Code correct — save to user's integrations
+        // ✅ Correct — save the verified number to user integrations
         await db.collection('users').doc(userEmail).set({
             integrations: {
                 whatsappAlerts: {
@@ -606,13 +641,12 @@ async function handleWAConfirm(req, res) {
 
         await ref.delete();
 
-        // Send a welcome confirmation to the newly connected number
+        // Send welcome message to the newly connected number
         try {
-            await sendWAMessage(data.phoneNumber,
+            await sendWATextMessage(data.phoneNumber,
                 `✅ *WhatsApp Connected!*\n\n` +
                 `Your number is now linked to Comex AI. ` +
-                `You will receive appointment booking notifications here.\n\n` +
-                `Team Comex`
+                `You will receive appointment booking notifications here.\n\nTeam Comex`
             );
         } catch (e) {
             console.warn('[WA-Confirm] Welcome message failed (non-fatal):', e.message);
@@ -677,8 +711,8 @@ async function handleGoogleCallback(req, res) {
     try {
         const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: new URLSearchParams({
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
                 code, client_id: clientId, client_secret: clientSecret,
                 redirect_uri: redirectUri, grant_type: 'authorization_code'
             })
@@ -717,18 +751,17 @@ async function handleGoogleCallback(req, res) {
 // ════════════════════════════════════════════════════════════════════════════
 
 function resolveDay(dayName) {
-    if (!dayName) return new Date().toISOString().split('T')[0];
+    if (!dayName) {
+        const n = new Date();
+        return `${n.getFullYear()}-${String(n.getMonth()+1).padStart(2,'0')}-${String(n.getDate()).padStart(2,'0')}`;
+    }
     const input = dayName.trim();
     const lower = input.toLowerCase();
 
-    if (lower === 'today') {
-        const d = new Date();
-        return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
-    }
-    if (lower === 'tomorrow') {
-        const d = new Date(); d.setDate(d.getDate() + 1);
-        return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
-    }
+    const fmt = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+
+    if (lower === 'today')    return fmt(new Date());
+    if (lower === 'tomorrow') { const d = new Date(); d.setDate(d.getDate()+1); return fmt(d); }
 
     const months = {
         january:0, february:1, march:2, april:3, may:4, june:5,
@@ -736,85 +769,75 @@ function resolveDay(dayName) {
         jan:0, feb:1, mar:2, apr:3, jun:5, jul:6, aug:7, sep:8, oct:9, nov:10, dec:11
     };
 
-    const dmyMatch = lower.match(/^(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]+)(?:\s+(\d{4}))?$/);
-    if (dmyMatch) {
-        const day  = parseInt(dmyMatch[1], 10);
-        const mon  = months[dmyMatch[2]];
-        const year = dmyMatch[3] ? parseInt(dmyMatch[3], 10) : new Date().getFullYear();
+    // "19 june", "19 june 2026", "19th june"
+    const dmy = lower.match(/^(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]+)(?:\s+(\d{4}))?$/);
+    if (dmy) {
+        const day = parseInt(dmy[1], 10), mon = months[dmy[2]];
+        const year = dmy[3] ? parseInt(dmy[3], 10) : new Date().getFullYear();
         if (mon !== undefined) {
             const d = new Date(year, mon, day);
-            if (!dmyMatch[3] && d < new Date()) d.setFullYear(d.getFullYear() + 1);
-            return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+            if (!dmy[3] && d < new Date()) d.setFullYear(d.getFullYear()+1);
+            return fmt(d);
         }
     }
 
-    const mdyMatch = lower.match(/^([a-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s+(\d{4}))?$/);
-    if (mdyMatch) {
-        const mon  = months[mdyMatch[1]];
-        const day  = parseInt(mdyMatch[2], 10);
-        const year = mdyMatch[3] ? parseInt(mdyMatch[3], 10) : new Date().getFullYear();
+    // "june 19", "june 19 2026"
+    const mdy = lower.match(/^([a-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s+(\d{4}))?$/);
+    if (mdy) {
+        const mon = months[mdy[1]], day = parseInt(mdy[2], 10);
+        const year = mdy[3] ? parseInt(mdy[3], 10) : new Date().getFullYear();
         if (mon !== undefined) {
             const d = new Date(year, mon, day);
-            if (!mdyMatch[3] && d < new Date()) d.setFullYear(d.getFullYear() + 1);
-            return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+            if (!mdy[3] && d < new Date()) d.setFullYear(d.getFullYear()+1);
+            return fmt(d);
         }
     }
 
-    const days    = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
+    // Weekday names
+    const days = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
     const cleaned = lower.replace(/^next\s+/, '').trim();
     const target  = days.indexOf(cleaned);
     if (target !== -1) {
         const today = new Date();
         let diff = target - today.getDay();
         if (diff <= 0) diff += 7;
-        const d = new Date(today);
-        d.setDate(today.getDate() + diff);
-        return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+        const d = new Date(today); d.setDate(today.getDate()+diff);
+        return fmt(d);
     }
 
-    const dateAttempt = new Date(input.includes('T') ? input : `${input}T12:00:00`);
-    if (!isNaN(dateAttempt.getTime())) {
-        return `${dateAttempt.getFullYear()}-${String(dateAttempt.getMonth()+1).padStart(2,'0')}-${String(dateAttempt.getDate()).padStart(2,'0')}`;
-    }
+    // Native parse fallback
+    const attempt = new Date(input.includes('T') ? input : `${input}T12:00:00`);
+    if (!isNaN(attempt.getTime())) return fmt(attempt);
 
-    const now = new Date();
-    return `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
+    return fmt(new Date());
 }
 
 function parseTime(timeStr) {
     if (!timeStr) return null;
     const s = timeStr.trim().toLowerCase();
-
     if (s === 'morning')                return { h: 9,  min: 0 };
     if (s === 'afternoon')              return { h: 14, min: 0 };
     if (s === 'evening')                return { h: 18, min: 0 };
     if (s === 'noon' || s === 'midday') return { h: 12, min: 0 };
     if (s === 'midnight')               return { h: 0,  min: 0 };
-
     const m = s.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/);
     if (m) {
-        let h   = parseInt(m[1], 10);
+        let h = parseInt(m[1], 10);
         const min = parseInt(m[2] || '0', 10);
         if (m[3] === 'pm' && h !== 12) h += 12;
         if (m[3] === 'am' && h === 12) h  = 0;
         if (h >= 0 && h <= 23 && min >= 0 && min <= 59) return { h, min };
     }
-
     return null;
 }
 
 async function getCalendarTimezone(accessToken) {
     try {
-        const r = await fetch(
-            'https://www.googleapis.com/calendar/v3/calendars/primary',
-            { headers: { Authorization: `Bearer ${accessToken}` } }
-        );
+        const r = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary',
+            { headers: { Authorization: `Bearer ${accessToken}` } });
         if (!r.ok) return 'UTC';
-        const data = await r.json();
-        return data.timeZone || 'UTC';
-    } catch {
-        return 'UTC';
-    }
+        return (await r.json()).timeZone || 'UTC';
+    } catch { return 'UTC'; }
 }
 
 async function refreshTokenIfNeeded(googleAuth, ownerEmail, db) {
@@ -840,9 +863,7 @@ async function refreshTokenIfNeeded(googleAuth, ownerEmail, db) {
                     'integrations.google_calendar.expiry_date':
                         new Date(Date.now() + (t.expires_in || 3500) * 1000).toISOString()
                 });
-            } else {
-                console.error('[Calendar/Refresh] Failed:', t);
-            }
+            } else console.error('[Calendar/Refresh] Failed:', t);
         }
     }
     return accessToken;
@@ -852,16 +873,13 @@ async function checkCalendarAvailability(googleAuth, dateISO, timeStr, ownerEmai
     try {
         const accessToken = await refreshTokenIfNeeded(googleAuth, ownerEmail, db);
         const timeZone    = await getCalendarTimezone(accessToken);
-
-        const parsed = parseTime(timeStr);
+        const parsed      = parseTime(timeStr);
         if (!parsed) return { available: true };
 
         const { h, min } = parsed;
-
         const localStart = `${dateISO}T${String(h).padStart(2,'0')}:${String(min).padStart(2,'0')}:00`;
-        const endH   = h + Math.floor((min + 60) / 60);
-        const endMin = (min + 60) % 60;
-        const localEnd   = `${dateISO}T${String(endH).padStart(2,'0')}:${String(endMin).padStart(2,'0')}:00`;
+        const endH = h + Math.floor((min+60)/60), endMin = (min+60)%60;
+        const localEnd = `${dateISO}T${String(endH).padStart(2,'0')}:${String(endMin).padStart(2,'0')}:00`;
 
         const toUTC = (localStr, tz) => {
             const naive = new Date(localStr + 'Z');
@@ -869,65 +887,49 @@ async function checkCalendarAvailability(googleAuth, dateISO, timeStr, ownerEmai
                 timeZone: tz, year:'numeric', month:'2-digit', day:'2-digit',
                 hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false
             });
-            const parts  = fmt.formatToParts(naive);
-            const get    = type => parseInt(parts.find(p => p.type === type)?.value || '0', 10);
-            const tzH    = get('hour') === 24 ? 0 : get('hour');
-            const represented = Date.UTC(get('year'), get('month')-1, get('day'), tzH, get('minute'), get('second'));
-            const desired     = naive.getTime();
-            return new Date(naive.getTime() - (represented - desired));
+            const parts = fmt.formatToParts(naive);
+            const get   = type => parseInt(parts.find(p => p.type === type)?.value || '0', 10);
+            const tzH   = get('hour') === 24 ? 0 : get('hour');
+            const repr  = Date.UTC(get('year'), get('month')-1, get('day'), tzH, get('minute'), get('second'));
+            return new Date(naive.getTime() - (repr - naive.getTime()));
         };
 
-        const startUTC = toUTC(localStart, timeZone);
-        const endUTC   = toUTC(localEnd,   timeZone);
-
-        const dayLocalStart = `${dateISO}T00:00:00`;
-        const dayLocalEnd   = `${dateISO}T23:59:59`;
-        const dayStartUTC   = toUTC(dayLocalStart, timeZone);
-        const dayEndUTC     = toUTC(dayLocalEnd,   timeZone);
+        const startUTC    = toUTC(localStart, timeZone);
+        const endUTC      = toUTC(localEnd,   timeZone);
+        const dayStartUTC = toUTC(`${dateISO}T00:00:00`, timeZone);
+        const dayEndUTC   = toUTC(`${dateISO}T23:59:59`, timeZone);
 
         const r = await fetch(
             `https://www.googleapis.com/calendar/v3/calendars/primary/events?` +
             `timeMin=${dayStartUTC.toISOString()}&timeMax=${dayEndUTC.toISOString()}&singleEvents=true&orderBy=startTime`,
             { headers: { Authorization: `Bearer ${accessToken}` } }
         );
+        if (!r.ok) return { available: true };
 
-        if (!r.ok) {
-            console.error('[Availability] Calendar fetch failed:', r.status);
-            return { available: true };
-        }
-
-        const data   = await r.json();
-        const events = data.items || [];
-
+        const events = (await r.json()).items || [];
         const isBooked = events.some(ev => {
-            const evStart = new Date(ev.start?.dateTime || ev.start?.date);
-            const evEnd   = new Date(ev.end?.dateTime   || ev.end?.date);
-            return startUTC < evEnd && endUTC > evStart;
+            const evS = new Date(ev.start?.dateTime || ev.start?.date);
+            const evE = new Date(ev.end?.dateTime   || ev.end?.date);
+            return startUTC < evE && endUTC > evS;
         });
-
         if (!isBooked) return { available: true };
 
-        const bookedRanges = events.map(ev => ({
+        const booked = events.map(ev => ({
             start: new Date(ev.start?.dateTime || ev.start?.date),
             end:   new Date(ev.end?.dateTime   || ev.end?.date)
         }));
-
         const suggestions = [];
         for (let sh = 9; sh < 18 && suggestions.length < 3; sh++) {
             for (let sm = 0; sm < 60 && suggestions.length < 3; sm += 30) {
-                const slotLocalStr = `${dateISO}T${String(sh).padStart(2,'0')}:${String(sm).padStart(2,'0')}:00`;
-                const slotStart    = toUTC(slotLocalStr, timeZone);
-                const slotEnd      = new Date(slotStart.getTime() + 30 * 60000);
-                const conflict     = bookedRanges.some(b => slotStart < b.end && slotEnd > b.start);
-                if (!conflict) {
-                    const dh  = sh % 12 === 0 ? 12 : sh % 12;
-                    const dm  = String(sm).padStart(2, '0');
-                    const per = sh < 12 ? 'AM' : 'PM';
-                    suggestions.push(`${dh}:${dm} ${per}`);
+                const sStr  = `${dateISO}T${String(sh).padStart(2,'0')}:${String(sm).padStart(2,'0')}:00`;
+                const sUTC  = toUTC(sStr, timeZone);
+                const eUTC  = new Date(sUTC.getTime() + 30*60000);
+                if (!booked.some(b => sUTC < b.end && eUTC > b.start)) {
+                    const dh = sh%12 === 0 ? 12 : sh%12;
+                    suggestions.push(`${dh}:${String(sm).padStart(2,'0')} ${sh < 12 ? 'AM' : 'PM'}`);
                 }
             }
         }
-
         return { available: false, suggestedTimes: suggestions };
 
     } catch (err) {
@@ -938,22 +940,16 @@ async function checkCalendarAvailability(googleAuth, dateISO, timeStr, ownerEmai
 
 async function addCalendarEvent(googleAuth, appt, ownerEmail, db) {
     const accessToken = await refreshTokenIfNeeded(googleAuth, ownerEmail, db);
-
     const parsed = parseTime(appt.appointmentTime);
     if (!parsed) {
-        console.error(`[Calendar] Cannot parse time "${appt.appointmentTime}" — skipping event creation.`);
+        console.error(`[Calendar] Cannot parse time "${appt.appointmentTime}" — skipping.`);
         return;
     }
-
     const { h, min } = parsed;
-    const timeZone = await getCalendarTimezone(accessToken);
-
+    const timeZone  = await getCalendarTimezone(accessToken);
     const localStart = `${appt.scheduledDate}T${String(h).padStart(2,'0')}:${String(min).padStart(2,'0')}:00`;
-    const endH   = h + Math.floor((min + 30) / 60);
-    const endMin = (min + 30) % 60;
+    const endH = h + Math.floor((min+30)/60), endMin = (min+30)%60;
     const localEnd = `${appt.scheduledDate}T${String(endH).padStart(2,'0')}:${String(endMin).padStart(2,'0')}:00`;
-
-    console.log(`[Calendar] Creating event: ${localStart} → ${localEnd} in ${timeZone}`);
 
     const r = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
         method: 'POST',
@@ -965,8 +961,7 @@ async function addCalendarEvent(googleAuth, appt, ownerEmail, db) {
             end:   { dateTime: localEnd,   timeZone }
         })
     });
-
     const data = await r.json();
-    if (!r.ok) console.error('[Calendar] Event creation error:', data.error?.message);
+    if (!r.ok) console.error('[Calendar] Event error:', data.error?.message);
     else       console.log('[Calendar] Event created:', data.id, 'at', localStart, timeZone);
 }
