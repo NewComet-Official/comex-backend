@@ -50,15 +50,14 @@ export default async function handler(req, res) {
 // ════════════════════════════════════════════════════════════════════════════
 
 /**
- * Normalise any phone string to E.164 (digits only with leading +).
- * Returns null if fewer than 7 digits remain.
+ * Normalise any phone string strictly to E.164 (leading + followed ONLY by digits).
+ * This fixes the YCloud Code 100 Invalid Parameter errors.
  */
 function normalisePhone(raw) {
     if (!raw) return null;
-    let digits = String(raw).replace(/[\s\-\(\)\.]/g, '');
-    if (!digits.startsWith('+')) digits = '+' + digits;
-    if (digits.replace(/\D/g, '').length < 7) return null;
-    return digits;
+    const digits = String(raw).replace(/\D/g, ''); // Strips all spaces, letters, and dashes
+    if (digits.length < 7) return null;
+    return '+' + digits;
 }
 
 /** True if the contact string looks like a phone number rather than an email. */
@@ -69,10 +68,6 @@ function looksLikePhone(contact) {
 
 /**
  * Send a WhatsApp IMAGE + caption message via YCloud.
- * YCloud API docs: https://docs.ycloud.com/reference/whatsapp_send_message
- *
- * `to`      – E.164 phone number, e.g. "+919876543210"
- * `caption` – text shown below the image (supports WhatsApp markdown: *bold*, _italic_)
  */
 async function sendWAImageMessage(to, caption) {
     const norm = normalisePhone(to);
@@ -86,14 +81,14 @@ async function sendWAImageMessage(to, caption) {
         return;
     }
 
-    const FROM_NUMBER = process.env.YCLOUD_FROM_NUMBER;
+    const FROM_NUMBER = normalisePhone(process.env.YCLOUD_FROM_NUMBER);
     if (!FROM_NUMBER) {
-        console.warn('[YCloud] Missing YCLOUD_FROM_NUMBER env var');
+        console.warn('[YCloud] Missing or invalid YCLOUD_FROM_NUMBER env var');
         return;
     }
 
     const body = {
-        from: FROM_NUMBER,  // ← ADD THIS
+        from: FROM_NUMBER,
         to: norm,
         type: 'image',
         image: {
@@ -135,10 +130,9 @@ async function sendWATextMessage(to, text) {
         return;
     }
 
-    // ← ADD THIS: Your WhatsApp Business number (e.g. +1234567890)
-    const FROM_NUMBER = process.env.YCLOUD_FROM_NUMBER;
+    const FROM_NUMBER = normalisePhone(process.env.YCLOUD_FROM_NUMBER);
     if (!FROM_NUMBER) {
-        console.warn('[YCloud] Missing YCLOUD_FROM_NUMBER env var');
+        console.warn('[YCloud] Missing or invalid YCLOUD_FROM_NUMBER env var');
         return;
     }
 
@@ -149,7 +143,7 @@ async function sendWATextMessage(to, text) {
             'X-API-Key':    YCLOUD_API_KEY
         },
         body: JSON.stringify({
-            from: FROM_NUMBER,  // ← ADD THIS
+            from: FROM_NUMBER,
             to:   norm,
             type: 'text',
             text: { body: text }
@@ -167,16 +161,6 @@ async function sendWATextMessage(to, text) {
 
 /**
  * Build the WhatsApp booking confirmation caption.
- * Matches the image exactly:
- *
- *   APPOINTMENT BOOKED          ← bold (handled by the image graphic)
- *
- *   Name: {name}
- *   Contact: {email/phone}
- *   Date: {date}
- *   Time: {time}
- *
- *   Team Comex
  */
 function buildBookingCaption(appt) {
     return (
@@ -784,7 +768,6 @@ function resolveDay(dayName) {
         jan:0, feb:1, mar:2, apr:3, jun:5, jul:6, aug:7, sep:8, oct:9, nov:10, dec:11
     };
 
-    // "19 june", "19 june 2026", "19th june"
     const dmy = lower.match(/^(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]+)(?:\s+(\d{4}))?$/);
     if (dmy) {
         const day = parseInt(dmy[1], 10), mon = months[dmy[2]];
@@ -796,7 +779,6 @@ function resolveDay(dayName) {
         }
     }
 
-    // "june 19", "june 19 2026"
     const mdy = lower.match(/^([a-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s+(\d{4}))?$/);
     if (mdy) {
         const mon = months[mdy[1]], day = parseInt(mdy[2], 10);
@@ -808,7 +790,6 @@ function resolveDay(dayName) {
         }
     }
 
-    // Weekday names
     const days = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
     const cleaned = lower.replace(/^next\s+/, '').trim();
     const target  = days.indexOf(cleaned);
@@ -820,7 +801,6 @@ function resolveDay(dayName) {
         return fmt(d);
     }
 
-    // Native parse fallback
     const attempt = new Date(input.includes('T') ? input : `${input}T12:00:00`);
     if (!isNaN(attempt.getTime())) return fmt(attempt);
 
