@@ -1,4 +1,4 @@
-// api/index.js - Single serverless function router for Vercel Hobby plan
+// api/index.js
 
 import admin from 'firebase-admin';
 import Groq from 'groq-sdk';
@@ -25,21 +25,21 @@ export default async function handler(req, res) {
 
     const path = req.url.split('?')[0].replace(/\/$/, '');
 
-    if (path === '/api/chat')                       return handleChat(req, res);
-    if (path === '/api/config')                     return handleConfig(req, res);
-    if (path === '/api/scrape')                     return handleScrape(req, res);
-    if (path === '/api/deploy')                     return handleDeploy(req, res);
-    if (path === '/api/calculate-roi')              return handleROI(req, res);
-    if (path === '/api/whatsapp-verify')            return handleWAVerify(req, res);
-    if (path === '/api/whatsapp-verify-confirm')    return handleWAConfirm(req, res);
-    if (path === '/api/oauth/google')               return handleGoogleOAuth(req, res);
-    if (path === '/api/oauth/google/callback')      return handleGoogleCallback(req, res);
+    if (path === '/api/chat')                     return handleChat(req, res);
+    if (path === '/api/config')                   return handleConfig(req, res);
+    if (path === '/api/scrape')                   return handleScrape(req, res);
+    if (path === '/api/deploy')                   return handleDeploy(req, res);
+    if (path === '/api/calculate-roi')            return handleROI(req, res);
+    if (path === '/api/whatsapp-verify')          return handleWAVerify(req, res);
+    if (path === '/api/whatsapp-verify-confirm')  return handleWAConfirm(req, res);
+    if (path === '/api/oauth/google')             return handleGoogleOAuth(req, res);
+    if (path === '/api/oauth/google/callback')    return handleGoogleCallback(req, res);
 
     return res.status(404).json({ success: false, message: `Unknown route: ${path}` });
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// 1. DEPLOY
+// DEPLOY
 // ════════════════════════════════════════════════════════════════════════════
 async function handleDeploy(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -59,7 +59,7 @@ async function handleDeploy(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// 2. SCRAPE
+// SCRAPE
 // ════════════════════════════════════════════════════════════════════════════
 async function handleScrape(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -92,7 +92,7 @@ async function handleScrape(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// 3. CONFIG
+// CONFIG
 // ════════════════════════════════════════════════════════════════════════════
 async function handleConfig(req, res) {
     const { businessId } = req.query;
@@ -102,7 +102,7 @@ async function handleConfig(req, res) {
         if (!snap.exists) return res.status(404).json({ success: false, error: 'Bot not found.' });
         const b = snap.data();
         return res.status(200).json({
-            success: true,
+            success:      true,
             name:         b.name                     || 'AI Assistant',
             position:     b.position                 || 'bottom-right',
             logoBase64:   b.logoBase64               || null,
@@ -116,17 +116,7 @@ async function handleConfig(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// 4. CHAT
-//
-// FIXES:
-//   1. Time detection is now strict — requires an explicit time like "3 pm",
-//      "15:00", "morning", "afternoon" etc. Vague phrases don't count.
-//   2. allFieldsPresent checks conversation history for EACH field independently
-//      before triggering the tool call — prevents premature booking.
-//   3. Confirmation message exactly matches the design image.
-//   4. Calendar event uses the EXACT time the user provided, not a default.
-//   5. If the requested slot is already booked, bot suggests 3 specific
-//      available alternative times from that day.
+// CHAT
 // ════════════════════════════════════════════════════════════════════════════
 async function handleChat(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -165,57 +155,51 @@ async function handleChat(req, res) {
         sysPrompt += `
 
 PERSONALITY & BEHAVIOR:
-- You are a warm, helpful customer service assistant. Answer questions naturally and helpfully.
+- You are a warm, helpful customer service assistant. Answer questions naturally.
 - Do NOT bring up appointment booking unless the user explicitly asks to book/schedule/set up an appointment.
-- If the user just says "hello", "hi", or anything that is not a booking request, respond naturally.
+- Greetings like "hello", "hi" get a natural, friendly response — no booking prompts.
 
 APPOINTMENT BOOKING (only when user explicitly asks):
 Collect information ONE piece at a time in EXACTLY this order:
-  1. Full name — ask "What's your name?"
-  2. Contact info (email or phone) — ask "What's your email or phone number?"
-  3. Preferred date — ask "What date would you prefer?"
-  4. Preferred time — ask "What time works best for you?" ← ALWAYS ask this explicitly
+  1. Full name    → ask: "What's your name?"
+  2. Contact info → ask: "What's your email or phone number?"
+  3. Date         → ask: "What date would you prefer?"
+  4. Time         → ask: "What time works best for you on [date]?"
 
 CRITICAL TIME RULES:
-- You MUST ask for a specific time. Never assume or default to a time.
-- Only accept explicit times: "3 pm", "3:00 PM", "15:00", "morning", "afternoon", "evening", "noon".
-- If the user gives a date but NOT a time, you MUST ask: "What time works best for you on [date]?"
-- Do NOT call the booking function until you have a specific time confirmed.
+- You MUST ask for the time explicitly. Never assume or skip it.
+- Valid times: "3 pm", "3:00 PM", "15:00", "morning", "afternoon", "evening", "noon".
+- If the user provides a date without a time, ask: "What time works best for you on [date]?"
+- Do NOT trigger the booking function until you have an explicit time confirmed.
 
-CRITICAL RULES:
-- Do NOT ask for information already provided in the conversation history.
-- Extract name from any phrasing: "I am Atharva", "It's Atharva", "My name is Atharva" — all mean name is Atharva.
-- Accept any date format: "Monday", "19 June", "next Tuesday", "tomorrow", "17th June".
-- Once you have all 4 pieces (name, contact, date, time), silently call the appointmentBooking tool immediately.
-- NEVER output raw JSON, curly braces {}, or function call arguments as plain text.
-- Do not re-ask for any information already given.`;
+OTHER RULES:
+- Extract name from any phrasing: "I am Atharva", "It's Atharva", "My name is Atharva" → name is Atharva.
+- Accept any date: "Monday", "19 June", "next Tuesday", "tomorrow", "17th June".
+- Never re-ask for information already given in conversation history.
+- Once you have all 4 fields confirmed, immediately call the appointmentBooking tool.
+- NEVER output raw JSON or function arguments as plain text. That is a critical error.`;
 
         const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
         const safeHistory = (Array.isArray(history) ? history : [])
             .slice(-12)
             .filter(m => m?.role && m?.content);
 
-        const allText = [...safeHistory.map(m => m.content), userMsg].join('\n');
+        const allText    = [...safeHistory.map(m => m.content), userMsg].join('\n');
         const allTextLow = allText.toLowerCase();
 
-        // ── Field detection (strict) ─────────────────────────────────────────
+        // ── Strict field detection ────────────────────────────────────────────
 
-        // Name: any explicit name phrasing OR a standalone 2-word capitalized name
         const hasName = (
             /my name is|i am|i'm|it'?s\s+[a-z]+|name[:\s]+/i.test(allText) ||
             safeHistory.some(m => m.role === 'user' && /^[A-Z][a-z]+ [A-Z][a-z]+/.test(m.content.trim()))
         );
 
-        // Contact: email address OR a phone-like number (7+ digits)
         const hasContact = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/.test(allText) ||
                            /(\+?\d[\d\s\-]{6,}\d)/.test(allText);
 
-        // Date: day name or date pattern
         const hasDay = /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|today|january|february|march|april|may|june|july|august|september|october|november|december|\d{1,2}[\s\/\-](jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\d{1,2}))\b/i.test(allTextLow);
 
-        // ── STRICT time detection — must be an actual time expression ────────
-        // Matches: "3 pm", "3:30pm", "15:00", "morning", "afternoon", "evening", "noon", "midday"
-        // Does NOT match vague words like "schedule", "book", "appointment"
+        // STRICT: must be an actual time expression — not "book", "schedule", etc.
         const hasTime = /\b(\d{1,2}(:\d{2})?\s*(am|pm))\b/i.test(allText) ||
                         /\b(morning|afternoon|evening|noon|midday|midnight)\b/i.test(allTextLow) ||
                         /\b([01]?\d|2[0-3]):[0-5]\d\b/.test(allText);
@@ -234,14 +218,14 @@ CRITICAL RULES:
                 type: 'function',
                 function: {
                     name: 'appointmentBooking',
-                    description: 'Book an appointment. Call ONLY when you have: full name, contact info, date, AND an explicit time. Never call this without a confirmed time.',
+                    description: 'Book an appointment. Call ONLY when you have confirmed: full name, contact info, date, AND an explicit time from the user.',
                     parameters: {
                         type: 'object',
                         properties: {
                             userName:        { type: 'string', description: 'Full name of the customer' },
                             contactInfo:     { type: 'string', description: 'Email or phone number' },
                             appointmentDay:  { type: 'string', description: 'Date or day of the appointment' },
-                            appointmentTime: { type: 'string', description: 'Exact time of the appointment as provided by the user (e.g. "3:00 PM", "morning", "2 pm")' }
+                            appointmentTime: { type: 'string', description: 'Exact time as stated by the user, e.g. "3 pm", "3:30 PM", "morning"' }
                         },
                         required: ['userName', 'contactInfo', 'appointmentDay', 'appointmentTime']
                     }
@@ -256,7 +240,7 @@ CRITICAL RULES:
 
         const choice = completion.choices[0]?.message;
 
-        // ── Safety net: intercept leaked JSON ────────────────────────────────
+        // ── Safety net: catch leaked JSON ─────────────────────────────────────
         if (choice?.content && !choice?.tool_calls) {
             const jsonMatch = choice.content.match(/\{[\s\S]*?"userName"[\s\S]*?"contactInfo"[\s\S]*?\}/);
             if (jsonMatch) {
@@ -267,11 +251,11 @@ CRITICAL RULES:
                         choice.tool_calls = [{ function: { name: 'appointmentBooking', arguments: JSON.stringify(leaked) } }];
                         choice.content = null;
                     }
-                } catch { /* not valid JSON — ignore */ }
+                } catch { /* not valid JSON */ }
             }
         }
 
-        // ── Appointment tool call ─────────────────────────────────────────────
+        // ── Handle booking tool call ──────────────────────────────────────────
         if (choice?.tool_calls?.[0]?.function?.name === 'appointmentBooking') {
             let args;
             try { args = JSON.parse(choice.tool_calls[0].function.arguments); }
@@ -279,8 +263,8 @@ CRITICAL RULES:
 
             const { userName, contactInfo, appointmentDay, appointmentTime } = args;
 
-            // Guard: if time is still missing/vague after tool call, ask again
-            if (!appointmentTime || appointmentTime.trim() === '' || appointmentTime.toLowerCase() === 'tbd') {
+            // Guard: time is missing or placeholder
+            if (!appointmentTime || appointmentTime.trim() === '' || /^tbd$/i.test(appointmentTime.trim())) {
                 return res.json({
                     success: true,
                     answer: `Got it! Just one more thing — what time works best for you on ${appointmentDay}?`
@@ -290,37 +274,30 @@ CRITICAL RULES:
             if (!userName || !contactInfo || !appointmentDay) {
                 return res.json({
                     success: true,
-                    answer: "I need your name, contact info, preferred date and time to complete the booking. What would you like to provide?"
+                    answer: 'I need your name, contact info, preferred date and time to complete the booking. What would you like to provide?'
                 });
             }
 
             const dateISO = resolveDay(appointmentDay);
 
-            // ── Check calendar availability if Google Calendar is connected ──
+            // ── Availability check (Google Calendar) ──────────────────────────
             if (ownerEmail) {
-                const userSnap = await db.collection('users').doc(ownerEmail).get();
+                const userSnap   = await db.collection('users').doc(ownerEmail).get();
                 const integrations = userSnap.exists ? (userSnap.data()?.integrations || {}) : {};
 
                 if (integrations.google_calendar?.connected) {
-                    const availability = await checkCalendarAvailability(
-                        integrations.google_calendar,
-                        dateISO,
-                        appointmentTime,
-                        ownerEmail,
-                        db
+                    const avail = await checkCalendarAvailability(
+                        integrations.google_calendar, dateISO, appointmentTime, ownerEmail, db
                     );
 
-                    if (!availability.available) {
-                        // Build 3 alternative time suggestions
-                        const alts = availability.suggestedTimes || [];
-                        let altText = '';
-                        if (alts.length > 0) {
-                            altText = '\n\nHere are 3 available slots on that day:\n' +
-                                alts.map((t, i) => `  ${i + 1}. ${t}`).join('\n') +
-                                '\n\nWhich one works for you?';
-                        } else {
-                            altText = '\n\nWould you like to pick a different date or time?';
-                        }
+                    if (!avail.available) {
+                        const alts = avail.suggestedTimes || [];
+                        let altText = alts.length > 0
+                            ? '\n\nHere are 3 available slots on that day:\n' +
+                              alts.map((t, i) => `  ${i + 1}. ${t}`).join('\n') +
+                              '\n\nWhich one works for you?'
+                            : '\n\nWould you like to pick a different date or time?';
+
                         return res.json({
                             success: true,
                             answer: `Sorry, ${appointmentTime} on ${appointmentDay} is already booked.${altText}`
@@ -329,7 +306,7 @@ CRITICAL RULES:
                 }
             }
 
-            // ── Save appointment ──────────────────────────────────────────────
+            // ── Save appointment record ───────────────────────────────────────
             const appt = {
                 businessId, botName, owner: ownerEmail, conversationId: convId,
                 customerName: userName, contactInfo,
@@ -340,9 +317,9 @@ CRITICAL RULES:
             await db.collection('appointments').add(appt);
             await db.collection('user_bots').doc(businessId).collection('appointments').add(appt);
 
-            // ── Trigger integrations ──────────────────────────────────────────
+            // ── Integrations ──────────────────────────────────────────────────
             if (ownerEmail) {
-                const userSnap = await db.collection('users').doc(ownerEmail).get();
+                const userSnap     = await db.collection('users').doc(ownerEmail).get();
                 const integrations = userSnap.exists ? (userSnap.data()?.integrations || {}) : {};
                 if (integrations.google_calendar?.connected) {
                     try { await addCalendarEvent(integrations.google_calendar, appt, ownerEmail, db); }
@@ -360,16 +337,24 @@ CRITICAL RULES:
                 createdAt: new Date().toISOString()
             });
 
-            // ── Confirmation message — matches the design image exactly ───────
-            const answer =
-`✅ APPOINTMENT BOOKED
-
-NAME:       ${userName}
-CONTACT:    ${contactInfo}
-DATE:       ${dateISO}
-TIME:       ${appointmentTime}
-
-Reply with "CANCEL" to cancel the appointment and "EDIT" to change a detail.`;
+            // ── Confirmation — exactly matches the design image ───────────────
+            //    ✅ APPOINTMENT BOOKED
+            //    NAME:     ...
+            //    CONTACT:  ...
+            //    DATE:     ...
+            //    TIME:     ...
+            //    Reply with "CANCEL"... "EDIT"...
+            const pad = (label) => label.padEnd(8);
+            const answer = [
+                '✅ APPOINTMENT BOOKED',
+                '',
+                `${pad('NAME:')}    ${userName}`,
+                `${pad('CONTACT:')} ${contactInfo}`,
+                `${pad('DATE:')}    ${dateISO}`,
+                `${pad('TIME:')}    ${appointmentTime}`,
+                '',
+                'Reply with "CANCEL" to cancel the appointment and "EDIT" to change a detail.'
+            ].join('\n');
 
             return res.json({ success: true, answer, reply: answer });
         }
@@ -388,12 +373,16 @@ Reply with "CANCEL" to cancel the appointment and "EDIT" to change a detail.`;
 
     } catch (err) {
         console.error('[Chat]', err.message);
-        return res.status(500).json({ success: false, answer: 'Something went wrong. Please try again.', reply: 'Something went wrong.' });
+        return res.status(500).json({
+            success: false,
+            answer: 'Something went wrong. Please try again.',
+            reply:  'Something went wrong.'
+        });
     }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// 5. ROI
+// ROI
 // ════════════════════════════════════════════════════════════════════════════
 async function handleROI(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -418,7 +407,7 @@ async function handleROI(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// 6. WHATSAPP VERIFY
+// WHATSAPP VERIFY
 // ════════════════════════════════════════════════════════════════════════════
 async function handleWAVerify(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -466,7 +455,7 @@ async function handleWAVerify(req, res) {
         if (!sid || !token || !from) {
             return res.status(500).json({
                 success: false,
-                message: 'WhatsApp not configured. Add WA_BUSINESS_PHONE_NUMBER_ID + WA_ACCESS_TOKEN OR Twilio credentials to Vercel environment variables.'
+                message: 'WhatsApp not configured. Add WA_BUSINESS_PHONE_NUMBER_ID + WA_ACCESS_TOKEN OR Twilio credentials.'
             });
         }
 
@@ -487,7 +476,7 @@ async function handleWAVerify(req, res) {
             if (twData.code === 63016) {
                 return res.status(400).json({
                     success: false, code: 'NOT_OPTED_IN',
-                    message: `Your WhatsApp number hasn't joined the Twilio sandbox. Send "join <your-keyword>" to ${from} on WhatsApp first, then try again.`
+                    message: `Your WhatsApp number hasn't joined the Twilio sandbox. Send "join <your-keyword>" to ${from} on WhatsApp first.`
                 });
             }
             return res.status(500).json({ success: false, message: twData.message || 'Twilio error.' });
@@ -502,7 +491,7 @@ async function handleWAVerify(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// 7. WHATSAPP CONFIRM
+// WHATSAPP CONFIRM
 // ════════════════════════════════════════════════════════════════════════════
 async function handleWAConfirm(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -545,7 +534,7 @@ async function handleWAConfirm(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// 8. GOOGLE OAUTH — initiate
+// GOOGLE OAUTH — initiate
 // ════════════════════════════════════════════════════════════════════════════
 async function handleGoogleOAuth(req, res) {
     const { email, origin } = req.query;
@@ -554,7 +543,6 @@ async function handleGoogleOAuth(req, res) {
     const clientId    = process.env.GOOGLE_CLIENT_ID;
     const redirectUri = process.env.GOOGLE_REDIRECT_URI ||
                         `https://${req.headers.host}/api/oauth/google/callback`;
-
     if (!clientId) return res.status(500).send('Missing GOOGLE_CLIENT_ID env var.');
 
     const state = Buffer.from(JSON.stringify({ email, origin: origin || null })).toString('base64');
@@ -571,7 +559,7 @@ async function handleGoogleOAuth(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// 9. GOOGLE OAUTH — callback
+// GOOGLE OAUTH — callback
 // ════════════════════════════════════════════════════════════════════════════
 async function handleGoogleCallback(req, res) {
     const { code, state, error } = req.query;
@@ -591,7 +579,6 @@ async function handleGoogleCallback(req, res) {
     const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
     const redirectUri  = process.env.GOOGLE_REDIRECT_URI ||
                          `https://${req.headers.host}/api/oauth/google/callback`;
-
     if (!clientId || !clientSecret) return res.status(500).send('Missing Google OAuth env vars.');
 
     try {
@@ -620,8 +607,6 @@ async function handleGoogleCallback(req, res) {
             }
         }, { merge: true });
 
-        console.log('[OAuth/Google] Saved tokens for:', email);
-
         const appUrl = origin ||
                        process.env.APP_URL ||
                        `https://${req.headers.host.replace('comex-backend', 'cometchat-ai-platform').replace('.vercel.app', '.web.app')}`;
@@ -639,15 +624,21 @@ async function handleGoogleCallback(req, res) {
 // ════════════════════════════════════════════════════════════════════════════
 
 /**
- * Resolve any natural-language date string to YYYY-MM-DD
+ * Resolve any natural-language date string to YYYY-MM-DD (local date, no TZ shift).
  */
 function resolveDay(dayName) {
     if (!dayName) return new Date().toISOString().split('T')[0];
     const input = dayName.trim();
     const lower = input.toLowerCase();
 
-    if (lower === 'today')    return new Date().toISOString().split('T')[0];
-    if (lower === 'tomorrow') { const d = new Date(); d.setDate(d.getDate() + 1); return d.toISOString().split('T')[0]; }
+    if (lower === 'today') {
+        const d = new Date();
+        return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+    }
+    if (lower === 'tomorrow') {
+        const d = new Date(); d.setDate(d.getDate() + 1);
+        return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+    }
 
     const months = {
         january:0, february:1, march:2, april:3, may:4, june:5,
@@ -662,9 +653,10 @@ function resolveDay(dayName) {
         const mon  = months[dmyMatch[2]];
         const year = dmyMatch[3] ? parseInt(dmyMatch[3], 10) : new Date().getFullYear();
         if (mon !== undefined) {
-            const d = new Date(year, mon, day, 12, 0, 0);
+            // Use local Date constructor — no UTC conversion
+            const d = new Date(year, mon, day);
             if (!dmyMatch[3] && d < new Date()) d.setFullYear(d.getFullYear() + 1);
-            return d.toISOString().split('T')[0];
+            return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
         }
     }
 
@@ -675,17 +667,13 @@ function resolveDay(dayName) {
         const day  = parseInt(mdyMatch[2], 10);
         const year = mdyMatch[3] ? parseInt(mdyMatch[3], 10) : new Date().getFullYear();
         if (mon !== undefined) {
-            const d = new Date(year, mon, day, 12, 0, 0);
+            const d = new Date(year, mon, day);
             if (!mdyMatch[3] && d < new Date()) d.setFullYear(d.getFullYear() + 1);
-            return d.toISOString().split('T')[0];
+            return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
         }
     }
 
-    // Native Date parse fallback
-    const dateAttempt = new Date(input + (input.match(/\d/) && !input.includes(':') ? 'T12:00:00' : ''));
-    if (!isNaN(dateAttempt.getTime())) return dateAttempt.toISOString().split('T')[0];
-
-    // Weekday names
+    // Weekday names: "Monday", "next Monday"
     const days    = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
     const cleaned = lower.replace(/^next\s+/, '').trim();
     const target  = days.indexOf(cleaned);
@@ -695,29 +683,34 @@ function resolveDay(dayName) {
         if (diff <= 0) diff += 7;
         const d = new Date(today);
         d.setDate(today.getDate() + diff);
-        return d.toISOString().split('T')[0];
+        return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
     }
 
-    return new Date().toISOString().split('T')[0];
+    // Fallback: try native parse but strip time to avoid TZ issues
+    const dateAttempt = new Date(input.includes('T') ? input : `${input}T12:00:00`);
+    if (!isNaN(dateAttempt.getTime())) {
+        return `${dateAttempt.getFullYear()}-${String(dateAttempt.getMonth()+1).padStart(2,'0')}-${String(dateAttempt.getDate()).padStart(2,'0')}`;
+    }
+
+    const now = new Date();
+    return `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
 }
 
 /**
- * Parse a time string to { h, min } — strict, no silent defaults.
- * Returns null if the time string is not recognisable, so the caller
- * can ask the user again instead of silently using 09:00.
+ * Parse a time string → { h, min } or null if unrecognisable.
+ * Returns null instead of silently defaulting to 09:00.
  */
 function parseTime(timeStr) {
     if (!timeStr) return null;
     const s = timeStr.trim().toLowerCase();
 
-    // Named periods → sensible midpoints
-    if (s === 'morning')              return { h: 9,  min: 0 };
-    if (s === 'afternoon')            return { h: 14, min: 0 };
-    if (s === 'evening')              return { h: 18, min: 0 };
+    if (s === 'morning')                return { h: 9,  min: 0 };
+    if (s === 'afternoon')              return { h: 14, min: 0 };
+    if (s === 'evening')                return { h: 18, min: 0 };
     if (s === 'noon' || s === 'midday') return { h: 12, min: 0 };
-    if (s === 'midnight')             return { h: 0,  min: 0 };
+    if (s === 'midnight')               return { h: 0,  min: 0 };
 
-    // "3 pm", "3:30pm", "3:30 pm", "15:00"
+    // "3 pm", "3:30pm", "3:30 pm", "15:00", "3"
     const m = s.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/);
     if (m) {
         let h   = parseInt(m[1], 10);
@@ -727,116 +720,32 @@ function parseTime(timeStr) {
         if (h >= 0 && h <= 23 && min >= 0 && min <= 59) return { h, min };
     }
 
-    return null; // unrecognised — caller must ask again
+    return null;
 }
 
 /**
- * Check if a time slot is available on Google Calendar.
- * Returns { available: true } or { available: false, suggestedTimes: ['10:00 AM', ...] }
+ * Fetch the owner's Google Calendar primary timezone (e.g. "Asia/Kolkata").
+ * Falls back to 'UTC' on any error.
  */
-async function checkCalendarAvailability(googleAuth, dateISO, timeStr, ownerEmail, db) {
+async function getCalendarTimezone(accessToken) {
     try {
-        let accessToken = googleAuth.access_token;
-
-        // Refresh token if expired
-        if (googleAuth.refresh_token && googleAuth.expiry_date) {
-            const expiryMs = new Date(googleAuth.expiry_date).getTime();
-            if (!isNaN(expiryMs) && expiryMs < Date.now() + 60000) {
-                const r = await fetch('https://oauth2.googleapis.com/token', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                    body: new URLSearchParams({
-                        client_id:     process.env.GOOGLE_CLIENT_ID,
-                        client_secret: process.env.GOOGLE_CLIENT_SECRET,
-                        refresh_token: googleAuth.refresh_token,
-                        grant_type:    'refresh_token'
-                    })
-                });
-                const t = await r.json();
-                if (t.access_token) {
-                    accessToken = t.access_token;
-                    await db.collection('users').doc(ownerEmail).update({
-                        'integrations.google_calendar.access_token': t.access_token,
-                        'integrations.google_calendar.expiry_date':
-                            new Date(Date.now() + (t.expires_in || 3500) * 1000).toISOString()
-                    });
-                }
-            }
-        }
-
-        const parsed = parseTime(timeStr);
-        if (!parsed) return { available: true }; // can't parse — let it through
-
-        const { h, min } = parsed;
-        const start = new Date(`${dateISO}T${String(h).padStart(2,'0')}:${String(min).padStart(2,'0')}:00Z`);
-        const end   = new Date(start.getTime() + 60 * 60000); // check 1-hour window
-
-        // Fetch all events on that day
-        const dayStart = new Date(`${dateISO}T00:00:00Z`);
-        const dayEnd   = new Date(`${dateISO}T23:59:59Z`);
-
         const r = await fetch(
-            `https://www.googleapis.com/calendar/v3/calendars/primary/events?` +
-            `timeMin=${dayStart.toISOString()}&timeMax=${dayEnd.toISOString()}&singleEvents=true&orderBy=startTime`,
-            { headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' } }
+            'https://www.googleapis.com/calendar/v3/calendars/primary',
+            { headers: { Authorization: `Bearer ${accessToken}` } }
         );
-
-        if (!r.ok) {
-            console.error('[Availability] Calendar fetch failed:', r.status);
-            return { available: true }; // fail open
-        }
-
+        if (!r.ok) return 'UTC';
         const data = await r.json();
-        const events = data.items || [];
-
-        // Check if the requested slot overlaps any event
-        const isBooked = events.some(ev => {
-            const evStart = new Date(ev.start?.dateTime || ev.start?.date);
-            const evEnd   = new Date(ev.end?.dateTime   || ev.end?.date);
-            return start < evEnd && end > evStart;
-        });
-
-        if (!isBooked) return { available: true };
-
-        // Build booked times set for this day (30-min granularity)
-        const bookedRanges = events.map(ev => ({
-            start: new Date(ev.start?.dateTime || ev.start?.date),
-            end:   new Date(ev.end?.dateTime   || ev.end?.date)
-        }));
-
-        // Find 3 available 30-min slots within business hours (9am–6pm)
-        const suggestions = [];
-        for (let slotH = 9; slotH < 18 && suggestions.length < 3; slotH++) {
-            for (let slotM = 0; slotM < 60 && suggestions.length < 3; slotM += 30) {
-                const slotStart = new Date(`${dateISO}T${String(slotH).padStart(2,'0')}:${String(slotM).padStart(2,'0')}:00Z`);
-                const slotEnd   = new Date(slotStart.getTime() + 30 * 60000);
-
-                const conflict = bookedRanges.some(b => slotStart < b.end && slotEnd > b.start);
-                if (!conflict) {
-                    // Format as "10:00 AM"
-                    const displayH   = slotH % 12 === 0 ? 12 : slotH % 12;
-                    const displayMin = String(slotM).padStart(2, '0');
-                    const period     = slotH < 12 ? 'AM' : 'PM';
-                    suggestions.push(`${displayH}:${displayMin} ${period}`);
-                }
-            }
-        }
-
-        return { available: false, suggestedTimes: suggestions };
-
-    } catch (err) {
-        console.error('[Availability]', err.message);
-        return { available: true }; // fail open
+        return data.timeZone || 'UTC';
+    } catch {
+        return 'UTC';
     }
 }
 
 /**
- * Add event to Google Calendar using the exact time provided by the user.
+ * Refresh access token if expiring soon. Returns current (or refreshed) token.
  */
-async function addCalendarEvent(googleAuth, appt, ownerEmail, db) {
+async function refreshTokenIfNeeded(googleAuth, ownerEmail, db) {
     let accessToken = googleAuth.access_token;
-
-    // Refresh token if expired
     if (googleAuth.refresh_token && googleAuth.expiry_date) {
         const expiryMs = new Date(googleAuth.expiry_date).getTime();
         if (!isNaN(expiryMs) && expiryMs < Date.now() + 60000) {
@@ -863,17 +772,138 @@ async function addCalendarEvent(googleAuth, appt, ownerEmail, db) {
             }
         }
     }
+    return accessToken;
+}
 
-    // Parse the user's time — if unrecognisable, log and skip silently
+/**
+ * Check if a time slot is free on Google Calendar.
+ * Returns { available: true } or { available: false, suggestedTimes: ['10:00 AM', ...] }
+ *
+ * KEY FIX: We fetch the calendar's own timezone, then build the query window
+ * using a local dateTime string + that timezone — exactly the same way we
+ * create events — so the availability window matches what the user sees.
+ */
+async function checkCalendarAvailability(googleAuth, dateISO, timeStr, ownerEmail, db) {
+    try {
+        const accessToken = await refreshTokenIfNeeded(googleAuth, ownerEmail, db);
+        const timeZone    = await getCalendarTimezone(accessToken);
+
+        const parsed = parseTime(timeStr);
+        if (!parsed) return { available: true }; // can't parse — let it through
+
+        const { h, min } = parsed;
+
+        // Build local start/end as wall-clock strings in the owner's timezone
+        const localStart = `${dateISO}T${String(h).padStart(2,'0')}:${String(min).padStart(2,'0')}:00`;
+        const endH   = h + Math.floor((min + 60) / 60);   // +1 hour window
+        const endMin = (min + 60) % 60;
+        const localEnd   = `${dateISO}T${String(endH).padStart(2,'0')}:${String(endMin).padStart(2,'0')}:00`;
+
+        // Convert local wall-clock strings → UTC ISO for the API query
+        const toUTC = (localStr, tz) => {
+            // Intl trick: find what UTC instant == this local time in tz
+            const naive = new Date(localStr + 'Z');
+            const fmt   = new Intl.DateTimeFormat('en-CA', {
+                timeZone: tz, year:'numeric', month:'2-digit', day:'2-digit',
+                hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false
+            });
+            const parts  = fmt.formatToParts(naive);
+            const get    = type => parseInt(parts.find(p => p.type === type)?.value || '0', 10);
+            const tzH    = get('hour') === 24 ? 0 : get('hour');
+            const represented = Date.UTC(get('year'), get('month')-1, get('day'), tzH, get('minute'), get('second'));
+            const desired     = naive.getTime();
+            return new Date(naive.getTime() - (represented - desired));
+        };
+
+        const startUTC = toUTC(localStart, timeZone);
+        const endUTC   = toUTC(localEnd,   timeZone);
+
+        // Fetch all events on this day
+        const dayLocalStart = `${dateISO}T00:00:00`;
+        const dayLocalEnd   = `${dateISO}T23:59:59`;
+        const dayStartUTC   = toUTC(dayLocalStart, timeZone);
+        const dayEndUTC     = toUTC(dayLocalEnd,   timeZone);
+
+        const r = await fetch(
+            `https://www.googleapis.com/calendar/v3/calendars/primary/events?` +
+            `timeMin=${dayStartUTC.toISOString()}&timeMax=${dayEndUTC.toISOString()}&singleEvents=true&orderBy=startTime`,
+            { headers: { Authorization: `Bearer ${accessToken}` } }
+        );
+
+        if (!r.ok) {
+            console.error('[Availability] Calendar fetch failed:', r.status);
+            return { available: true }; // fail open
+        }
+
+        const data   = await r.json();
+        const events = data.items || [];
+
+        // Check if requested slot overlaps any event
+        const isBooked = events.some(ev => {
+            const evStart = new Date(ev.start?.dateTime || ev.start?.date);
+            const evEnd   = new Date(ev.end?.dateTime   || ev.end?.date);
+            return startUTC < evEnd && endUTC > evStart;
+        });
+
+        if (!isBooked) return { available: true };
+
+        // Find 3 free 30-min slots in business hours (9am–6pm local)
+        const bookedRanges = events.map(ev => ({
+            start: new Date(ev.start?.dateTime || ev.start?.date),
+            end:   new Date(ev.end?.dateTime   || ev.end?.date)
+        }));
+
+        const suggestions = [];
+        for (let sh = 9; sh < 18 && suggestions.length < 3; sh++) {
+            for (let sm = 0; sm < 60 && suggestions.length < 3; sm += 30) {
+                const slotLocalStr = `${dateISO}T${String(sh).padStart(2,'0')}:${String(sm).padStart(2,'0')}:00`;
+                const slotStart    = toUTC(slotLocalStr, timeZone);
+                const slotEnd      = new Date(slotStart.getTime() + 30 * 60000);
+                const conflict     = bookedRanges.some(b => slotStart < b.end && slotEnd > b.start);
+                if (!conflict) {
+                    const dh  = sh % 12 === 0 ? 12 : sh % 12;
+                    const dm  = String(sm).padStart(2, '0');
+                    const per = sh < 12 ? 'AM' : 'PM';
+                    suggestions.push(`${dh}:${dm} ${per}`);
+                }
+            }
+        }
+
+        return { available: false, suggestedTimes: suggestions };
+
+    } catch (err) {
+        console.error('[Availability]', err.message);
+        return { available: true }; // fail open
+    }
+}
+
+/**
+ * Add event to Google Calendar at EXACTLY the time the user stated,
+ * in the owner's local timezone — no UTC shift.
+ *
+ * KEY FIX: pass dateTime WITHOUT a 'Z' suffix + the correct timeZone string.
+ * Google Calendar treats it as a wall-clock time in that zone, so a user
+ * in IST (GMT+5:30) who says "3 pm" gets an event at 3 PM IST, not 3 PM UTC.
+ */
+async function addCalendarEvent(googleAuth, appt, ownerEmail, db) {
+    const accessToken = await refreshTokenIfNeeded(googleAuth, ownerEmail, db);
+
     const parsed = parseTime(appt.appointmentTime);
     if (!parsed) {
-        console.error(`[Calendar] Cannot parse time "${appt.appointmentTime}" — event NOT created.`);
+        console.error(`[Calendar] Cannot parse time "${appt.appointmentTime}" — skipping event creation.`);
         return;
     }
 
     const { h, min } = parsed;
-    const start = new Date(`${appt.scheduledDate}T${String(h).padStart(2,'0')}:${String(min).padStart(2,'0')}:00`);
-    const end   = new Date(start.getTime() + 30 * 60000); // 30-minute appointment
+    const timeZone = await getCalendarTimezone(accessToken);
+
+    // Local wall-clock datetime strings (NO 'Z' — intentional)
+    const localStart = `${appt.scheduledDate}T${String(h).padStart(2,'0')}:${String(min).padStart(2,'0')}:00`;
+    const endH   = h + Math.floor((min + 30) / 60);
+    const endMin = (min + 30) % 60;
+    const localEnd = `${appt.scheduledDate}T${String(endH).padStart(2,'0')}:${String(endMin).padStart(2,'0')}:00`;
+
+    console.log(`[Calendar] Creating event: ${localStart} → ${localEnd} in ${timeZone}`);
 
     const r = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
         method: 'POST',
@@ -881,14 +911,15 @@ async function addCalendarEvent(googleAuth, appt, ownerEmail, db) {
         body: JSON.stringify({
             summary:     `Appointment: ${appt.customerName}`,
             description: `Contact: ${appt.contactInfo}\nBooked via Comex AI`,
-            start: { dateTime: start.toISOString(), timeZone: 'UTC' },
-            end:   { dateTime: end.toISOString(),   timeZone: 'UTC' }
+            // No 'Z' on dateTime + timeZone = Google stores as local wall-clock time
+            start: { dateTime: localStart, timeZone },
+            end:   { dateTime: localEnd,   timeZone }
         })
     });
 
     const data = await r.json();
-    if (!r.ok) console.error('[Calendar] Event error:', data.error?.message);
-    else       console.log('[Calendar] Event created:', data.id, 'at', start.toISOString());
+    if (!r.ok) console.error('[Calendar] Event creation error:', data.error?.message);
+    else       console.log('[Calendar] Event created:', data.id, 'at', localStart, timeZone);
 }
 
 async function sendWANotification(waAuth, appt) {
