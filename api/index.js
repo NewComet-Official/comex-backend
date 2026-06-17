@@ -69,6 +69,9 @@ function looksLikePhone(contact) {
 /**
  * Send a WhatsApp IMAGE + caption message via YCloud.
  */
+/**
+ * Send a WhatsApp IMAGE + caption message via YCloud.
+ */
 async function sendWAImageMessage(to, caption) {
     const norm = normalisePhone(to);
     if (!norm) {
@@ -87,12 +90,12 @@ async function sendWAImageMessage(to, caption) {
         return;
     }
 
-    const body = {
+    const payload = {
         from: FROM_NUMBER,
         to: norm,
         type: 'image',
         image: {
-            link:    BOOKING_IMAGE_URL,
+            link:    BOOKING_IMAGE_URL, // ✅ Must remain 'link' for media files
             caption: caption
         }
     };
@@ -103,7 +106,7 @@ async function sendWAImageMessage(to, caption) {
             'Content-Type': 'application/json',
             'X-API-Key':    YCLOUD_API_KEY
         },
-        body: JSON.stringify(body)
+        body: JSON.stringify(payload)
     });
 
     const data = await r.json();
@@ -114,7 +117,9 @@ async function sendWAImageMessage(to, caption) {
     console.log('[YCloud] Message sent to', norm, '→ id:', data.id);
     return data;
 }
-
+/**
+ * Send a plain text WhatsApp message via YCloud (used for verification codes).
+ */
 /**
  * Send a plain text WhatsApp message via YCloud (used for verification codes).
  */
@@ -139,20 +144,22 @@ async function sendWATextMessage(to, text) {
         return;
     }
 
+    const payload = {
+        from: FROM_NUMBER,
+        to:   norm,
+        type: 'text',
+        text: { 
+            body: text // ✅ Correctly nested parameter mapping required by YCloud
+        }
+    };
+
     const r = await fetch('https://api.ycloud.com/v2/whatsapp/messages', {
         method:  'POST',
         headers: {
             'Content-Type': 'application/json',
             'X-API-Key':    YCLOUD_API_KEY
         },
-        body: JSON.stringify({
-            from: FROM_NUMBER,
-            to:   norm,
-            type: 'text',
-            text: { 
-                value: text // ✅ Corrected from 'body' to 'value'
-            }
-        })
+        body: JSON.stringify(payload)
     });
 
     const data = await r.json();
@@ -162,8 +169,7 @@ async function sendWATextMessage(to, text) {
     }
     console.log('[YCloud] Text sent to', norm, '→ id:', data.id);
     return data;
-}
-/**
+}/**
  * Build the WhatsApp booking confirmation caption.
  */
 function buildBookingCaption(appt) {
