@@ -3,6 +3,12 @@
 import admin from 'firebase-admin';
 import Groq from 'groq-sdk';
 
+// ── WhatsApp Business API credentials ────────────────────────────────────────
+// Set these as Vercel environment variables. The hardcoded values below are
+// used as fallbacks so the app works immediately without any env-var setup.
+const WA_PHONE_ID  = process.env.WA_BUSINESS_PHONE_NUMBER_ID || '1199177256605148';
+const WA_TOKEN     = process.env.WA_ACCESS_TOKEN             || 'EAAZCdmKcvZCBIBRpdjQejV9JAoFv9GWw9xMWBqNnZCw3usJN2z8MEID6UzdB18DPDECEHAbEH7z28wHFJ9HjBJZAhZBHT2cGfdpyyp1ensUcqZCWBCP56k3cp79iJiZCD3oDXJQqQL8iMc9Nr8M8MTn6BXM6lqgbtU3bgWEACr0vOhPwfPsaS9QqpvTyoAsXsjROgZDZD';
+
 function getDb() {
     if (!admin.apps.length) {
         const b64 = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
@@ -36,6 +42,90 @@ export default async function handler(req, res) {
     if (path === '/api/oauth/google/callback')    return handleGoogleCallback(req, res);
 
     return res.status(404).json({ success: false, message: `Unknown route: ${path}` });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// WHATSAPP HELPERS
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Normalise any phone string to E.164 (digits only, leading +).
+ * Returns null if fewer than 7 digits remain after stripping.
+ */
+function normalisePhone(raw) {
+    if (!raw) return null;
+    let digits = raw.replace(/[\s\-\(\)\.]/g, '');
+    if (!digits.startsWith('+')) digits = '+' + digits;
+    // Must have at least country code + 6 digits
+    if (digits.replace(/\D/g, '').length < 7) return null;
+    return digits;
+}
+
+/**
+ * Returns true if the string looks like a phone number rather than an email.
+ */
+function looksLikePhone(contact) {
+    if (!contact) return false;
+    // Has more than 5 digit characters and no @ sign
+    return !contact.includes('@') && (contact.replace(/\D/g, '').length >= 7);
+}
+
+/**
+ * Send a WhatsApp text message via the Cloud API.
+ * `to` should be E.164 WITHOUT the leading '+', e.g. "919876543210".
+ */
+async function sendWAMessage(toRaw, body) {
+    const norm = normalisePhone(toRaw);
+    if (!norm) {
+        console.warn('[WA] Invalid phone, skipping:', toRaw);
+        return;
+    }
+    const to = norm.replace(/^\+/, ''); // Cloud API wants digits only
+
+    const r = await fetch(`https://graph.facebook.com/v19.0/${WA_PHONE_ID}/messages`, {
+        method:  'POST',
+        headers: {
+            Authorization:  `Bearer ${WA_TOKEN}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            messaging_product: 'whatsapp',
+            to,
+            type: 'text',
+            text: { body }
+        })
+    });
+
+    const data = await r.json();
+    if (!r.ok) {
+        console.error('[WA] Send error:', JSON.stringify(data.error));
+        throw new Error(data.error?.message || 'WhatsApp API error');
+    }
+    console.log('[WA] Message sent to', to, '→ id:', data.messages?.[0]?.id);
+    return data;
+}
+
+/**
+ * Build the exact "APPOINTMENT BOOKED" message that matches the design.
+ *
+ * ✅ APPOINTMENT BOOKED
+ *
+ * Name: {name}
+ * Contact: {email/phone}
+ * Date: {date}
+ * Time: {time}
+ *
+ * Team Comex
+ */
+function buildBookingMessage(appt) {
+    return (
+        `✅ *APPOINTMENT BOOKED*\n\n` +
+        `Name: ${appt.customerName}\n` +
+        `Contact: ${appt.contactInfo}\n` +
+        `Date: ${appt.scheduledDate}\n` +
+        `Time: ${appt.appointmentTime}\n\n` +
+        `Team Comex`
+    );
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -188,7 +278,6 @@ OTHER RULES:
         const allTextLow = allText.toLowerCase();
 
         // ── Strict field detection ────────────────────────────────────────────
-
         const hasName = (
             /my name is|i am|i'm|it'?s\s+[a-z]+|name[:\s]+/i.test(allText) ||
             safeHistory.some(m => m.role === 'user' && /^[A-Z][a-z]+ [A-Z][a-z]+/.test(m.content.trim()))
@@ -199,7 +288,6 @@ OTHER RULES:
 
         const hasDay = /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|today|january|february|march|april|may|june|july|august|september|october|november|december|\d{1,2}[\s\/\-](jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\d{1,2}))\b/i.test(allTextLow);
 
-        // STRICT: must be an actual time expression — not "book", "schedule", etc.
         const hasTime = /\b(\d{1,2}(:\d{2})?\s*(am|pm))\b/i.test(allText) ||
                         /\b(morning|afternoon|evening|noon|midday|midnight)\b/i.test(allTextLow) ||
                         /\b([01]?\d|2[0-3]):[0-5]\d\b/.test(allText);
@@ -282,7 +370,7 @@ OTHER RULES:
 
             // ── Availability check (Google Calendar) ──────────────────────────
             if (ownerEmail) {
-                const userSnap   = await db.collection('users').doc(ownerEmail).get();
+                const userSnap     = await db.collection('users').doc(ownerEmail).get();
                 const integrations = userSnap.exists ? (userSnap.data()?.integrations || {}) : {};
 
                 if (integrations.google_calendar?.connected) {
@@ -321,13 +409,34 @@ OTHER RULES:
             if (ownerEmail) {
                 const userSnap     = await db.collection('users').doc(ownerEmail).get();
                 const integrations = userSnap.exists ? (userSnap.data()?.integrations || {}) : {};
+
+                // Google Calendar event
                 if (integrations.google_calendar?.connected) {
                     try { await addCalendarEvent(integrations.google_calendar, appt, ownerEmail, db); }
                     catch (e) { console.error('[Chat/Calendar]', e.message); }
                 }
-                if (integrations.whatsappAlerts?.connected) {
-                    try { await sendWANotification(integrations.whatsappAlerts, appt); }
-                    catch (e) { console.error('[Chat/WhatsApp]', e.message); }
+
+                // ── WhatsApp notifications ────────────────────────────────────
+                const bookingMsg = buildBookingMessage(appt);
+
+                // 1. Always notify the business owner (via their saved WA number)
+                if (integrations.whatsappAlerts?.connected && integrations.whatsappAlerts?.phoneNumber) {
+                    try {
+                        await sendWAMessage(integrations.whatsappAlerts.phoneNumber, bookingMsg);
+                        console.log('[WA] Owner notification sent to', integrations.whatsappAlerts.phoneNumber);
+                    } catch (e) {
+                        console.error('[WA] Owner notification failed:', e.message);
+                    }
+                }
+
+                // 2. Notify the customer IF they provided a phone number (not email)
+                if (looksLikePhone(contactInfo)) {
+                    try {
+                        await sendWAMessage(contactInfo, bookingMsg);
+                        console.log('[WA] Customer notification sent to', contactInfo);
+                    } catch (e) {
+                        console.error('[WA] Customer notification failed:', e.message);
+                    }
                 }
             }
 
@@ -337,13 +446,7 @@ OTHER RULES:
                 createdAt: new Date().toISOString()
             });
 
-            // ── Confirmation — exactly matches the design image ───────────────
-            //    ✅ APPOINTMENT BOOKED
-            //    NAME:     ...
-            //    CONTACT:  ...
-            //    DATE:     ...
-            //    TIME:     ...
-            //    Reply with "CANCEL"... "EDIT"...
+            // ── Confirmation message (shown in chat widget) ───────────────────
             const pad = (label) => label.padEnd(8);
             const answer = [
                 '✅ APPOINTMENT BOOKED',
@@ -407,7 +510,7 @@ async function handleROI(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// WHATSAPP VERIFY
+// WHATSAPP VERIFY — sends 6-digit code to the entered phone number
 // ════════════════════════════════════════════════════════════════════════════
 async function handleWAVerify(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -415,83 +518,51 @@ async function handleWAVerify(req, res) {
     if (!userEmail || !phoneNumber)
         return res.status(400).json({ success: false, message: 'Missing userEmail or phoneNumber.' });
 
-    let to = phoneNumber.replace(/[\s\-\(\)]/g, '');
-    if (!to.startsWith('+')) to = '+' + to;
-    const toWA = to.replace(/^\+/, '');
+    const norm = normalisePhone(phoneNumber);
+    if (!norm) {
+        return res.status(400).json({ success: false, message: 'Invalid phone number. Please include your country code (e.g. +91 9876543210).' });
+    }
 
     const code      = Math.floor(100000 + Math.random() * 900000).toString();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
 
     try {
+        // Store the pending verification in Firestore
         await getDb().collection('whatsapp_verifications').doc(userEmail).set({
-            verificationCode: code, phoneNumber: to, expiresAt, attempts: 0,
-            createdAt: new Date().toISOString()
+            verificationCode: code,
+            phoneNumber:      norm,
+            expiresAt,
+            attempts:   0,
+            createdAt:  new Date().toISOString()
         });
 
-        const waPhoneId = process.env.WA_BUSINESS_PHONE_NUMBER_ID;
-        const waToken   = process.env.WA_ACCESS_TOKEN;
+        // Send via WhatsApp Business Cloud API
+        const verificationMsg =
+            `🔐 *Comex AI Verification*\n\n` +
+            `Your verification code is:\n\n` +
+            `*${code}*\n\n` +
+            `This code expires in 10 minutes. Do not share it with anyone.\n\n` +
+            `Team Comex`;
 
-        if (waPhoneId && waToken) {
-            const waRes = await fetch(`https://graph.facebook.com/v19.0/${waPhoneId}/messages`, {
-                method: 'POST',
-                headers: { Authorization: `Bearer ${waToken}`, 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    messaging_product: 'whatsapp', to: toWA, type: 'text',
-                    text: { body: `Your Comex AI verification code is: *${code}*\n\nExpires in 10 minutes. Do not share this code.` }
-                })
-            });
-            const waData = await waRes.json();
-            if (!waRes.ok) {
-                console.error('[WA-Business]', JSON.stringify(waData));
-                return res.status(500).json({ success: false, message: waData.error?.message || 'WhatsApp Business API error.' });
-            }
-            return res.json({ success: true, message: `Code sent to ${to} via WhatsApp.`, provider: 'whatsapp-business' });
-        }
+        await sendWAMessage(norm, verificationMsg);
 
-        const sid   = process.env.TWILIO_ACCOUNT_SID;
-        const token = process.env.TWILIO_AUTH_TOKEN;
-        const from  = process.env.TWILIO_WHATSAPP_NUMBER;
-
-        if (!sid || !token || !from) {
-            return res.status(500).json({
-                success: false,
-                message: 'WhatsApp not configured. Add WA_BUSINESS_PHONE_NUMBER_ID + WA_ACCESS_TOKEN OR Twilio credentials.'
-            });
-        }
-
-        const twRes = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`, {
-            method: 'POST',
-            headers: {
-                Authorization: `Basic ${Buffer.from(`${sid}:${token}`).toString('base64')}`,
-                'Content-Type': 'application/x-www-form-urlencoded'
-            },
-            body: new URLSearchParams({
-                From: `whatsapp:${from}`, To: `whatsapp:${to}`,
-                Body: `Your Comex AI verification code is: *${code}*\n\nExpires in 10 minutes. Do not share.`
-            })
+        return res.json({
+            success:  true,
+            message:  `Verification code sent to ${norm} via WhatsApp.`,
+            provider: 'whatsapp-business'
         });
-
-        const twData = await twRes.json();
-        if (!twRes.ok) {
-            if (twData.code === 63016) {
-                return res.status(400).json({
-                    success: false, code: 'NOT_OPTED_IN',
-                    message: `Your WhatsApp number hasn't joined the Twilio sandbox. Send "join <your-keyword>" to ${from} on WhatsApp first.`
-                });
-            }
-            return res.status(500).json({ success: false, message: twData.message || 'Twilio error.' });
-        }
-
-        return res.json({ success: true, message: `Code sent to ${to} via WhatsApp.`, provider: 'twilio' });
 
     } catch (err) {
         console.error('[WA-Verify]', err.message);
-        return res.status(500).json({ success: false, message: err.message });
+        return res.status(500).json({
+            success: false,
+            message: `Failed to send WhatsApp message: ${err.message}. Make sure the number has WhatsApp and is reachable.`
+        });
     }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// WHATSAPP CONFIRM
+// WHATSAPP CONFIRM — validates the 6-digit code
 // ════════════════════════════════════════════════════════════════════════════
 async function handleWAConfirm(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -522,11 +593,33 @@ async function handleWAConfirm(req, res) {
             return res.status(400).json({ success: false, message: `Wrong code. ${3 - attempts} attempt(s) left.` });
         }
 
+        // ✅ Code correct — save to user's integrations
         await db.collection('users').doc(userEmail).set({
-            integrations: { whatsappAlerts: { connected: true, phoneNumber: data.phoneNumber, verifiedAt: new Date().toISOString() } }
+            integrations: {
+                whatsappAlerts: {
+                    connected:   true,
+                    phoneNumber: data.phoneNumber,
+                    verifiedAt:  new Date().toISOString()
+                }
+            }
         }, { merge: true });
+
         await ref.delete();
+
+        // Send a welcome confirmation to the newly connected number
+        try {
+            await sendWAMessage(data.phoneNumber,
+                `✅ *WhatsApp Connected!*\n\n` +
+                `Your number is now linked to Comex AI. ` +
+                `You will receive appointment booking notifications here.\n\n` +
+                `Team Comex`
+            );
+        } catch (e) {
+            console.warn('[WA-Confirm] Welcome message failed (non-fatal):', e.message);
+        }
+
         return res.json({ success: true, message: 'WhatsApp connected successfully!' });
+
     } catch (err) {
         console.error('[WA-Confirm]', err.message);
         return res.status(500).json({ success: false, message: err.message });
@@ -623,9 +716,6 @@ async function handleGoogleCallback(req, res) {
 // HELPERS
 // ════════════════════════════════════════════════════════════════════════════
 
-/**
- * Resolve any natural-language date string to YYYY-MM-DD (local date, no TZ shift).
- */
 function resolveDay(dayName) {
     if (!dayName) return new Date().toISOString().split('T')[0];
     const input = dayName.trim();
@@ -646,21 +736,18 @@ function resolveDay(dayName) {
         jan:0, feb:1, mar:2, apr:3, jun:5, jul:6, aug:7, sep:8, oct:9, nov:10, dec:11
     };
 
-    // "19 june", "19 june 2026", "19th june"
     const dmyMatch = lower.match(/^(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]+)(?:\s+(\d{4}))?$/);
     if (dmyMatch) {
         const day  = parseInt(dmyMatch[1], 10);
         const mon  = months[dmyMatch[2]];
         const year = dmyMatch[3] ? parseInt(dmyMatch[3], 10) : new Date().getFullYear();
         if (mon !== undefined) {
-            // Use local Date constructor — no UTC conversion
             const d = new Date(year, mon, day);
             if (!dmyMatch[3] && d < new Date()) d.setFullYear(d.getFullYear() + 1);
             return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
         }
     }
 
-    // "june 19", "june 19 2026"
     const mdyMatch = lower.match(/^([a-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s+(\d{4}))?$/);
     if (mdyMatch) {
         const mon  = months[mdyMatch[1]];
@@ -673,7 +760,6 @@ function resolveDay(dayName) {
         }
     }
 
-    // Weekday names: "Monday", "next Monday"
     const days    = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
     const cleaned = lower.replace(/^next\s+/, '').trim();
     const target  = days.indexOf(cleaned);
@@ -686,7 +772,6 @@ function resolveDay(dayName) {
         return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
     }
 
-    // Fallback: try native parse but strip time to avoid TZ issues
     const dateAttempt = new Date(input.includes('T') ? input : `${input}T12:00:00`);
     if (!isNaN(dateAttempt.getTime())) {
         return `${dateAttempt.getFullYear()}-${String(dateAttempt.getMonth()+1).padStart(2,'0')}-${String(dateAttempt.getDate()).padStart(2,'0')}`;
@@ -696,10 +781,6 @@ function resolveDay(dayName) {
     return `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
 }
 
-/**
- * Parse a time string → { h, min } or null if unrecognisable.
- * Returns null instead of silently defaulting to 09:00.
- */
 function parseTime(timeStr) {
     if (!timeStr) return null;
     const s = timeStr.trim().toLowerCase();
@@ -710,7 +791,6 @@ function parseTime(timeStr) {
     if (s === 'noon' || s === 'midday') return { h: 12, min: 0 };
     if (s === 'midnight')               return { h: 0,  min: 0 };
 
-    // "3 pm", "3:30pm", "3:30 pm", "15:00", "3"
     const m = s.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/);
     if (m) {
         let h   = parseInt(m[1], 10);
@@ -723,10 +803,6 @@ function parseTime(timeStr) {
     return null;
 }
 
-/**
- * Fetch the owner's Google Calendar primary timezone (e.g. "Asia/Kolkata").
- * Falls back to 'UTC' on any error.
- */
 async function getCalendarTimezone(accessToken) {
     try {
         const r = await fetch(
@@ -741,9 +817,6 @@ async function getCalendarTimezone(accessToken) {
     }
 }
 
-/**
- * Refresh access token if expiring soon. Returns current (or refreshed) token.
- */
 async function refreshTokenIfNeeded(googleAuth, ownerEmail, db) {
     let accessToken = googleAuth.access_token;
     if (googleAuth.refresh_token && googleAuth.expiry_date) {
@@ -775,33 +848,22 @@ async function refreshTokenIfNeeded(googleAuth, ownerEmail, db) {
     return accessToken;
 }
 
-/**
- * Check if a time slot is free on Google Calendar.
- * Returns { available: true } or { available: false, suggestedTimes: ['10:00 AM', ...] }
- *
- * KEY FIX: We fetch the calendar's own timezone, then build the query window
- * using a local dateTime string + that timezone — exactly the same way we
- * create events — so the availability window matches what the user sees.
- */
 async function checkCalendarAvailability(googleAuth, dateISO, timeStr, ownerEmail, db) {
     try {
         const accessToken = await refreshTokenIfNeeded(googleAuth, ownerEmail, db);
         const timeZone    = await getCalendarTimezone(accessToken);
 
         const parsed = parseTime(timeStr);
-        if (!parsed) return { available: true }; // can't parse — let it through
+        if (!parsed) return { available: true };
 
         const { h, min } = parsed;
 
-        // Build local start/end as wall-clock strings in the owner's timezone
         const localStart = `${dateISO}T${String(h).padStart(2,'0')}:${String(min).padStart(2,'0')}:00`;
-        const endH   = h + Math.floor((min + 60) / 60);   // +1 hour window
+        const endH   = h + Math.floor((min + 60) / 60);
         const endMin = (min + 60) % 60;
         const localEnd   = `${dateISO}T${String(endH).padStart(2,'0')}:${String(endMin).padStart(2,'0')}:00`;
 
-        // Convert local wall-clock strings → UTC ISO for the API query
         const toUTC = (localStr, tz) => {
-            // Intl trick: find what UTC instant == this local time in tz
             const naive = new Date(localStr + 'Z');
             const fmt   = new Intl.DateTimeFormat('en-CA', {
                 timeZone: tz, year:'numeric', month:'2-digit', day:'2-digit',
@@ -818,7 +880,6 @@ async function checkCalendarAvailability(googleAuth, dateISO, timeStr, ownerEmai
         const startUTC = toUTC(localStart, timeZone);
         const endUTC   = toUTC(localEnd,   timeZone);
 
-        // Fetch all events on this day
         const dayLocalStart = `${dateISO}T00:00:00`;
         const dayLocalEnd   = `${dateISO}T23:59:59`;
         const dayStartUTC   = toUTC(dayLocalStart, timeZone);
@@ -832,13 +893,12 @@ async function checkCalendarAvailability(googleAuth, dateISO, timeStr, ownerEmai
 
         if (!r.ok) {
             console.error('[Availability] Calendar fetch failed:', r.status);
-            return { available: true }; // fail open
+            return { available: true };
         }
 
         const data   = await r.json();
         const events = data.items || [];
 
-        // Check if requested slot overlaps any event
         const isBooked = events.some(ev => {
             const evStart = new Date(ev.start?.dateTime || ev.start?.date);
             const evEnd   = new Date(ev.end?.dateTime   || ev.end?.date);
@@ -847,7 +907,6 @@ async function checkCalendarAvailability(googleAuth, dateISO, timeStr, ownerEmai
 
         if (!isBooked) return { available: true };
 
-        // Find 3 free 30-min slots in business hours (9am–6pm local)
         const bookedRanges = events.map(ev => ({
             start: new Date(ev.start?.dateTime || ev.start?.date),
             end:   new Date(ev.end?.dateTime   || ev.end?.date)
@@ -873,18 +932,10 @@ async function checkCalendarAvailability(googleAuth, dateISO, timeStr, ownerEmai
 
     } catch (err) {
         console.error('[Availability]', err.message);
-        return { available: true }; // fail open
+        return { available: true };
     }
 }
 
-/**
- * Add event to Google Calendar at EXACTLY the time the user stated,
- * in the owner's local timezone — no UTC shift.
- *
- * KEY FIX: pass dateTime WITHOUT a 'Z' suffix + the correct timeZone string.
- * Google Calendar treats it as a wall-clock time in that zone, so a user
- * in IST (GMT+5:30) who says "3 pm" gets an event at 3 PM IST, not 3 PM UTC.
- */
 async function addCalendarEvent(googleAuth, appt, ownerEmail, db) {
     const accessToken = await refreshTokenIfNeeded(googleAuth, ownerEmail, db);
 
@@ -897,7 +948,6 @@ async function addCalendarEvent(googleAuth, appt, ownerEmail, db) {
     const { h, min } = parsed;
     const timeZone = await getCalendarTimezone(accessToken);
 
-    // Local wall-clock datetime strings (NO 'Z' — intentional)
     const localStart = `${appt.scheduledDate}T${String(h).padStart(2,'0')}:${String(min).padStart(2,'0')}:00`;
     const endH   = h + Math.floor((min + 30) / 60);
     const endMin = (min + 30) % 60;
@@ -911,7 +961,6 @@ async function addCalendarEvent(googleAuth, appt, ownerEmail, db) {
         body: JSON.stringify({
             summary:     `Appointment: ${appt.customerName}`,
             description: `Contact: ${appt.contactInfo}\nBooked via Comex AI`,
-            // No 'Z' on dateTime + timeZone = Google stores as local wall-clock time
             start: { dateTime: localStart, timeZone },
             end:   { dateTime: localEnd,   timeZone }
         })
@@ -920,39 +969,4 @@ async function addCalendarEvent(googleAuth, appt, ownerEmail, db) {
     const data = await r.json();
     if (!r.ok) console.error('[Calendar] Event creation error:', data.error?.message);
     else       console.log('[Calendar] Event created:', data.id, 'at', localStart, timeZone);
-}
-
-async function sendWANotification(waAuth, appt) {
-    if (!waAuth.phoneNumber) return;
-    let to = waAuth.phoneNumber.replace(/[\s\-\(\)]/g, '');
-    if (!to.startsWith('+')) to = '+' + to;
-
-    const body = `📅 *New Appointment Booked*\n\n👤 Name: ${appt.customerName}\n📧 Contact: ${appt.contactInfo}\n📆 Date: ${appt.scheduledDate}\n🕐 Time: ${appt.appointmentTime}\n\nBooked via Comex AI`;
-
-    const waPhoneId = process.env.WA_BUSINESS_PHONE_NUMBER_ID;
-    const waToken   = process.env.WA_ACCESS_TOKEN;
-    if (waPhoneId && waToken) {
-        const r = await fetch(`https://graph.facebook.com/v19.0/${waPhoneId}/messages`, {
-            method: 'POST',
-            headers: { Authorization: `Bearer ${waToken}`, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ messaging_product: 'whatsapp', to: to.replace(/^\+/, ''), type: 'text', text: { body } })
-        });
-        if (!r.ok) { const d = await r.json(); console.error('[WA-Business] Send error:', d.error?.message); }
-        return;
-    }
-
-    const sid   = process.env.TWILIO_ACCOUNT_SID;
-    const token = process.env.TWILIO_AUTH_TOKEN;
-    const from  = process.env.TWILIO_WHATSAPP_NUMBER;
-    if (!sid || !token || !from) return;
-
-    const r = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`, {
-        method: 'POST',
-        headers: {
-            Authorization: `Basic ${Buffer.from(`${sid}:${token}`).toString('base64')}`,
-            'Content-Type': 'application/x-www-form-urlencoded'
-        },
-        body: new URLSearchParams({ From: `whatsapp:${from}`, To: `whatsapp:${to}`, Body: body })
-    });
-    if (!r.ok) { const d = await r.json(); console.error('[WA-Twilio] Send error:', d.message); }
 }
