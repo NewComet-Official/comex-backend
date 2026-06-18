@@ -3,12 +3,32 @@
 import admin from 'firebase-admin';
 import Groq from 'groq-sdk';
 
-// ── YCloud WhatsApp API ───────────────────────────────────────────────────────
-// Set YCLOUD_API_KEY as a Vercel environment variable.
-const YCLOUD_API_KEY = process.env.YCLOUD_API_KEY || '';
-
-// Image shown at the top of every WhatsApp booking confirmation
+const YCLOUD_API_KEY   = process.env.YCLOUD_API_KEY || '';
 const BOOKING_IMAGE_URL = 'https://i.ibb.co/8nbzHx0N/Appointment-booking-cofirmed.png';
+
+// ── WhatsApp link / QR prefilled message ─────────────────────────────────────
+// Opens a wa.me chat with a prefilled message so the user sends the FIRST message,
+// which opens a 24-hour session and makes ALL subsequent messages deliverable
+// to any WhatsApp account (business or personal).
+const WA_PREFILL_MSG = encodeURIComponent(
+    'I want to connect *WhatsApp integration* for my business on *Comex AI* platform.'
+);
+
+/**
+ * Build the wa.me link with the prefilled message for a given FROM number.
+ * Strip leading '+' for the wa.me URL format.
+ */
+function buildWALink(fromNumber) {
+    const digits = String(fromNumber).replace(/\D/g, '');
+    return `https://wa.me/${digits}?text=${WA_PREFILL_MSG}`;
+}
+
+/**
+ * Build a QR code image URL (via api.qrserver.com — no auth needed).
+ */
+function buildQRUrl(waLink) {
+    return `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(waLink)}`;
+}
 
 function getDb() {
     if (!admin.apps.length) {
@@ -39,6 +59,7 @@ export default async function handler(req, res) {
     if (path === '/api/calculate-roi')            return handleROI(req, res);
     if (path === '/api/whatsapp-verify')          return handleWAVerify(req, res);
     if (path === '/api/whatsapp-verify-confirm')  return handleWAConfirm(req, res);
+    if (path === '/api/whatsapp-session-open')    return handleWASessionOpen(req, res);
     if (path === '/api/oauth/google')             return handleGoogleOAuth(req, res);
     if (path === '/api/oauth/google/callback')    return handleGoogleCallback(req, res);
 
@@ -46,17 +67,23 @@ export default async function handler(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// YCLOUD WHATSAPP HELPERS
+// PHONE HELPERS
 // ════════════════════════════════════════════════════════════════════════════
 
 /**
  * Normalise any phone string strictly to E.164 (leading + followed ONLY by digits).
- * This fixes the YCloud Code 100 Invalid Parameter errors.
+ * Handles formats like: +918318228754, 918318228754, 08318228754, +91 831 822 8754
  */
 function normalisePhone(raw) {
     if (!raw) return null;
-    const digits = String(raw).replace(/\D/g, ''); // Strips all spaces, letters, and dashes
+    const str    = String(raw).trim();
+    const digits = str.replace(/\D/g, '');
     if (digits.length < 7) return null;
+
+    // Already has + prefix — trust it
+    if (str.startsWith('+')) return '+' + digits;
+
+    // Assume the digits are already the full international number
     return '+' + digits;
 }
 
@@ -66,102 +93,79 @@ function looksLikePhone(contact) {
     return !contact.includes('@') && contact.replace(/\D/g, '').length >= 7;
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// YCLOUD WHATSAPP HELPERS
+//
+// ROOT CAUSE OF 24-HOUR ERRORS:
+// WhatsApp only allows businesses to send the FIRST message using approved
+// "template" messages. Free-form messages (image, text, etc.) can ONLY be
+// sent within 24 hours of the CUSTOMER sending a message first.
+//
+// FIX: We show a QR code + wa.me link with a prefilled message so the
+// customer opens the conversation. Once they send that first message,
+// the 24-hour session is open and ALL message types work on ANY account.
+// ════════════════════════════════════════════════════════════════════════════
+
 /**
  * Send a WhatsApp IMAGE + caption message via YCloud.
- */
-/**
- * Send a WhatsApp IMAGE + caption message via YCloud.
+ * Requires an open 24-hour session (customer messaged first).
  */
 async function sendWAImageMessage(to, caption) {
     const norm = normalisePhone(to);
-    if (!norm) {
-        console.warn('[YCloud] Invalid phone, skipping:', to);
-        return;
-    }
-
-    if (!YCLOUD_API_KEY) {
-        console.warn('[YCloud] No API key set — skipping WA send.');
-        return;
-    }
+    if (!norm) { console.warn('[YCloud] Invalid phone, skipping:', to); return; }
+    if (!YCLOUD_API_KEY) { console.warn('[YCloud] No API key set.'); return; }
 
     const FROM_NUMBER = normalisePhone(process.env.YCLOUD_FROM_NUMBER);
-    if (!FROM_NUMBER) {
-        console.warn('[YCloud] Missing or invalid YCLOUD_FROM_NUMBER env var');
-        return;
-    }
+    if (!FROM_NUMBER) { console.warn('[YCloud] Missing YCLOUD_FROM_NUMBER.'); return; }
 
     const payload = {
         from: FROM_NUMBER,
-        to: norm,
+        to:   norm,
         type: 'image',
         image: {
-            link:    BOOKING_IMAGE_URL, // ✅ Must remain 'link' for media files
+            link:    BOOKING_IMAGE_URL,
             caption: caption
         }
     };
 
     const r = await fetch('https://api.ycloud.com/v2/whatsapp/messages', {
         method:  'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'X-API-Key':    YCLOUD_API_KEY
-        },
+        headers: { 'Content-Type': 'application/json', 'X-API-Key': YCLOUD_API_KEY },
         body: JSON.stringify(payload)
     });
-
     const data = await r.json();
     if (!r.ok) {
-        console.error('[YCloud] Send error:', JSON.stringify(data));
+        console.error('[YCloud] Image send error:', JSON.stringify(data));
         throw new Error(data.message || data.error?.message || 'YCloud API error');
     }
-    console.log('[YCloud] Message sent to', norm, '→ id:', data.id);
+    console.log('[YCloud] Image sent to', norm, '→ id:', data.id);
     return data;
 }
+
 /**
- * Send a plain text WhatsApp message via YCloud (used for verification codes).
- */
-/**
- * Send a plain text WhatsApp message via YCloud (used for verification codes).
- */
-/**
- * Send a plain text WhatsApp message via YCloud (used for verification codes).
+ * Send a plain text WhatsApp message via YCloud.
+ * Requires an open 24-hour session (customer messaged first).
  */
 async function sendWATextMessage(to, text) {
     const norm = normalisePhone(to);
-    if (!norm) {
-        console.warn('[YCloud] Invalid phone, skipping:', to);
-        return;
-    }
-
-    if (!YCLOUD_API_KEY) {
-        console.warn('[YCloud] No API key set — skipping WA send.');
-        return;
-    }
+    if (!norm) { console.warn('[YCloud] Invalid phone, skipping:', to); return; }
+    if (!YCLOUD_API_KEY) { console.warn('[YCloud] No API key set.'); return; }
 
     const FROM_NUMBER = normalisePhone(process.env.YCLOUD_FROM_NUMBER);
-    if (!FROM_NUMBER) {
-        console.warn('[YCloud] Missing or invalid YCLOUD_FROM_NUMBER env var');
-        return;
-    }
+    if (!FROM_NUMBER) { console.warn('[YCloud] Missing YCLOUD_FROM_NUMBER.'); return; }
 
     const payload = {
         from: FROM_NUMBER,
         to:   norm,
         type: 'text',
-        text: { 
-            body: text // ✅ Correctly nested parameter mapping required by YCloud
-        }
+        text: { body: text }
     };
 
     const r = await fetch('https://api.ycloud.com/v2/whatsapp/messages', {
         method:  'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'X-API-Key':    YCLOUD_API_KEY
-        },
+        headers: { 'Content-Type': 'application/json', 'X-API-Key': YCLOUD_API_KEY },
         body: JSON.stringify(payload)
     });
-
     const data = await r.json();
     if (!r.ok) {
         console.error('[YCloud] Text send error:', JSON.stringify(data));
@@ -169,9 +173,64 @@ async function sendWATextMessage(to, text) {
     }
     console.log('[YCloud] Text sent to', norm, '→ id:', data.id);
     return data;
-}/**
- * Build the WhatsApp booking confirmation caption.
+}
+
+/**
+ * Try to send a WhatsApp message. If it fails because no 24-hour session is open,
+ * return the wa.me link + QR URL instead of throwing — the caller can surface
+ * these to the user so they can open the session themselves.
+ *
+ * Returns: { sent: true } | { sent: false, waLink, qrUrl, reason }
  */
+async function sendWASafe(to, type, payload) {
+    const norm = normalisePhone(to);
+    if (!norm) return { sent: false, reason: 'Invalid phone number.' };
+    if (!YCLOUD_API_KEY) return { sent: false, reason: 'No YCloud API key configured.' };
+
+    const FROM_NUMBER = normalisePhone(process.env.YCLOUD_FROM_NUMBER);
+    if (!FROM_NUMBER) return { sent: false, reason: 'YCLOUD_FROM_NUMBER not configured.' };
+
+    const body = { from: FROM_NUMBER, to: norm, type, ...payload };
+
+    try {
+        const r = await fetch('https://api.ycloud.com/v2/whatsapp/messages', {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json', 'X-API-Key': YCLOUD_API_KEY },
+            body: JSON.stringify(body)
+        });
+        const data = await r.json();
+
+        if (!r.ok) {
+            // YCloud error codes for session/window issues:
+            // 131047 = outside 24-hour window
+            // 470    = re-engagement message not allowed
+            // 100    = invalid parameter (often phone not on WhatsApp)
+            const errorCode = data.error?.code || data.code;
+            const is24hError = [131047, 470, 368].includes(Number(errorCode)) ||
+                               /window|session|24.hour|outside/i.test(data.message || '');
+
+            const waLink = buildWALink(FROM_NUMBER);
+            const qrUrl  = buildQRUrl(waLink);
+
+            if (is24hError) {
+                console.warn('[YCloud] 24h window closed for', norm, '— returning QR/link');
+                return { sent: false, waLink, qrUrl, reason: '24h_window', errorCode };
+            }
+
+            console.error('[YCloud] Send error:', JSON.stringify(data));
+            return { sent: false, reason: data.message || 'YCloud API error', errorCode };
+        }
+
+        console.log('[YCloud] Sent to', norm, '→ id:', data.id);
+        return { sent: true, messageId: data.id };
+
+    } catch (err) {
+        console.error('[YCloud] Network error:', err.message);
+        return { sent: false, reason: err.message };
+    }
+}
+
+/** Build the WhatsApp booking confirmation caption. */
 function buildBookingCaption(appt) {
     return (
         `*APPOINTMENT BOOKED*\n\n` +
@@ -181,6 +240,25 @@ function buildBookingCaption(appt) {
         `Time: ${appt.appointmentTime}\n\n` +
         `Team Comex`
     );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// NEW ROUTE: /api/whatsapp-session-open
+// Called by the frontend to check if a session is open, or get the QR/link
+// to show the user so they can open it themselves.
+// ════════════════════════════════════════════════════════════════════════════
+async function handleWASessionOpen(req, res) {
+    if (req.method !== 'GET' && req.method !== 'POST') return res.status(405).json({ success: false });
+
+    const FROM_NUMBER = normalisePhone(process.env.YCLOUD_FROM_NUMBER);
+    if (!FROM_NUMBER) {
+        return res.status(500).json({ success: false, message: 'YCLOUD_FROM_NUMBER not configured.' });
+    }
+
+    const waLink = buildWALink(FROM_NUMBER);
+    const qrUrl  = buildQRUrl(waLink);
+
+    return res.json({ success: true, waLink, qrUrl, prefillMessage: decodeURIComponent(WA_PREFILL_MSG) });
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -332,7 +410,6 @@ OTHER RULES:
         const allText    = [...safeHistory.map(m => m.content), userMsg].join('\n');
         const allTextLow = allText.toLowerCase();
 
-        // ── Strict field detection ────────────────────────────────────────────
         const hasName = (
             /my name is|i am|i'm|it'?s\s+[a-z]+|name[:\s]+/i.test(allText) ||
             safeHistory.some(m => m.role === 'user' && /^[A-Z][a-z]+ [A-Z][a-z]+/.test(m.content.trim()))
@@ -380,7 +457,7 @@ OTHER RULES:
 
         const choice = completion.choices[0]?.message;
 
-        // ── Safety net: catch leaked JSON ─────────────────────────────────────
+        // Safety net: catch leaked JSON
         if (choice?.content && !choice?.tool_calls) {
             const jsonMatch = choice.content.match(/\{[\s\S]*?"userName"[\s\S]*?"contactInfo"[\s\S]*?\}/);
             if (jsonMatch) {
@@ -403,7 +480,6 @@ OTHER RULES:
 
             const { userName, contactInfo, appointmentDay, appointmentTime } = args;
 
-            // Guard: time missing or placeholder
             if (!appointmentTime || appointmentTime.trim() === '' || /^tbd$/i.test(appointmentTime.trim())) {
                 return res.json({
                     success: true,
@@ -419,11 +495,10 @@ OTHER RULES:
 
             const dateISO = resolveDay(appointmentDay);
 
-            // ── Availability check (Google Calendar) ──────────────────────────
+            // Availability check (Google Calendar)
             if (ownerEmail) {
                 const userSnap     = await db.collection('users').doc(ownerEmail).get();
                 const integrations = userSnap.exists ? (userSnap.data()?.integrations || {}) : {};
-
                 if (integrations.google_calendar?.connected) {
                     const avail = await checkCalendarAvailability(
                         integrations.google_calendar, dateISO, appointmentTime, ownerEmail, db
@@ -443,7 +518,7 @@ OTHER RULES:
                 }
             }
 
-            // ── Save appointment record ───────────────────────────────────────
+            // Save appointment record
             const appt = {
                 businessId, botName, owner: ownerEmail, conversationId: convId,
                 customerName: userName, contactInfo,
@@ -454,7 +529,7 @@ OTHER RULES:
             await db.collection('appointments').add(appt);
             await db.collection('user_bots').doc(businessId).collection('appointments').add(appt);
 
-            // ── Google Calendar event ─────────────────────────────────────────
+            // Google Calendar event
             if (ownerEmail) {
                 const userSnap     = await db.collection('users').doc(ownerEmail).get();
                 const integrations = userSnap.exists ? (userSnap.data()?.integrations || {}) : {};
@@ -464,45 +539,54 @@ OTHER RULES:
                 }
             }
 
-            // ── WhatsApp notifications via YCloud ─────────────────────────────
-            // Sends image + caption to BOTH owner and customer (if phone given)
+            // ── WhatsApp notifications ────────────────────────────────────────
+            // Uses sendWASafe which handles the 24-hour window gracefully.
+            // If the session is closed, waLink/qrUrl are returned to the client.
             const caption = buildBookingCaption(appt);
+            const FROM_NUMBER = normalisePhone(process.env.YCLOUD_FROM_NUMBER);
+            const waLink  = FROM_NUMBER ? buildWALink(FROM_NUMBER) : null;
+            const qrUrl   = waLink ? buildQRUrl(waLink) : null;
+            let waSessionWarning = null;
 
-            // 1. Fetch owner's WhatsApp number from Firestore and notify them
+            // 1. Notify the owner
             if (ownerEmail) {
                 try {
                     const userSnap     = await db.collection('users').doc(ownerEmail).get();
                     const integrations = userSnap.exists ? (userSnap.data()?.integrations || {}) : {};
                     const ownerPhone   = integrations.whatsappAlerts?.phoneNumber;
                     if (ownerPhone) {
-                        await sendWAImageMessage(ownerPhone, caption);
-                        console.log('[WA] Owner notified:', ownerPhone);
+                        const result = await sendWASafe(ownerPhone, 'image', {
+                            image: { link: BOOKING_IMAGE_URL, caption }
+                        });
+                        if (!result.sent && result.reason === '24h_window') {
+                            waSessionWarning = { waLink: result.waLink, qrUrl: result.qrUrl };
+                        }
                     }
-                } catch (e) {
-                    console.error('[WA] Owner notification failed:', e.message);
-                }
+                } catch (e) { console.error('[WA] Owner notification failed:', e.message); }
             }
 
-            // 2. Notify the customer if they gave a phone number (not email)
+            // 2. Notify the customer (if phone given)
             if (looksLikePhone(contactInfo)) {
                 try {
-                    await sendWAImageMessage(contactInfo, caption);
-                    console.log('[WA] Customer notified:', contactInfo);
-                } catch (e) {
-                    console.error('[WA] Customer notification failed:', e.message);
-                }
+                    const result = await sendWASafe(contactInfo, 'image', {
+                        image: { link: BOOKING_IMAGE_URL, caption }
+                    });
+                    if (!result.sent && result.reason === '24h_window' && !waSessionWarning) {
+                        waSessionWarning = { waLink: result.waLink, qrUrl: result.qrUrl };
+                    }
+                } catch (e) { console.error('[WA] Customer notification failed:', e.message); }
             }
 
-            // ── Log chat ──────────────────────────────────────────────────────
+            // Log chat
             await db.collection('user_bots').doc(businessId).collection('chats').add({
                 conversationId: convId, question: userMsg,
                 answer: 'Appointment booked.', isGenuineQuery: true, isLeadCaptured: true,
                 createdAt: new Date().toISOString()
             });
 
-            // ── In-chat confirmation message ──────────────────────────────────
+            // In-chat confirmation message
             const pad = (label) => label.padEnd(8);
-            const answer = [
+            let answer = [
                 '✅ APPOINTMENT BOOKED',
                 '',
                 `${pad('NAME:')}    ${userName}`,
@@ -510,13 +594,21 @@ OTHER RULES:
                 `${pad('DATE:')}    ${dateISO}`,
                 `${pad('TIME:')}    ${appointmentTime}`,
                 '',
-                'Reply with "CANCEL" to cancel the appointment and "EDIT" to change a detail.'
+                'Reply with "CANCEL" to cancel or "EDIT" to change a detail.'
             ].join('\n');
 
-            return res.json({ success: true, answer, reply: answer });
+            // If the 24-hour session is closed, append the QR/link info
+            if (waSessionWarning) {
+                answer += `\n\n📲 *WhatsApp notification pending* — to receive confirmations on WhatsApp, please message us first:\n${waSessionWarning.waLink}`;
+            }
+
+            return res.json({
+                success: true, answer, reply: answer,
+                ...(waSessionWarning ? { waSessionRequired: true, ...waSessionWarning } : {})
+            });
         }
 
-        // ── Plain reply ───────────────────────────────────────────────────────
+        // Plain reply
         const answer = choice?.content?.trim() || 'How can I help you?';
         try {
             await db.collection('user_bots').doc(businessId).collection('chats').add({
@@ -576,6 +668,10 @@ async function handleWAVerify(req, res) {
     if (!norm)
         return res.status(400).json({ success: false, message: 'Invalid phone number. Please include your country code (e.g. +91 9876543210).' });
 
+    const FROM_NUMBER = normalisePhone(process.env.YCLOUD_FROM_NUMBER);
+    const waLink      = FROM_NUMBER ? buildWALink(FROM_NUMBER) : null;
+    const qrUrl       = waLink ? buildQRUrl(waLink) : null;
+
     const code      = Math.floor(100000 + Math.random() * 900000).toString();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
 
@@ -588,11 +684,28 @@ async function handleWAVerify(req, res) {
             createdAt: new Date().toISOString()
         });
 
-        await sendWATextMessage(norm,
+        const otpText =
             `🔐 *Comex AI Verification*\n\n` +
             `Your verification code is:\n\n*${code}*\n\n` +
-            `Expires in 10 minutes. Do not share it.\n\nTeam Comex`
-        );
+            `Expires in 10 minutes. Do not share it.\n\nTeam Comex`;
+
+        const result = await sendWASafe(norm, 'text', { text: { body: otpText } });
+
+        if (!result.sent) {
+            // 24-hour window is closed — return the QR/link so the frontend
+            // can prompt the user to send the first message, then retry.
+            if (result.reason === '24h_window') {
+                return res.status(200).json({
+                    success: false,
+                    sessionRequired: true,
+                    waLink,
+                    qrUrl,
+                    message: `To receive your verification code on WhatsApp, please message us first using the link or QR code below, then click "Send Code" again.`,
+                    prefillMessage: decodeURIComponent(WA_PREFILL_MSG)
+                });
+            }
+            return res.status(500).json({ success: false, message: `WhatsApp send failed: ${result.reason}` });
+        }
 
         return res.json({ success: true, message: `Verification code sent to ${norm} via WhatsApp.` });
 
@@ -600,7 +713,9 @@ async function handleWAVerify(req, res) {
         console.error('[WA-Verify]', err.message);
         return res.status(500).json({
             success: false,
-            message: `Failed to send WhatsApp message: ${err.message}. Make sure the number has WhatsApp and your YCloud API key is set.`
+            message: `Failed to send WhatsApp message: ${err.message}`,
+            waLink,
+            qrUrl
         });
     }
 }
@@ -650,15 +765,15 @@ async function handleWAConfirm(req, res) {
 
         await ref.delete();
 
-        // Send welcome message to the newly connected number
-        try {
-            await sendWATextMessage(data.phoneNumber,
-                `✅ *WhatsApp Connected!*\n\n` +
-                `Your number is now linked to Comex AI. ` +
-                `You will receive appointment booking notifications here.\n\nTeam Comex`
-            );
-        } catch (e) {
-            console.warn('[WA-Confirm] Welcome message failed (non-fatal):', e.message);
+        // Send welcome message — safe, session should now be open since user just messaged first
+        const welcomeText =
+            `✅ *WhatsApp Connected!*\n\n` +
+            `Your number is now linked to Comex AI. ` +
+            `You will receive appointment booking notifications here.\n\nTeam Comex`;
+
+        const result = await sendWASafe(data.phoneNumber, 'text', { text: { body: welcomeText } });
+        if (!result.sent) {
+            console.warn('[WA-Confirm] Welcome message not delivered (non-fatal):', result.reason);
         }
 
         return res.json({ success: true, message: 'WhatsApp connected successfully!' });
