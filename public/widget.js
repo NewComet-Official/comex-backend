@@ -135,30 +135,6 @@
             box-shadow:0 4px 10px rgba(15,23,42,0.03);
         }
         
-        .cc-wa-card {
-            align-self:flex-start; max-width:85%;
-            background:#fff; border:1px solid #e2e8f0;
-            border-radius:18px; border-bottom-left-radius:4px;
-            padding:16px; box-shadow:0 4px 15px rgba(0,0,0,0.04);
-            font-size:13.5px; line-height:1.5; color:#475569;
-        }
-        .cc-wa-card strong { color:#0f172a; display:flex; align-items:center; gap:6px; font-size:14px; }
-        .cc-wa-card strong svg { width: 16px; height: 16px; fill: #25d366; }
-        .cc-wa-card .cc-qr-img {
-            display:block; margin:14px auto 10px;
-            width:140px; height:140px; border-radius:12px;
-            border:1px solid #e2e8f0; padding:4px; background:#fff;
-        }
-        .cc-wa-link {
-            display:inline-flex; align-items:center; justify-content:center; gap:8px;
-            margin-top:10px; padding:10px 16px; width: 100%; box-sizing: border-box;
-            background:#25d366; color:#fff; border-radius:12px;
-            font-size:13.5px; font-weight:600; text-decoration:none;
-            transition: background-color 0.2s, transform 0.15s; box-shadow: 0 2px 8px rgba(37,211,102,0.3);
-        }
-        .cc-wa-link:hover { background-color:#22c35e; transform: translateY(-1px); }
-        .cc-wa-link svg { width: 16px; height: 16px; fill: currentColor; }
-        
         .cc-footer {
             padding:14px 18px; background:#fff;
             border-top:1px solid #f1f5f9;
@@ -311,56 +287,6 @@
         return el;
     }
 
-    /**
-     * Show a WhatsApp "session required" card with QR code + tap-to-open link.
-     * This appears whenever the backend returns waSessionRequired: true.
-     */
-    function appendWASessionCard(waLink, qrUrl) {
-        // Don't show duplicate cards
-        if (chatBox.querySelector('.cc-wa-card')) {
-            chatBox.scrollTop = chatBox.scrollHeight;
-            return;
-        }
-
-        const card = document.createElement('div');
-        card.className = 'cc-wa-card';
-
-        const title = document.createElement('strong');
-        title.innerHTML = `<svg viewBox="0 0 24 24"><path d="M12.04 2c-5.46 0-9.91 4.45-9.91 9.91 0 1.75.46 3.45 1.32 4.95L2.05 22l5.25-1.38c1.45.79 3.08 1.21 4.74 1.21 5.46 0 9.91-4.45 9.91-9.91 0-2.65-1.03-5.14-2.9-7.01A9.817 9.817 0 0 0 12.04 2m.01 1.67c2.2 0 4.26.86 5.82 2.42a8.16 8.16 0 0 1 2.41 5.83c0 4.54-3.7 8.23-8.24 8.23-1.48 0-2.93-.4-4.19-1.15l-.3-.18-3.12.82.83-3.04-.2-.31a8.188 8.188 0 0 1-1.26-4.38c.01-4.54 3.7-8.24 8.25-8.24M8.53 7.33c-.15 0-.41.06-.63.29-.22.24-.85.83-.85 2.02 0 1.19.86 2.35.98 2.51.12.16 1.7 2.6 4.12 3.64.58.25 1.03.4 1.38.51.58.18 1.11.16 1.53.09.47-.07 1.44-.59 1.65-1.16.21-.57.21-1.06.15-1.16-.06-.1-.22-.16-.47-.29-.25-.12-1.44-.71-1.66-.79-.22-.08-.38-.12-.54.12-.16.24-.63.79-.77.95-.14.16-.28.18-.53.06-1.93-.97-2.68-1.7-3.23-2.65-.1-.18-.01-.28.08-.37.08-.08.18-.22.28-.33.09-.1.12-.18.18-.31.06-.12.03-.24-.01-.33-.05-.1-.41-1-.56-1.37-.15-.37-.3-.32-.41-.32h-.34z"/></svg> Connect WhatsApp to receive notifications`;
-        card.appendChild(title);
-
-        const desc = document.createElement('p');
-        desc.style.cssText = 'margin:10px 0 0; font-size:12px; color:#64748b;';
-        desc.textContent = 'Scan the QR or tap the button to send us a quick message. After that, all confirmations & OTPs will be delivered automatically.';
-        card.appendChild(desc);
-
-        if (qrUrl) {
-            const qr = document.createElement('img');
-            qr.className = 'cc-qr-img';
-            qr.src = qrUrl;
-            qr.alt = 'WhatsApp QR code';
-            card.appendChild(qr);
-        }
-
-        if (waLink) {
-            const link = document.createElement('a');
-            link.className = 'cc-wa-link';
-            link.href = waLink;
-            link.target = '_blank';
-            link.rel = 'noopener noreferrer';
-            link.innerHTML = `<svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg> Open WhatsApp`;
-            card.appendChild(link);
-
-            const hint = document.createElement('p');
-            hint.style.cssText = 'margin:10px 0 0; font-size:11px; color:#94a3b8; text-align: center;';
-            hint.textContent = 'Message will be pre-filled. Just press Send in WhatsApp, then come back here.';
-            card.appendChild(hint);
-        }
-
-        chatBox.insertBefore(card, typingEl);
-        chatBox.scrollTop = chatBox.scrollHeight;
-    }
-
     // Initial greeting
     appendMsg('Hello! How can I assist you today?', false);
 
@@ -414,12 +340,6 @@
             const reply = data.answer || data.reply || "Sorry, I couldn't process that.";
             appendMsg(reply, false);
             chatHistory.push({ role: 'assistant', content: reply });
-
-            // If the backend couldn't deliver a WhatsApp message due to the 24h window,
-            // show the QR + link card so the user can open the session themselves.
-            if (data.waSessionRequired && data.waLink) {
-                appendWASessionCard(data.waLink, data.qrUrl);
-            }
 
         } catch (err) {
             typingEl.classList.remove('visible');
