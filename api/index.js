@@ -3,65 +3,6 @@
 import admin from 'firebase-admin';
 import Groq from 'groq-sdk';
 
-const YCLOUD_API_KEY    = process.env.YCLOUD_API_KEY || '';
-const BOOKING_IMAGE_URL = 'https://i.ibb.co/8nbzHx0N/Appointment-booking-cofirmed.png';
-
-// ── Prefilled WhatsApp message that opens the 24-hour session ────────────────
-// Users send this FIRST before entering their number, so the window is always open.
-const WA_PREFILL_TEXT = 'I want to connect WhatsApp Integration for my business on Comex AI platform.';
-const WA_PREFILL_ENC  = encodeURIComponent(WA_PREFILL_TEXT);
-
-// ════════════════════════════════════════════════════════════════════════════
-// PHONE HELPERS
-// ════════════════════════════════════════════════════════════════════════════
-
-/**
- * Normalise any phone string to strict E.164 (+digits only, no spaces).
- * Handles: +918318228754 / 918318228754 / +91 831 822 8754 / 08318228754
- */
-function normalisePhone(raw) {
-    if (!raw) return null;
-    const str    = String(raw).trim();
-    const digits = str.replace(/\D/g, '');
-    if (digits.length < 7) return null;
-    return '+' + digits;
-}
-
-/** True if the contact string looks like a phone number rather than an email. */
-function looksLikePhone(contact) {
-    if (!contact) return false;
-    return !contact.includes('@') && contact.replace(/\D/g, '').length >= 7;
-}
-
-/**
- * Build the wa.me deep-link for a given FROM number (the YCloud sender number).
- * Strip '+' for the wa.me URL format.
- */
-function buildWALink(fromNumber) {
-    const digits = String(fromNumber || '').replace(/\D/g, '');
-    if (!digits) return null;
-    return `https://wa.me/${digits}?text=${WA_PREFILL_ENC}`;
-}
-
-/**
- * Build a QR-code image URL using the free api.qrserver.com service.
- */
-function buildQRUrl(waLink) {
-    if (!waLink) return null;
-    return `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(waLink)}`;
-}
-
-/**
- * Return { waLink, qrUrl } for the configured YCLOUD_FROM_NUMBER.
- * Returns { waLink: null, qrUrl: null } if not configured.
- */
-function getSessionLinks() {
-    const from = normalisePhone(process.env.YCLOUD_FROM_NUMBER);
-    const waLink = from ? buildWALink(from) : null;
-    const qrUrl  = waLink ? buildQRUrl(waLink) : null;
-    return { waLink, qrUrl };
-}
-
 // ════════════════════════════════════════════════════════════════════════════
 // FIREBASE
 // ════════════════════════════════════════════════════════════════════════════
@@ -74,6 +15,11 @@ function getDb() {
         admin.initializeApp({ credential: admin.credential.cert(sa) });
     }
     return admin.firestore();
+}
+
+function getMessaging() {
+    if (!admin.apps.length) getDb(); // ensures admin.initializeApp() has run
+    return admin.messaging();
 }
 
 function cors(res) {
@@ -97,9 +43,9 @@ export default async function handler(req, res) {
     if (path === '/api/scrape')                   return handleScrape(req, res);
     if (path === '/api/deploy')                   return handleDeploy(req, res);
     if (path === '/api/calculate-roi')            return handleROI(req, res);
-    if (path === '/api/whatsapp-session-info')    return handleWASessionInfo(req, res);
-    if (path === '/api/whatsapp-verify')          return handleWAVerify(req, res);
-    if (path === '/api/whatsapp-verify-confirm')  return handleWAConfirm(req, res);
+    if (path === '/api/fcm-register-token')       return handleFCMRegisterToken(req, res);
+    if (path === '/api/fcm-remove-token')         return handleFCMRemoveToken(req, res);
+    if (path === '/api/fcm-test-notification')    return handleFCMTestNotification(req, res);
     if (path === '/api/oauth/google')             return handleGoogleOAuth(req, res);
     if (path === '/api/oauth/google/callback')    return handleGoogleCallback(req, res);
 
@@ -107,161 +53,183 @@ export default async function handler(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// YCLOUD SEND HELPERS
+// FCM — PUSH NOTIFICATION HELPERS
 // ════════════════════════════════════════════════════════════════════════════
 
 /**
- * Core YCloud send function.
- * Returns a structured result object instead of throwing, so callers can
- * handle specific error codes gracefully.
+ * Send a push notification to every registered device token for a user.
+ * Automatically prunes dead/invalid tokens from Firestore (e.g. user
+ * uninstalled, cleared site data, or the token simply expired).
  *
- * Error codes we handle specifically:
- *   100    – Invalid parameter (also fires when you message your own YCloud number)
- *   131031 – Recipient's WhatsApp Business account restricted/deactivated by Meta
- *   131047 – Outside 24-hour conversation window (customer hasn't messaged first)
- *   470    – Re-engagement not permitted (another 24h-window variant)
- *
- * Returns:
- *   { sent: true, messageId }
- *   { sent: false, errorCode, reason, userFacingMessage }
+ * `data` fields are delivered to the service worker's onBackgroundMessage
+ * AND to the foreground onMessage listener in index.html — so we put
+ * everything (title/body/url/tag) inside `data`, NOT inside a top-level
+ * `notification` block. This guarantees our own code controls rendering
+ * in both foreground and background, instead of the browser auto-showing
+ * a default-styled notification when the tab is in the foreground.
  */
-async function ycloudSend(to, type, typePayload) {
-    const norm = normalisePhone(to);
-    if (!norm) {
-        return {
-            sent: false,
-            errorCode: 'INVALID_PHONE',
-            reason: 'invalid_phone',
-            userFacingMessage: 'The phone number format is invalid. Please include your country code (e.g. +91 9876543210).'
-        };
+async function sendFCMToUser(ownerEmail, { title, body, url, tag }) {
+    if (!ownerEmail) return { sent: 0, failed: 0 };
+
+    const db = getDb();
+    const userRef = db.collection('users').doc(ownerEmail);
+    const userSnap = await userRef.get();
+    if (!userSnap.exists) return { sent: 0, failed: 0 };
+
+    const tokens = userSnap.data()?.fcmTokens || [];
+    if (!tokens.length) return { sent: 0, failed: 0 };
+
+    const messaging = getMessaging();
+    const message = {
+        tokens,
+        data: {
+            title: title || 'Comex AI Notification',
+            body:  body  || '',
+            url:   url   || '/',
+            tag:   tag   || 'comex-general'
+        },
+        webpush: {
+            // fcmOptions.link is used by some browsers as a fallback click target
+            fcmOptions: { link: url || '/' }
+        }
+    };
+
+    let result;
+    try {
+        result = await messaging.sendEachForMulticast(message);
+    } catch (err) {
+        console.error('[FCM] sendEachForMulticast failed:', err.message);
+        return { sent: 0, failed: tokens.length };
     }
 
-    if (!YCLOUD_API_KEY) {
-        return { sent: false, errorCode: 'NO_API_KEY', reason: 'no_api_key', userFacingMessage: 'WhatsApp service not configured.' };
+    // Prune any tokens Firebase reports as invalid/unregistered
+    const deadTokens = [];
+    result.responses.forEach((r, i) => {
+        if (!r.success) {
+            const code = r.error?.code || '';
+            console.warn('[FCM] Token failed:', tokens[i], code);
+            if (
+                code === 'messaging/registration-token-not-registered' ||
+                code === 'messaging/invalid-registration-token'
+            ) {
+                deadTokens.push(tokens[i]);
+            }
+        }
+    });
+
+    if (deadTokens.length) {
+        const remaining = tokens.filter(t => !deadTokens.includes(t));
+        await userRef.update({ fcmTokens: remaining });
+        console.log('[FCM] Pruned', deadTokens.length, 'dead token(s) for', ownerEmail);
     }
 
-    const FROM_NUMBER = normalisePhone(process.env.YCLOUD_FROM_NUMBER);
-    if (!FROM_NUMBER) {
-        return { sent: false, errorCode: 'NO_FROM', reason: 'no_from', userFacingMessage: 'WhatsApp sender number not configured.' };
-    }
+    return { sent: result.successCount, failed: result.failureCount };
+}
 
-    // ── Error 100 prevention: YCloud does not allow messaging the same number
-    // that owns the account (the FROM number). Detect and bail early.
-    if (norm === FROM_NUMBER) {
-        return {
-            sent: false,
-            errorCode: 100,
-            reason: 'self_message',
-            userFacingMessage: `You cannot send WhatsApp notifications to the same number used to create your YCloud account (${norm}). Please use a different phone number.`
-        };
-    }
+/** Build the appointment-booked notification payload. */
+function buildBookingNotification(appt) {
+    return {
+        title: '📅 New Appointment Booked!',
+        body:  `${appt.customerName} booked ${appt.appointmentDay} at ${appt.appointmentTime}. Contact: ${appt.contactInfo}`,
+        url:   '/?view=analytics',
+        tag:   'comex-appointment'
+    };
+}
 
-    const body = { from: FROM_NUMBER, to: norm, type, ...typePayload };
-    console.log('[YCloud] Sending', type, 'from', FROM_NUMBER, 'to', norm);
+// ════════════════════════════════════════════════════════════════════════════
+// NEW ROUTE: POST /api/fcm-register-token
+// Called once the user grants notification permission and the frontend
+// retrieves an FCM token. Stores the token under users/{email}.fcmTokens (array).
+// ════════════════════════════════════════════════════════════════════════════
+async function handleFCMRegisterToken(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { userEmail, fcmToken } = req.body || {};
+    if (!userEmail || !fcmToken)
+        return res.status(400).json({ success: false, message: 'Missing userEmail or fcmToken.' });
 
     try {
-        const r = await fetch('https://api.ycloud.com/v2/whatsapp/messages', {
-            method:  'POST',
-            headers: { 'Content-Type': 'application/json', 'X-API-Key': YCLOUD_API_KEY },
-            body: JSON.stringify(body)
-        });
+        const db = getDb();
+        const userRef = db.collection('users').doc(userEmail);
+        const snap = await userRef.get();
+        const existing = snap.exists ? (snap.data()?.fcmTokens || []) : [];
 
-        const data = await r.json();
-
-        if (!r.ok) {
-            const errorCode = Number(data.error?.code || data.code || 0);
-            console.error('[YCloud] Error', errorCode, JSON.stringify(data));
-
-            // ── 24-hour window closed ─────────────────────────────────────────
-            const is24h = [131047, 470, 368].includes(errorCode) ||
-                          /window|session|24.hour|outside/i.test(data.message || '');
-            if (is24h) {
-                return {
-                    sent: false,
-                    errorCode,
-                    reason: '24h_window',
-                    userFacingMessage: null // caller will show QR card instead
-                };
-            }
-
-            // ── Recipient account restricted/deactivated ──────────────────────
-            if (errorCode === 131031) {
-                return {
-                    sent: false,
-                    errorCode,
-                    reason: 'account_restricted',
-                    userFacingMessage: 'This WhatsApp number\'s Business account has been restricted or deactivated by Meta. Please use a personal WhatsApp number or a different Business number that is in good standing.'
-                };
-            }
-
-            // ── Generic error 100 (invalid parameter) ─────────────────────────
-            // Remaining 100 errors after self-message check are usually the recipient
-            // number not being on WhatsApp, or a malformed number.
-            if (errorCode === 100) {
-                return {
-                    sent: false,
-                    errorCode,
-                    reason: 'invalid_param',
-                    userFacingMessage: 'The phone number doesn\'t appear to be registered on WhatsApp, or is invalid. Please double-check the number and country code.'
-                };
-            }
-
-            return {
-                sent: false,
-                errorCode,
-                reason: 'api_error',
-                userFacingMessage: data.message || 'WhatsApp message could not be delivered.'
-            };
+        if (!existing.includes(fcmToken)) {
+            await userRef.set({
+                fcmTokens: [...existing, fcmToken],
+                notificationsEnabled: true,
+                notificationsConnectedAt: new Date().toISOString()
+            }, { merge: true });
+        } else {
+            // Token already registered — just confirm it's marked enabled.
+            await userRef.set({ notificationsEnabled: true }, { merge: true });
         }
 
-        console.log('[YCloud] Sent to', norm, '→ id:', data.id);
-        return { sent: true, messageId: data.id };
-
+        return res.json({ success: true, message: 'Device registered for notifications.' });
     } catch (err) {
-        console.error('[YCloud] Network error:', err.message);
-        return { sent: false, errorCode: 'NETWORK', reason: 'network', userFacingMessage: 'Network error contacting WhatsApp service.' };
+        console.error('[FCM-Register]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
     }
 }
 
-/** Convenience: send a text message. */
-async function sendWAText(to, bodyText) {
-    return ycloudSend(to, 'text', { text: { body: bodyText } });
-}
-
-/** Convenience: send an image + caption message. */
-async function sendWAImage(to, caption) {
-    return ycloudSend(to, 'image', { image: { link: BOOKING_IMAGE_URL, caption } });
-}
-
-/** Build the booking confirmation caption. */
-function buildBookingCaption(appt) {
-    return (
-        `*APPOINTMENT BOOKED*\n\n` +
-        `Name: ${appt.customerName}\n` +
-        `Contact: ${appt.contactInfo}\n` +
-        `Date: ${appt.scheduledDate}\n` +
-        `Time: ${appt.appointmentTime}\n\n` +
-        `Team Comex`
-    );
-}
-
 // ════════════════════════════════════════════════════════════════════════════
-// NEW ROUTE: GET /api/whatsapp-session-info
-// Returns the wa.me link + QR URL for the frontend to display BEFORE the user
-// enters their phone number. When they send the prefilled message, the 24-hour
-// session opens and OTP delivery is guaranteed.
+// NEW ROUTE: POST /api/fcm-remove-token
+// Lets a user disconnect notifications on this device (mirrors the old
+// WhatsApp "disconnect" flow in the Integrations page).
 // ════════════════════════════════════════════════════════════════════════════
-async function handleWASessionInfo(req, res) {
-    const { waLink, qrUrl } = getSessionLinks();
-    if (!waLink) {
-        return res.status(500).json({ success: false, message: 'YCLOUD_FROM_NUMBER not configured.' });
+async function handleFCMRemoveToken(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { userEmail, fcmToken } = req.body || {};
+    if (!userEmail) return res.status(400).json({ success: false, message: 'Missing userEmail.' });
+
+    try {
+        const db = getDb();
+        const userRef = db.collection('users').doc(userEmail);
+        const snap = await userRef.get();
+        if (!snap.exists) return res.json({ success: true });
+
+        const existing = snap.data()?.fcmTokens || [];
+        // If a specific token is given, remove just that one; otherwise clear all
+        // (e.g. "disconnect notifications entirely" from the Integrations page).
+        const remaining = fcmToken ? existing.filter(t => t !== fcmToken) : [];
+
+        await userRef.update({
+            fcmTokens: remaining,
+            notificationsEnabled: remaining.length > 0
+        });
+
+        return res.json({ success: true, message: 'Notifications disconnected.' });
+    } catch (err) {
+        console.error('[FCM-Remove]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
     }
-    return res.json({
-        success: true,
-        waLink,
-        qrUrl,
-        prefillText: WA_PREFILL_TEXT
-    });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// NEW ROUTE: POST /api/fcm-test-notification
+// Lets the user fire a test push from the Integrations page right after
+// connecting, so they immediately see/hear it working.
+// ════════════════════════════════════════════════════════════════════════════
+async function handleFCMTestNotification(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { userEmail } = req.body || {};
+    if (!userEmail) return res.status(400).json({ success: false, message: 'Missing userEmail.' });
+
+    try {
+        const result = await sendFCMToUser(userEmail, {
+            title: '✅ Notifications Connected!',
+            body:  'This is a test alert from Comex AI. You will receive one like this for every new appointment.',
+            url:   '/?view=integrations',
+            tag:   'comex-test'
+        });
+
+        if (result.sent === 0) {
+            return res.status(400).json({ success: false, message: 'No active devices found, or delivery failed. Try reconnecting.' });
+        }
+        return res.json({ success: true, message: `Test notification sent to ${result.sent} device(s).` });
+    } catch (err) {
+        console.error('[FCM-Test]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -542,32 +510,14 @@ OTHER RULES:
                 }
             }
 
-            // WhatsApp notifications (fire-and-forget — don't block the chat response)
-            const caption = buildBookingCaption(appt);
-            let waSessionRequired = false;
-            const { waLink, qrUrl } = getSessionLinks();
-
-            // Notify the owner
+            // ── Push notification to the business owner (replaces WhatsApp) ────
             if (ownerEmail) {
                 try {
-                    const userSnap     = await db.collection('users').doc(ownerEmail).get();
-                    const integrations = userSnap.exists ? (userSnap.data()?.integrations || {}) : {};
-                    const ownerPhone   = integrations.whatsappAlerts?.phoneNumber;
-                    if (ownerPhone) {
-                        const result = await sendWAImage(ownerPhone, caption);
-                        if (!result.sent && result.reason === '24h_window') waSessionRequired = true;
-                        if (!result.sent) console.warn('[WA] Owner notify failed:', result.reason, result.userFacingMessage);
-                    }
-                } catch (e) { console.error('[WA] Owner error:', e.message); }
-            }
-
-            // Notify the customer if they gave a phone number
-            if (looksLikePhone(contactInfo)) {
-                try {
-                    const result = await sendWAImage(contactInfo, caption);
-                    if (!result.sent && result.reason === '24h_window') waSessionRequired = true;
-                    if (!result.sent) console.warn('[WA] Customer notify failed:', result.reason, result.userFacingMessage);
-                } catch (e) { console.error('[WA] Customer error:', e.message); }
+                    const pushResult = await sendFCMToUser(ownerEmail, buildBookingNotification(appt));
+                    console.log('[FCM] Booking notification:', pushResult);
+                } catch (e) {
+                    console.error('[FCM] Booking notify error:', e.message);
+                }
             }
 
             // Log chat
@@ -590,11 +540,7 @@ OTHER RULES:
                 'Reply with "CANCEL" to cancel or "EDIT" to change a detail.'
             ].join('\n');
 
-            return res.json({
-                success: true, answer, reply: answer,
-                // Signal the widget to show the QR card if the WA session was closed
-                ...(waSessionRequired ? { waSessionRequired: true, waLink, qrUrl } : {})
-            });
+            return res.json({ success: true, answer, reply: answer });
         }
 
         // Plain reply
@@ -640,156 +586,6 @@ async function handleROI(req, res) {
         const resolutionRate = genuine > 0 ? Math.round(((genuine - leads) / genuine) * 100) : 100;
         return res.json({ success: true, totalConversations: total, hoursSaved, moneySaved, leadsCaptured: leads, resolutionRate });
     } catch (err) {
-        return res.status(500).json({ success: false, message: err.message });
-    }
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-// WHATSAPP VERIFY
-// Flow: user has ALREADY sent the prefilled wa.me message (opening the 24h
-// session), then enters their number here. We send the OTP immediately.
-//
-// Error handling:
-//   self_message    → clear error: can't use your own YCloud number
-//   account_restricted (131031) → clear error: use personal WA number
-//   24h_window      → shouldn't happen since they sent first, but handled
-//   invalid_param (100) → number not on WA or invalid
-// ════════════════════════════════════════════════════════════════════════════
-async function handleWAVerify(req, res) {
-    if (req.method !== 'POST') return res.status(405).json({ success: false });
-    const { userEmail, phoneNumber } = req.body || {};
-    if (!userEmail || !phoneNumber)
-        return res.status(400).json({ success: false, message: 'Missing userEmail or phoneNumber.' });
-
-    const norm = normalisePhone(phoneNumber);
-    if (!norm)
-        return res.status(400).json({
-            success: false,
-            message: 'Invalid phone number format. Please include your country code (e.g. +91 9876543210).'
-        });
-
-    const code      = Math.floor(100000 + Math.random() * 900000).toString();
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-
-    try {
-        await getDb().collection('whatsapp_verifications').doc(userEmail).set({
-            verificationCode: code,
-            phoneNumber:      norm,
-            expiresAt,
-            attempts:  0,
-            createdAt: new Date().toISOString()
-        });
-
-        const otpText =
-            `🔐 *Comex AI Verification*\n\n` +
-            `Your verification code is:\n\n*${code}*\n\n` +
-            `Expires in 10 minutes. Do not share it.\n\nTeam Comex`;
-
-        const result = await sendWAText(norm, otpText);
-
-        if (!result.sent) {
-            // Map each error reason to a clear, actionable message
-            let message;
-            const { waLink, qrUrl } = getSessionLinks();
-
-            switch (result.reason) {
-                case 'self_message':
-                    message = result.userFacingMessage;
-                    return res.status(400).json({ success: false, message });
-
-                case 'account_restricted':
-                    message = result.userFacingMessage;
-                    return res.status(400).json({ success: false, message });
-
-                case '24h_window':
-                    // This should be rare since the user sent the prefill first,
-                    // but handle gracefully by showing the QR again.
-                    return res.status(200).json({
-                        success: false,
-                        sessionRequired: true,
-                        waLink,
-                        qrUrl,
-                        message: 'It looks like the WhatsApp session expired. Please scan the QR or use the link to send us a quick message first, then try again.'
-                    });
-
-                case 'invalid_param':
-                    message = result.userFacingMessage;
-                    return res.status(400).json({ success: false, message });
-
-                default:
-                    message = result.userFacingMessage || 'WhatsApp message could not be delivered. Please check the number and try again.';
-                    return res.status(500).json({ success: false, message });
-            }
-        }
-
-        return res.json({ success: true, message: `Verification code sent to ${norm} via WhatsApp.` });
-
-    } catch (err) {
-        console.error('[WA-Verify]', err.message);
-        return res.status(500).json({ success: false, message: `Server error: ${err.message}` });
-    }
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-// WHATSAPP CONFIRM — validates the OTP
-// ════════════════════════════════════════════════════════════════════════════
-async function handleWAConfirm(req, res) {
-    if (req.method !== 'POST') return res.status(405).json({ success: false });
-    const { userEmail, verificationCode } = req.body || {};
-    if (!userEmail || !verificationCode)
-        return res.status(400).json({ success: false, message: 'Missing userEmail or verificationCode.' });
-
-    try {
-        const db   = getDb();
-        const ref  = db.collection('whatsapp_verifications').doc(userEmail);
-        const snap = await ref.get();
-        if (!snap.exists)
-            return res.status(404).json({ success: false, message: 'No pending verification. Please start again.' });
-
-        const data = snap.data();
-        if (Date.now() > new Date(data.expiresAt).getTime()) {
-            await ref.delete();
-            return res.status(400).json({ success: false, message: 'Code expired. Please request a new one.' });
-        }
-
-        const attempts = (data.attempts || 0) + 1;
-        if (data.verificationCode !== verificationCode.trim()) {
-            if (attempts >= 3) {
-                await ref.delete();
-                return res.status(400).json({ success: false, message: 'Too many wrong attempts. Please start again.' });
-            }
-            await ref.update({ attempts });
-            return res.status(400).json({ success: false, message: `Wrong code. ${3 - attempts} attempt(s) left.` });
-        }
-
-        // Save verified number
-        await db.collection('users').doc(userEmail).set({
-            integrations: {
-                whatsappAlerts: {
-                    connected:   true,
-                    phoneNumber: data.phoneNumber,
-                    verifiedAt:  new Date().toISOString()
-                }
-            }
-        }, { merge: true });
-
-        await ref.delete();
-
-        // Send a welcome message — the 24h session should still be open
-        const welcomeText =
-            `✅ *WhatsApp Connected!*\n\n` +
-            `Your number is now linked to Comex AI. ` +
-            `You will receive appointment booking notifications here.\n\nTeam Comex`;
-
-        const wResult = await sendWAText(data.phoneNumber, welcomeText);
-        if (!wResult.sent) {
-            console.warn('[WA-Confirm] Welcome message not delivered (non-fatal):', wResult.reason);
-        }
-
-        return res.json({ success: true, message: 'WhatsApp connected successfully!' });
-
-    } catch (err) {
-        console.error('[WA-Confirm]', err.message);
         return res.status(500).json({ success: false, message: err.message });
     }
 }
@@ -845,8 +641,8 @@ async function handleGoogleCallback(req, res) {
     try {
         const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
                 code, client_id: clientId, client_secret: clientSecret,
                 redirect_uri: redirectUri, grant_type: 'authorization_code'
             })
@@ -881,7 +677,7 @@ async function handleGoogleCallback(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// HELPERS
+// HELPERS — date / time / calendar (unchanged from previous version)
 // ════════════════════════════════════════════════════════════════════════════
 
 function resolveDay(dayName) {
