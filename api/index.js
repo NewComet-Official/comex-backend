@@ -18,7 +18,7 @@ function getDb() {
 }
 
 function getMessaging() {
-    if (!admin.apps.length) getDb(); // ensures admin.initializeApp() has run
+    if (!admin.apps.length) getDb();
     return admin.messaging();
 }
 
@@ -26,6 +26,42 @@ function cors(res) {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// MULTI-MODEL LLM ROUTER
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * All models are served via Groq's unified API.
+ * Model IDs map to Groq-hosted open-source models.
+ * https://console.groq.com/docs/models
+ */
+const MODEL_REGISTRY = {
+    // Meta LLaMA (default)
+    'llama-3.3-70b':        { id: 'llama-3.3-70b-versatile',        provider: 'groq', label: 'Meta LLaMA 3.3 70B' },
+    'llama-3.1-8b':         { id: 'llama-3.1-8b-instant',            provider: 'groq', label: 'Meta LLaMA 3.1 8B (Fast)' },
+    // Google DeepMind Gemma
+    'gemma-3-27b':          { id: 'gemma2-9b-it',                    provider: 'groq', label: 'Google Gemma 2 9B' },
+    // Mistral AI
+    'mistral-saba':         { id: 'mistral-saba-24b',                provider: 'groq', label: 'Mistral Saba 24B' },
+    // Alibaba Qwen
+    'qwen-3-32b':           { id: 'qwen-qwq-32b',                   provider: 'groq', label: 'Alibaba Qwen QwQ 32B' },
+    // xAI Grok (via Groq — uses distil variant available on Groq)
+    'groq-llama-tool':      { id: 'llama3-groq-70b-8192-tool-use-preview', provider: 'groq', label: 'Tool-Optimized LLaMA 70B' },
+    // OpenAI-compatible GPT open weights (placeholder — swap id when available)
+    'openai-gpt4o-mini':    { id: 'llama-3.3-70b-versatile',        provider: 'groq', label: 'GPT-4o Mini Compatible (LLaMA)' },
+};
+
+const DEFAULT_MODEL_KEY = 'llama-3.3-70b';
+
+/**
+ * Get the Groq model ID to use for a given bot config.
+ * Falls back to default if the model key is unknown.
+ */
+function resolveModelId(modelKey) {
+    const entry = MODEL_REGISTRY[modelKey] || MODEL_REGISTRY[DEFAULT_MODEL_KEY];
+    return entry.id;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -43,9 +79,12 @@ export default async function handler(req, res) {
     if (path === '/api/scrape')                   return handleScrape(req, res);
     if (path === '/api/deploy')                   return handleDeploy(req, res);
     if (path === '/api/calculate-roi')            return handleROI(req, res);
+    if (path === '/api/models')                   return handleModels(req, res);
     if (path === '/api/fcm-register-token')       return handleFCMRegisterToken(req, res);
     if (path === '/api/fcm-remove-token')         return handleFCMRemoveToken(req, res);
     if (path === '/api/fcm-test-notification')    return handleFCMTestNotification(req, res);
+    if (path === '/api/appointment/cancel')       return handleAppointmentCancel(req, res);
+    if (path === '/api/appointment/edit')         return handleAppointmentEdit(req, res);
     if (path === '/api/oauth/google')             return handleGoogleOAuth(req, res);
     if (path === '/api/oauth/google/callback')    return handleGoogleCallback(req, res);
 
@@ -53,21 +92,21 @@ export default async function handler(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// GET /api/models — returns available model options for the frontend
+// ════════════════════════════════════════════════════════════════════════════
+async function handleModels(req, res) {
+    const models = Object.entries(MODEL_REGISTRY).map(([key, val]) => ({
+        key,
+        label: val.label,
+        provider: val.provider
+    }));
+    return res.json({ success: true, models });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // FCM — PUSH NOTIFICATION HELPERS
 // ════════════════════════════════════════════════════════════════════════════
 
-/**
- * Send a push notification to every registered device token for a user.
- * Automatically prunes dead/invalid tokens from Firestore (e.g. user
- * uninstalled, cleared site data, or the token simply expired).
- *
- * `data` fields are delivered to the service worker's onBackgroundMessage
- * AND to the foreground onMessage listener in index.html — so we put
- * everything (title/body/url/tag) inside `data`, NOT inside a top-level
- * `notification` block. This guarantees our own code controls rendering
- * in both foreground and background, instead of the browser auto-showing
- * a default-styled notification when the tab is in the foreground.
- */
 async function sendFCMToUser(ownerEmail, { title, body, url, tag }) {
     if (!ownerEmail) return { sent: 0, failed: 0 };
 
@@ -89,7 +128,6 @@ async function sendFCMToUser(ownerEmail, { title, body, url, tag }) {
             tag:   tag   || 'comex-general'
         },
         webpush: {
-            // fcmOptions.link is used by some browsers as a fallback click target
             fcmOptions: { link: url || '/' }
         }
     };
@@ -102,12 +140,10 @@ async function sendFCMToUser(ownerEmail, { title, body, url, tag }) {
         return { sent: 0, failed: tokens.length };
     }
 
-    // Prune any tokens Firebase reports as invalid/unregistered
     const deadTokens = [];
     result.responses.forEach((r, i) => {
         if (!r.success) {
             const code = r.error?.code || '';
-            console.warn('[FCM] Token failed:', tokens[i], code);
             if (
                 code === 'messaging/registration-token-not-registered' ||
                 code === 'messaging/invalid-registration-token'
@@ -120,13 +156,11 @@ async function sendFCMToUser(ownerEmail, { title, body, url, tag }) {
     if (deadTokens.length) {
         const remaining = tokens.filter(t => !deadTokens.includes(t));
         await userRef.update({ fcmTokens: remaining });
-        console.log('[FCM] Pruned', deadTokens.length, 'dead token(s) for', ownerEmail);
     }
 
     return { sent: result.successCount, failed: result.failureCount };
 }
 
-/** Build the appointment-booked notification payload. */
 function buildBookingNotification(appt) {
     return {
         title: '📅 New Appointment Booked!',
@@ -136,11 +170,168 @@ function buildBookingNotification(appt) {
     };
 }
 
+function buildCancellationNotification(appt) {
+    return {
+        title: '❌ Appointment Cancelled',
+        body:  `APPOINTMENT CANCELLED\nAppointment booked on ${appt.scheduledDate} at ${appt.appointmentTime} by ${appt.customerName} has been cancelled by the client itself`,
+        url:   '/?view=analytics',
+        tag:   'comex-appointment-cancel'
+    };
+}
+
+function buildEditNotification(appt, field, oldData, newData) {
+    const fieldLabels = {
+        customerName:    'name',
+        contactInfo:     'contact info',
+        appointmentDay:  'date',
+        appointmentTime: 'time',
+        scheduledDate:   'date'
+    };
+    const label = fieldLabels[field] || field;
+    return {
+        title: '✏️ Appointment Edited',
+        body:  `APPOINTMENT EDITED\n${appt.customerName} edited the ${label} from "${oldData}" to "${newData}"`,
+        url:   '/?view=analytics',
+        tag:   'comex-appointment-edit'
+    };
+}
+
 // ════════════════════════════════════════════════════════════════════════════
-// NEW ROUTE: POST /api/fcm-register-token
-// Called once the user grants notification permission and the frontend
-// retrieves an FCM token. Stores the token under users/{email}.fcmTokens (array).
+// POST /api/appointment/cancel
+// Called by the chat handler when user confirms cancellation.
 // ════════════════════════════════════════════════════════════════════════════
+async function handleAppointmentCancel(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { appointmentId, businessId, ownerEmail } = req.body || {};
+    if (!appointmentId || !businessId)
+        return res.status(400).json({ success: false, message: 'Missing appointmentId or businessId.' });
+
+    try {
+        const db = getDb();
+
+        // Mark as cancelled in global appointments
+        const apptRef = db.collection('appointments').doc(appointmentId);
+        const apptSnap = await apptRef.get();
+
+        if (!apptSnap.exists) {
+            return res.status(404).json({ success: false, message: 'Appointment not found.' });
+        }
+
+        const appt = apptSnap.data();
+        await apptRef.update({ status: 'cancelled', cancelledAt: new Date().toISOString() });
+
+        // Also mark cancelled in bot sub-collection (best-effort, find by conversationId)
+        const botApptsRef = db.collection('user_bots').doc(businessId).collection('appointments');
+        const q = await botApptsRef.where('conversationId', '==', appt.conversationId).get();
+        q.forEach(d => d.ref.update({ status: 'cancelled', cancelledAt: new Date().toISOString() }));
+
+        // Google Calendar: delete the event if we have it
+        if (appt.googleCalendarEventId && ownerEmail) {
+            try {
+                const userSnap = await db.collection('users').doc(ownerEmail).get();
+                const googleAuth = userSnap.data()?.integrations?.google_calendar;
+                if (googleAuth?.connected) {
+                    const token = await refreshTokenIfNeeded(googleAuth, ownerEmail, db);
+                    await fetch(
+                        `https://www.googleapis.com/calendar/v3/calendars/primary/events/${appt.googleCalendarEventId}`,
+                        { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } }
+                    );
+                }
+            } catch (e) {
+                console.error('[Cancel/Calendar]', e.message);
+            }
+        }
+
+        // Send push notification
+        const notifyEmail = ownerEmail || appt.owner;
+        if (notifyEmail) {
+            await sendFCMToUser(notifyEmail, buildCancellationNotification(appt));
+        }
+
+        return res.json({ success: true, message: 'Appointment cancelled.' });
+    } catch (err) {
+        console.error('[AppointmentCancel]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/appointment/edit
+// ════════════════════════════════════════════════════════════════════════════
+async function handleAppointmentEdit(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { appointmentId, businessId, ownerEmail, field, newValue } = req.body || {};
+    if (!appointmentId || !field || newValue === undefined)
+        return res.status(400).json({ success: false, message: 'Missing required fields.' });
+
+    // Only allow editing safe fields
+    const EDITABLE_FIELDS = ['customerName', 'contactInfo', 'appointmentDay', 'appointmentTime', 'scheduledDate'];
+    if (!EDITABLE_FIELDS.includes(field))
+        return res.status(400).json({ success: false, message: `Field "${field}" is not editable.` });
+
+    try {
+        const db = getDb();
+        const apptRef = db.collection('appointments').doc(appointmentId);
+        const apptSnap = await apptRef.get();
+
+        if (!apptSnap.exists)
+            return res.status(404).json({ success: false, message: 'Appointment not found.' });
+
+        const appt = apptSnap.data();
+        const oldValue = appt[field] || '(not set)';
+
+        // If editing date, resolve it
+        let resolvedValue = newValue;
+        if (field === 'appointmentDay') {
+            resolvedValue = newValue;
+            const iso = resolveDay(newValue);
+            await apptRef.update({ [field]: newValue, scheduledDate: iso, updatedAt: new Date().toISOString() });
+        } else {
+            await apptRef.update({ [field]: resolvedValue, updatedAt: new Date().toISOString() });
+        }
+
+        // Update bot sub-collection too
+        if (businessId) {
+            const botApptsRef = db.collection('user_bots').doc(businessId).collection('appointments');
+            const q = await botApptsRef.where('conversationId', '==', appt.conversationId).get();
+            q.forEach(d => d.ref.update({ [field]: resolvedValue, updatedAt: new Date().toISOString() }));
+        }
+
+        // Google Calendar: update event if date or time changed
+        if ((field === 'appointmentDay' || field === 'appointmentTime') && appt.googleCalendarEventId) {
+            const notifyEmail = ownerEmail || appt.owner;
+            if (notifyEmail) {
+                try {
+                    const userSnap = await db.collection('users').doc(notifyEmail).get();
+                    const googleAuth = userSnap.data()?.integrations?.google_calendar;
+                    if (googleAuth?.connected) {
+                        const updatedAppt = { ...appt, [field]: resolvedValue };
+                        if (field === 'appointmentDay') updatedAppt.scheduledDate = resolveDay(resolvedValue);
+                        await updateCalendarEvent(googleAuth, appt.googleCalendarEventId, updatedAppt, notifyEmail, db);
+                    }
+                } catch (e) {
+                    console.error('[Edit/Calendar]', e.message);
+                }
+            }
+        }
+
+        // Push notification
+        const notifyEmail = ownerEmail || appt.owner;
+        if (notifyEmail) {
+            await sendFCMToUser(notifyEmail, buildEditNotification(appt, field, oldValue, resolvedValue));
+        }
+
+        return res.json({ success: true, oldValue, newValue: resolvedValue });
+    } catch (err) {
+        console.error('[AppointmentEdit]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// FCM ROUTES
+// ════════════════════════════════════════════════════════════════════════════
+
 async function handleFCMRegisterToken(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
     const { userEmail, fcmToken } = req.body || {};
@@ -160,7 +351,6 @@ async function handleFCMRegisterToken(req, res) {
                 notificationsConnectedAt: new Date().toISOString()
             }, { merge: true });
         } else {
-            // Token already registered — just confirm it's marked enabled.
             await userRef.set({ notificationsEnabled: true }, { merge: true });
         }
 
@@ -171,11 +361,6 @@ async function handleFCMRegisterToken(req, res) {
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// NEW ROUTE: POST /api/fcm-remove-token
-// Lets a user disconnect notifications on this device (mirrors the old
-// WhatsApp "disconnect" flow in the Integrations page).
-// ════════════════════════════════════════════════════════════════════════════
 async function handleFCMRemoveToken(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
     const { userEmail, fcmToken } = req.body || {};
@@ -188,14 +373,8 @@ async function handleFCMRemoveToken(req, res) {
         if (!snap.exists) return res.json({ success: true });
 
         const existing = snap.data()?.fcmTokens || [];
-        // If a specific token is given, remove just that one; otherwise clear all
-        // (e.g. "disconnect notifications entirely" from the Integrations page).
         const remaining = fcmToken ? existing.filter(t => t !== fcmToken) : [];
-
-        await userRef.update({
-            fcmTokens: remaining,
-            notificationsEnabled: remaining.length > 0
-        });
+        await userRef.update({ fcmTokens: remaining, notificationsEnabled: remaining.length > 0 });
 
         return res.json({ success: true, message: 'Notifications disconnected.' });
     } catch (err) {
@@ -204,11 +383,6 @@ async function handleFCMRemoveToken(req, res) {
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// NEW ROUTE: POST /api/fcm-test-notification
-// Lets the user fire a test push from the Integrations page right after
-// connecting, so they immediately see/hear it working.
-// ════════════════════════════════════════════════════════════════════════════
 async function handleFCMTestNotification(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
     const { userEmail } = req.body || {};
@@ -223,7 +397,7 @@ async function handleFCMTestNotification(req, res) {
         });
 
         if (result.sent === 0) {
-            return res.status(400).json({ success: false, message: 'No active devices found, or delivery failed. Try reconnecting.' });
+            return res.status(400).json({ success: false, message: 'No active devices found. Try reconnecting.' });
         }
         return res.json({ success: true, message: `Test notification sent to ${result.sent} device(s).` });
     } catch (err) {
@@ -301,7 +475,8 @@ async function handleConfig(req, res) {
             position:     b.position                 || 'bottom-right',
             logoBase64:   b.logoBase64               || null,
             themeColor:   b.designConfig?.themeColor || '#0f172a',
-            designConfig: b.designConfig             || {}
+            designConfig: b.designConfig             || {},
+            modelKey:     b.modelKey                 || DEFAULT_MODEL_KEY
         });
     } catch (err) {
         console.error('[Config]', err.message);
@@ -310,7 +485,7 @@ async function handleConfig(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// CHAT
+// CHAT — with CANCEL / EDIT / multi-model support
 // ════════════════════════════════════════════════════════════════════════════
 async function handleChat(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -330,11 +505,13 @@ async function handleChat(req, res) {
         const botSnap = await db.collection('user_bots').doc(businessId).get();
         let sysPrompt  = 'You are a helpful, friendly customer service assistant.';
         let ownerEmail = '', botName = 'Assistant';
+        let modelKey   = DEFAULT_MODEL_KEY;
 
         if (botSnap.exists) {
             const b  = botSnap.data();
             ownerEmail = b.owner || '';
             botName    = b.name  || 'Assistant';
+            modelKey   = b.modelKey || DEFAULT_MODEL_KEY;
             const kc   = b.knowledgeContext || {};
             if (kc.systemPrompt) {
                 sysPrompt = kc.systemPrompt;
@@ -346,12 +523,195 @@ async function handleChat(req, res) {
             }
         }
 
+        // ── CANCEL / EDIT INTENT DETECTION ────────────────────────────────
+        const msgLower = userMsg.toLowerCase().trim();
+
+        // Detect CANCEL confirmation
+        const isCancelConfirm = /^(yes,?\s*)?(please\s+)?(cancel|delete|remove)\s*(it|this|the appointment|my appointment)?\.?$/i.test(msgLower) ||
+                                 /^(confirm cancel|yes cancel|cancel confirmed|go ahead and cancel)\.?$/i.test(msgLower);
+
+        // Detect initial CANCEL intent
+        const isCancelIntent = /\bcancel\b/.test(msgLower) && !isCancelConfirm;
+
+        // Detect EDIT intent
+        const isEditIntent = /\b(edit|change|update|modify|reschedule)\b/.test(msgLower);
+
+        // Check if we're in a pending cancel flow (set via prior assistant message context)
+        const safeHistory = (Array.isArray(history) ? history : []).slice(-12).filter(m => m?.role && m?.content);
+        const lastAssistantMsg = [...safeHistory].reverse().find(m => m.role === 'assistant')?.content || '';
+        const isPendingCancel = /confirm.*cancel|type.*yes.*cancel|cancel.*confirm/i.test(lastAssistantMsg);
+        const isPendingEdit   = /which.*field|what.*change|name.*contact.*date.*time/i.test(lastAssistantMsg);
+        const isPendingEditValue = /new.*value|what.*would.*you.*like.*change.*to|enter.*new/i.test(lastAssistantMsg);
+
+        // Find the most recent appointment for this conversation
+        async function findConversationAppointment() {
+            const apptSnap = await db.collection('appointments')
+                .where('conversationId', '==', convId)
+                .where('status', '==', 'confirmed')
+                .orderBy('createdAt', 'desc')
+                .limit(1)
+                .get();
+
+            if (!apptSnap.empty) return { id: apptSnap.docs[0].id, ...apptSnap.docs[0].data() };
+
+            // Also check bot sub-collection
+            const botApptSnap = await db.collection('user_bots').doc(businessId)
+                .collection('appointments')
+                .where('status', '==', 'confirmed')
+                .orderBy('createdAt', 'desc')
+                .limit(1)
+                .get();
+
+            if (!botApptSnap.empty) return { id: botApptSnap.docs[0].id, ...botApptSnap.docs[0].data() };
+            return null;
+        }
+
+        // ── HANDLE: User says "CANCEL" ──────────────────────────────────
+        if (isCancelIntent && !isPendingCancel) {
+            // Ask for confirmation
+            const reply = `Are you sure you want to cancel your appointment? Type "YES, CANCEL" to confirm, or "no" to keep it.`;
+            await logChat(db, businessId, convId, userMsg, reply, false, false);
+            return res.json({ success: true, answer: reply, reply });
+        }
+
+        // ── HANDLE: User confirms cancellation ─────────────────────────
+        if ((isCancelConfirm && isPendingCancel) || (msgLower === 'yes, cancel' || msgLower === 'yes cancel')) {
+            const appt = await findConversationAppointment();
+            if (!appt) {
+                const reply = "I couldn't find an active appointment to cancel. Please contact us directly.";
+                return res.json({ success: true, answer: reply, reply });
+            }
+
+            // Cancel via internal API call
+            try {
+                await db.collection('appointments').doc(appt.id).update({
+                    status: 'cancelled',
+                    cancelledAt: new Date().toISOString()
+                });
+
+                // Update bot sub-collection
+                const botApptsRef = db.collection('user_bots').doc(businessId).collection('appointments');
+                const q = await botApptsRef.where('conversationId', '==', convId).get();
+                q.forEach(d => d.ref.update({ status: 'cancelled', cancelledAt: new Date().toISOString() }));
+
+                // Delete Google Calendar event if present
+                if (appt.googleCalendarEventId && ownerEmail) {
+                    try {
+                        const userSnap = await db.collection('users').doc(ownerEmail).get();
+                        const googleAuth = userSnap.data()?.integrations?.google_calendar;
+                        if (googleAuth?.connected) {
+                            const token = await refreshTokenIfNeeded(googleAuth, ownerEmail, db);
+                            await fetch(
+                                `https://www.googleapis.com/calendar/v3/calendars/primary/events/${appt.googleCalendarEventId}`,
+                                { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } }
+                            );
+                        }
+                    } catch (e) { console.error('[Cancel/Calendar]', e.message); }
+                }
+
+                // Send push notification
+                if (ownerEmail) {
+                    await sendFCMToUser(ownerEmail, buildCancellationNotification(appt)).catch(e => console.error('[Cancel/FCM]', e.message));
+                }
+
+                const reply = `✅ Your appointment has been successfully cancelled.\n\n📅 Cancelled: ${appt.scheduledDate} at ${appt.appointmentTime}\n👤 Name: ${appt.customerName}\n\nIf you'd like to rebook, just say "I want to book an appointment".`;
+                await logChat(db, businessId, convId, userMsg, reply, false, false);
+                return res.json({ success: true, answer: reply, reply });
+
+            } catch (e) {
+                const reply = 'There was an error cancelling your appointment. Please try again.';
+                return res.json({ success: true, answer: reply, reply });
+            }
+        }
+
+        // ── HANDLE: User says "EDIT" ────────────────────────────────────
+        if (isEditIntent && !isPendingEdit && !isPendingEditValue) {
+            const reply = `Which detail would you like to change?\n\n1. **Name**\n2. **Contact info** (email/phone)\n3. **Date**\n4. **Time**\n\nPlease type the number or the field name.`;
+            await logChat(db, businessId, convId, userMsg, reply, false, false);
+            return res.json({ success: true, answer: reply, reply });
+        }
+
+        // ── HANDLE: User picked a field to edit ────────────────────────
+        if (isPendingEdit && !isPendingEditValue) {
+            const fieldMap = {
+                '1': 'customerName',   'name': 'customerName',
+                '2': 'contactInfo',    'contact': 'contactInfo', 'email': 'contactInfo', 'phone': 'contactInfo',
+                '3': 'appointmentDay', 'date': 'appointmentDay',
+                '4': 'appointmentTime','time': 'appointmentTime'
+            };
+            const key = msgLower.replace(/[^a-z0-9]/g,'');
+            const field = fieldMap[key] || fieldMap[msgLower.split(/\s+/)[0]];
+
+            if (!field) {
+                const reply = 'I didn\'t catch that. Please type: "name", "contact", "date", or "time".';
+                return res.json({ success: true, answer: reply, reply });
+            }
+
+            const fieldLabels = { customerName:'name', contactInfo:'contact info', appointmentDay:'date', appointmentTime:'time' };
+            const reply = `What would you like to change the ${fieldLabels[field]} to?`;
+            await logChat(db, businessId, convId, userMsg, reply, false, false);
+            return res.json({ success: true, answer: reply, reply, _editField: field });
+        }
+
+        // ── HANDLE: User provides new value for edit ────────────────────
+        if (isPendingEditValue) {
+            // Extract which field we were editing from history
+            const editFieldMsg = [...safeHistory].reverse().find(m =>
+                m.role === 'assistant' && m.content.includes('_editField:')
+            );
+            // Fallback: parse from last assistant message context
+            const fieldHint = lastAssistantMsg.match(/change the (name|contact info|date|time) to/i)?.[1];
+            const fieldMap2 = { 'name': 'customerName', 'contact info': 'contactInfo', 'date': 'appointmentDay', 'time': 'appointmentTime' };
+            const field = fieldHint ? fieldMap2[fieldHint.toLowerCase()] : null;
+
+            if (!field) {
+                // Can't determine field — fall through to normal LLM handling
+            } else {
+                const appt = await findConversationAppointment();
+                if (appt) {
+                    const oldValue = appt[field];
+                    let newValue = userMsg.trim();
+                    let scheduledDateUpdate = {};
+
+                    if (field === 'appointmentDay') {
+                        const iso = resolveDay(newValue);
+                        scheduledDateUpdate = { scheduledDate: iso };
+                    }
+
+                    await db.collection('appointments').doc(appt.id).update({
+                        [field]: newValue,
+                        ...scheduledDateUpdate,
+                        updatedAt: new Date().toISOString()
+                    });
+
+                    // Update bot sub-collection
+                    const botApptsRef = db.collection('user_bots').doc(businessId).collection('appointments');
+                    const q = await botApptsRef.where('conversationId', '==', convId).get();
+                    q.forEach(d => d.ref.update({ [field]: newValue, ...scheduledDateUpdate, updatedAt: new Date().toISOString() }));
+
+                    // Send push notification
+                    if (ownerEmail) {
+                        await sendFCMToUser(ownerEmail, buildEditNotification(appt, field, oldValue, newValue)).catch(e => console.error('[Edit/FCM]', e.message));
+                    }
+
+                    const fieldLabels2 = { customerName:'name', contactInfo:'contact info', appointmentDay:'date', appointmentTime:'time' };
+                    const reply = `✅ Updated! Your ${fieldLabels2[field]} has been changed from "${oldValue}" to "${newValue}".\n\nIs there anything else you'd like to change, or are you all set?`;
+                    await logChat(db, businessId, convId, userMsg, reply, false, false);
+                    return res.json({ success: true, answer: reply, reply });
+                }
+            }
+        }
+
+        // ── NORMAL CHAT FLOW ───────────────────────────────────────────
         sysPrompt += `
 
 PERSONALITY & BEHAVIOR:
 - You are a warm, helpful customer service assistant. Answer questions naturally.
 - Do NOT bring up appointment booking unless the user explicitly asks to book/schedule/set up an appointment.
 - Greetings like "hello", "hi" get a natural, friendly response — no booking prompts.
+- If the user types "CANCEL", ask them to confirm with "YES, CANCEL".
+- If the user types "EDIT", ask which field they want to change: name, contact info, date, or time. Then ask for the new value.
+- NEVER output raw JSON or function call arguments as plain text — that is a critical error.
 
 APPOINTMENT BOOKING (only when user explicitly asks):
 Collect information ONE piece at a time in EXACTLY this order:
@@ -362,7 +722,6 @@ Collect information ONE piece at a time in EXACTLY this order:
 
 CRITICAL TIME RULES:
 - You MUST ask for the time explicitly. Never assume or skip it.
-- Valid times: "3 pm", "3:00 PM", "15:00", "morning", "afternoon", "evening", "noon".
 - If the user provides a date without a time, ask: "What time works best for you on [date]?"
 - Do NOT trigger the booking function until you have an explicit time confirmed.
 
@@ -370,13 +729,10 @@ OTHER RULES:
 - Extract name from any phrasing: "I am Atharva", "It's Atharva", "My name is Atharva" → name is Atharva.
 - Accept any date: "Monday", "19 June", "next Tuesday", "tomorrow", "17th June".
 - Never re-ask for information already given in conversation history.
-- Once you have all 4 fields confirmed, immediately call the appointmentBooking tool.
-- NEVER output raw JSON or function arguments as plain text. That is a critical error.`;
+- Once you have all 4 fields confirmed, immediately call the appointmentBooking tool.`;
 
         const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-        const safeHistory = (Array.isArray(history) ? history : [])
-            .slice(-12)
-            .filter(m => m?.role && m?.content);
+        const modelId = resolveModelId(modelKey);
 
         const allText    = [...safeHistory.map(m => m.content), userMsg].join('\n');
         const allTextLow = allText.toLowerCase();
@@ -396,7 +752,7 @@ OTHER RULES:
         const allFieldsPresent = isBookingConversation && hasName && hasContact && hasDay && hasTime;
 
         const completion = await groq.chat.completions.create({
-            model:    'llama-3.3-70b-versatile',
+            model:    modelId,
             messages: [
                 { role: 'system', content: sysPrompt },
                 ...safeHistory,
@@ -413,7 +769,7 @@ OTHER RULES:
                             userName:        { type: 'string', description: 'Full name of the customer' },
                             contactInfo:     { type: 'string', description: 'Email or phone number' },
                             appointmentDay:  { type: 'string', description: 'Date or day of the appointment' },
-                            appointmentTime: { type: 'string', description: 'Exact time as stated by the user, e.g. "3 pm", "3:30 PM", "morning"' }
+                            appointmentTime: { type: 'string', description: 'Exact time as stated by the user' }
                         },
                         required: ['userName', 'contactInfo', 'appointmentDay', 'appointmentTime']
                     }
@@ -435,7 +791,6 @@ OTHER RULES:
                 try {
                     const leaked = JSON.parse(jsonMatch[0]);
                     if (leaked.userName && leaked.contactInfo && leaked.appointmentDay && leaked.appointmentTime) {
-                        console.warn('[Chat] Intercepted leaked JSON, processing as booking');
                         choice.tool_calls = [{ function: { name: 'appointmentBooking', arguments: JSON.stringify(leaked) } }];
                         choice.content = null;
                     }
@@ -466,7 +821,7 @@ OTHER RULES:
 
             const dateISO = resolveDay(appointmentDay);
 
-            // Availability check (Google Calendar)
+            // Availability check
             if (ownerEmail) {
                 const userSnap     = await db.collection('users').doc(ownerEmail).get();
                 const integrations = userSnap.exists ? (userSnap.data()?.integrations || {}) : {};
@@ -489,53 +844,47 @@ OTHER RULES:
                 }
             }
 
-            // Save appointment record
             const appt = {
                 businessId, botName, owner: ownerEmail, conversationId: convId,
                 customerName: userName, contactInfo,
                 appointmentDay, appointmentTime, scheduledDate: dateISO,
-                status: 'confirmed', createdAt: new Date().toISOString()
+                status: 'confirmed', createdAt: new Date().toISOString(),
+                googleCalendarEventId: null
             };
 
-            await db.collection('appointments').add(appt);
-            await db.collection('user_bots').doc(businessId).collection('appointments').add(appt);
+            const apptDocRef = await db.collection('appointments').add(appt);
+            await db.collection('user_bots').doc(businessId).collection('appointments').add({ ...appt, globalId: apptDocRef.id });
 
             // Google Calendar event
             if (ownerEmail) {
                 const userSnap     = await db.collection('users').doc(ownerEmail).get();
                 const integrations = userSnap.exists ? (userSnap.data()?.integrations || {}) : {};
                 if (integrations.google_calendar?.connected) {
-                    try { await addCalendarEvent(integrations.google_calendar, appt, ownerEmail, db); }
+                    try {
+                        const calResult = await addCalendarEvent(integrations.google_calendar, appt, ownerEmail, db);
+                        if (calResult?.eventId) {
+                            await apptDocRef.update({ googleCalendarEventId: calResult.eventId });
+                        }
+                    }
                     catch (e) { console.error('[Chat/Calendar]', e.message); }
                 }
             }
 
-            // ── Push notification to the business owner (replaces WhatsApp) ────
+            // Push notification
             if (ownerEmail) {
-                try {
-                    const pushResult = await sendFCMToUser(ownerEmail, buildBookingNotification(appt));
-                    console.log('[FCM] Booking notification:', pushResult);
-                } catch (e) {
-                    console.error('[FCM] Booking notify error:', e.message);
-                }
+                try { await sendFCMToUser(ownerEmail, buildBookingNotification(appt)); }
+                catch (e) { console.error('[FCM] Booking notify error:', e.message); }
             }
 
-            // Log chat
-            await db.collection('user_bots').doc(businessId).collection('chats').add({
-                conversationId: convId, question: userMsg,
-                answer: 'Appointment booked.', isGenuineQuery: true, isLeadCaptured: true,
-                createdAt: new Date().toISOString()
-            });
+            await logChat(db, businessId, convId, userMsg, 'Appointment booked.', true, true);
 
-            // Build confirmation reply
-            const pad = (label) => label.padEnd(8);
             const answer = [
                 '✅ APPOINTMENT BOOKED',
                 '',
-                `${pad('NAME:')}    ${userName}`,
-                `${pad('CONTACT:')} ${contactInfo}`,
-                `${pad('DATE:')}    ${dateISO}`,
-                `${pad('TIME:')}    ${appointmentTime}`,
+                `📅 Date:     ${dateISO}`,
+                `🕐 Time:     ${appointmentTime}`,
+                `👤 Name:     ${userName}`,
+                `📧 Contact:  ${contactInfo}`,
                 '',
                 'Reply with "CANCEL" to cancel or "EDIT" to change a detail.'
             ].join('\n');
@@ -545,14 +894,7 @@ OTHER RULES:
 
         // Plain reply
         const answer = choice?.content?.trim() || 'How can I help you?';
-        try {
-            await db.collection('user_bots').doc(businessId).collection('chats').add({
-                conversationId: convId, question: userMsg, answer,
-                isGenuineQuery: true, isLeadCaptured: false,
-                createdAt: new Date().toISOString()
-            });
-        } catch (e) { console.warn('[Chat] Log error:', e.message); }
-
+        await logChat(db, businessId, convId, userMsg, answer, true, false);
         return res.json({ success: true, answer, reply: answer });
 
     } catch (err) {
@@ -591,7 +933,7 @@ async function handleROI(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// GOOGLE OAUTH — initiate
+// GOOGLE OAUTH
 // ════════════════════════════════════════════════════════════════════════════
 async function handleGoogleOAuth(req, res) {
     const { email, origin } = req.query;
@@ -615,9 +957,6 @@ async function handleGoogleOAuth(req, res) {
     return res.redirect(302, url.toString());
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// GOOGLE OAUTH — callback
-// ════════════════════════════════════════════════════════════════════════════
 async function handleGoogleCallback(req, res) {
     const { code, state, error } = req.query;
     if (error) return res.status(400).send(`OAuth error: ${error}`);
@@ -651,16 +990,47 @@ async function handleGoogleCallback(req, res) {
         const tokens = await tokenRes.json();
         if (tokens.error) return res.status(400).send(`Token error: ${tokens.error_description || tokens.error}`);
 
-        await getDb().collection('users').doc(email).set({
+        // Fetch user's Google profile to get calendar label
+        let calendarLabel = email;
+        try {
+            const profileRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+                headers: { Authorization: `Bearer ${tokens.access_token}` }
+            });
+            const profile = await profileRes.json();
+            calendarLabel = profile.email || email;
+        } catch (e) { /* best-effort */ }
+
+        const db = getDb();
+        const userSnap = await db.collection('users').doc(email).get();
+        const existing = userSnap.exists ? (userSnap.data()?.integrations?.google_calendar_accounts || []) : [];
+
+        // Store this account in an array so multiple accounts are supported
+        const newAccount = {
+            email:         calendarLabel,
+            connected:     true,
+            access_token:  tokens.access_token,
+            refresh_token: tokens.refresh_token || null,
+            expiry_date:   tokens.expires_in
+                ? new Date(Date.now() + tokens.expires_in * 1000).toISOString()
+                : new Date(Date.now() + 3600 * 1000).toISOString(),
+            connectedAt:   new Date().toISOString()
+        };
+
+        // Upsert by email
+        const idx = existing.findIndex(a => a.email === calendarLabel);
+        if (idx >= 0) existing[idx] = newAccount;
+        else existing.push(newAccount);
+
+        await db.collection('users').doc(email).set({
             integrations: {
+                // Keep legacy single-account field for backwards-compat with chat handler
                 google_calendar: {
                     connected:     true,
                     access_token:  tokens.access_token,
                     refresh_token: tokens.refresh_token || null,
-                    expiry_date:   tokens.expires_in
-                        ? new Date(Date.now() + tokens.expires_in * 1000).toISOString()
-                        : new Date(Date.now() + 3600 * 1000).toISOString()
-                }
+                    expiry_date:   newAccount.expiry_date
+                },
+                google_calendar_accounts: existing
             }
         }, { merge: true });
 
@@ -677,8 +1047,17 @@ async function handleGoogleCallback(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// HELPERS — date / time / calendar (unchanged from previous version)
+// HELPERS
 // ════════════════════════════════════════════════════════════════════════════
+
+async function logChat(db, businessId, convId, question, answer, isGenuineQuery, isLeadCaptured) {
+    try {
+        await db.collection('user_bots').doc(businessId).collection('chats').add({
+            conversationId: convId, question, answer, isGenuineQuery, isLeadCaptured,
+            createdAt: new Date().toISOString()
+        });
+    } catch (e) { console.warn('[Chat] Log error:', e.message); }
+}
 
 function resolveDay(dayName) {
     if (!dayName) {
@@ -787,7 +1166,7 @@ async function refreshTokenIfNeeded(googleAuth, ownerEmail, db) {
                     'integrations.google_calendar.expiry_date':
                         new Date(Date.now() + (t.expires_in || 3500) * 1000).toISOString()
                 });
-            } else console.error('[Calendar/Refresh] Failed:', t);
+            }
         }
     }
     return accessToken;
@@ -865,10 +1244,8 @@ async function checkCalendarAvailability(googleAuth, dateISO, timeStr, ownerEmai
 async function addCalendarEvent(googleAuth, appt, ownerEmail, db) {
     const accessToken = await refreshTokenIfNeeded(googleAuth, ownerEmail, db);
     const parsed = parseTime(appt.appointmentTime);
-    if (!parsed) {
-        console.error(`[Calendar] Cannot parse time "${appt.appointmentTime}" — skipping.`);
-        return;
-    }
+    if (!parsed) { console.error(`[Calendar] Cannot parse time "${appt.appointmentTime}"`); return null; }
+
     const { h, min } = parsed;
     const timeZone   = await getCalendarTimezone(accessToken);
     const localStart = `${appt.scheduledDate}T${String(h).padStart(2,'0')}:${String(min).padStart(2,'0')}:00`;
@@ -886,6 +1263,33 @@ async function addCalendarEvent(googleAuth, appt, ownerEmail, db) {
         })
     });
     const data = await r.json();
-    if (!r.ok) console.error('[Calendar] Event error:', data.error?.message);
-    else       console.log('[Calendar] Event created:', data.id, 'at', localStart, timeZone);
+    if (!r.ok) { console.error('[Calendar] Event error:', data.error?.message); return null; }
+    return { eventId: data.id, eventLink: data.htmlLink };
+}
+
+async function updateCalendarEvent(googleAuth, eventId, appt, ownerEmail, db) {
+    const accessToken = await refreshTokenIfNeeded(googleAuth, ownerEmail, db);
+    const parsed = parseTime(appt.appointmentTime);
+    if (!parsed) return;
+
+    const { h, min } = parsed;
+    const timeZone   = await getCalendarTimezone(accessToken);
+    const localStart = `${appt.scheduledDate}T${String(h).padStart(2,'0')}:${String(min).padStart(2,'0')}:00`;
+    const endH = h + Math.floor((min+30)/60), endMin = (min+30)%60;
+    const localEnd = `${appt.scheduledDate}T${String(endH).padStart(2,'0')}:${String(endMin).padStart(2,'0')}:00`;
+
+    const r = await fetch(`https://www.googleapis.com/calendar/v3/calendars/primary/events/${eventId}`, {
+        method: 'PATCH',
+        headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            summary:     `Appointment: ${appt.customerName}`,
+            description: `Contact: ${appt.contactInfo}\nBooked via Comex AI`,
+            start: { dateTime: localStart, timeZone },
+            end:   { dateTime: localEnd,   timeZone }
+        })
+    });
+    if (!r.ok) {
+        const d = await r.json();
+        console.error('[Calendar] Update error:', d.error?.message);
+    }
 }
