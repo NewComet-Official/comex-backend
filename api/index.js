@@ -1,5 +1,3 @@
-// api/index.js
-
 import admin from 'firebase-admin';
 import Groq from 'groq-sdk';
 
@@ -33,35 +31,141 @@ function cors(res) {
 // ════════════════════════════════════════════════════════════════════════════
 
 /**
- * All models are served via Groq's unified API.
- * Model IDs map to Groq-hosted open-source models.
- * https://console.groq.com/docs/models
+ * Models are served via:
+ *  - Groq: fast open-source inference (LLaMA, Gemma on Groq, Mistral, Qwen)
+ *  - Google AI Studio: Gemini 2.5 Flash (uses GOOGLE_AI_STUDIO_API_KEY)
+ *
+ * All models share identical system prompt + tool-calling behaviour as LLaMA.
+ * Gemini uses the Google AI Studio REST API (OpenAI-compatible endpoint).
  */
 const MODEL_REGISTRY = {
-    // Meta LLaMA (default)
-    'llama-3.3-70b':        { id: 'llama-3.3-70b-versatile',        provider: 'groq', label: 'Meta LLaMA 3.3 70B' },
-    'llama-3.1-8b':         { id: 'llama-3.1-8b-instant',            provider: 'groq', label: 'Meta LLaMA 3.1 8B (Fast)' },
-    // Google DeepMind Gemma
-    'gemma-3-27b':          { id: 'gemma2-9b-it',                    provider: 'groq', label: 'Google Gemma 2 9B' },
-    // Mistral AI
-    'mistral-saba':         { id: 'mistral-saba-24b',                provider: 'groq', label: 'Mistral Saba 24B' },
-    // Alibaba Qwen
-    'qwen-3-32b':           { id: 'qwen-qwq-32b',                   provider: 'groq', label: 'Alibaba Qwen QwQ 32B' },
-    // xAI Grok (via Groq — uses distil variant available on Groq)
-    'groq-llama-tool':      { id: 'llama3-groq-70b-8192-tool-use-preview', provider: 'groq', label: 'Tool-Optimized LLaMA 70B' },
-    // OpenAI-compatible GPT open weights (placeholder — swap id when available)
-    'openai-gpt4o-mini':    { id: 'llama-3.3-70b-versatile',        provider: 'groq', label: 'GPT-4o Mini Compatible (LLaMA)' },
+    // ── Groq-hosted models ────────────────────────────────────────────────
+    'llama-3.3-70b':     { id: 'llama-3.3-70b-versatile',                provider: 'groq',   label: 'Meta LLaMA 3.3 70B'              },
+    'llama-3.1-8b':      { id: 'llama-3.1-8b-instant',                   provider: 'groq',   label: 'Meta LLaMA 3.1 8B (Fast)'        },
+    'gemma-3-27b':       { id: 'gemma2-9b-it',                           provider: 'groq',   label: 'Google Gemma 2 9B'               },
+    'mistral-saba':      { id: 'mistral-saba-24b',                       provider: 'groq',   label: 'Mistral Saba 24B'                },
+    'qwen-3-32b':        { id: 'qwen-qwq-32b',                          provider: 'groq',   label: 'Alibaba Qwen QwQ 32B'            },
+    'groq-llama-tool':   { id: 'llama3-groq-70b-8192-tool-use-preview',  provider: 'groq',   label: 'Tool-Optimized LLaMA 70B'        },
+    'openai-gpt4o-mini': { id: 'llama-3.3-70b-versatile',               provider: 'groq',   label: 'GPT-4o Mini Compatible (LLaMA)'  },
+    // ── Google AI Studio ──────────────────────────────────────────────────
+    'gemini-2.5-flash':  { id: 'gemini-2.5-flash',                       provider: 'google', label: 'Gemini 2.5 Flash'                },
 };
 
 const DEFAULT_MODEL_KEY = 'llama-3.3-70b';
 
+/** Shared system prompt additions injected for every model. */
+const BOOKING_SYSTEM_SUFFIX = `
+
+PERSONALITY & BEHAVIOR:
+- You are a warm, helpful customer service assistant. Answer questions naturally.
+- Do NOT bring up appointment booking unless the user explicitly asks to book/schedule/set up an appointment.
+- Greetings like "hello", "hi" get a natural, friendly response — no booking prompts.
+- If the user types "CANCEL", ask them to confirm with "YES, CANCEL".
+- If the user types "EDIT", ask which field they want to change: name, contact info, date, or time. Then ask for the new value.
+- NEVER output raw JSON or function call arguments as plain text — that is a critical error.
+
+APPOINTMENT BOOKING (only when user explicitly asks):
+Collect information ONE piece at a time in EXACTLY this order:
+  1. Full name    → ask: "What's your name?"
+  2. Contact info → ask: "What's your email or phone number?"
+  3. Date         → ask: "What date would you prefer?"
+  4. Time         → ask: "What time works best for you on [date]?"
+
+CRITICAL TIME RULES:
+- You MUST ask for the time explicitly. Never assume or skip it.
+- If the user provides a date without a time, ask: "What time works best for you on [date]?"
+- Do NOT trigger the booking function until you have an explicit time confirmed.
+
+OTHER RULES:
+- Extract name from any phrasing: "I am Atharva", "It's Atharva", "My name is Atharva" → name is Atharva.
+- Accept any date: "Monday", "19 June", "next Tuesday", "tomorrow", "17th June".
+- Never re-ask for information already given in conversation history.
+- Once you have all 4 fields confirmed, immediately call the appointmentBooking tool.`;
+
+/** The tool definition shared across all providers. */
+const BOOKING_TOOL_DEF = {
+    type: 'function',
+    function: {
+        name: 'appointmentBooking',
+        description: 'Book an appointment. Call ONLY when you have confirmed: full name, contact info, date, AND an explicit time from the user.',
+        parameters: {
+            type: 'object',
+            properties: {
+                userName:        { type: 'string', description: 'Full name of the customer'       },
+                contactInfo:     { type: 'string', description: 'Email or phone number'           },
+                appointmentDay:  { type: 'string', description: 'Date or day of the appointment' },
+                appointmentTime: { type: 'string', description: 'Exact time as stated by the user'},
+            },
+            required: ['userName', 'contactInfo', 'appointmentDay', 'appointmentTime'],
+        },
+    },
+};
+
+// ════════════════════════════════════════════════════════════════════════════
+// PROVIDER ABSTRACTION — identical interface for all models
+// ════════════════════════════════════════════════════════════════════════════
+
 /**
- * Get the Groq model ID to use for a given bot config.
- * Falls back to default if the model key is unknown.
+ * Call the correct provider for the given model key.
+ * Returns { content, tool_calls } — same shape regardless of provider.
  */
-function resolveModelId(modelKey) {
+async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent }) {
     const entry = MODEL_REGISTRY[modelKey] || MODEL_REGISTRY[DEFAULT_MODEL_KEY];
-    return entry.id;
+
+    // ── Groq ──────────────────────────────────────────────────────────────
+    if (entry.provider === 'groq') {
+        if (!process.env.GROQ_API_KEY) throw new Error('GROQ_API_KEY not set.');
+        const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+        const completion = await groq.chat.completions.create({
+            model:       entry.id,
+            messages,
+            tools:       [BOOKING_TOOL_DEF],
+            tool_choice: allFieldsPresent
+                ? { type: 'function', function: { name: 'appointmentBooking' } }
+                : 'auto',
+            temperature: 0.3,
+            max_tokens:  600,
+        });
+        return completion.choices[0]?.message || {};
+    }
+
+    // ── Google AI Studio (OpenAI-compatible endpoint) ─────────────────────
+    if (entry.provider === 'google') {
+        const apiKey = process.env.GOOGLE_AI_STUDIO_API_KEY;
+        if (!apiKey) throw new Error('GOOGLE_AI_STUDIO_API_KEY not set.');
+
+        const url = `https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`;
+
+        const body = {
+            model:       entry.id,
+            messages,
+            tools:       [BOOKING_TOOL_DEF],
+            tool_choice: allFieldsPresent
+                ? { type: 'function', function: { name: 'appointmentBooking' } }
+                : 'auto',
+            temperature: 0.3,
+            max_tokens:  600,
+        };
+
+        const r = await fetch(url, {
+            method:  'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${apiKey}`,
+            },
+            body: JSON.stringify(body),
+        });
+
+        if (!r.ok) {
+            const err = await r.text();
+            throw new Error(`Google AI Studio error ${r.status}: ${err}`);
+        }
+
+        const data = await r.json();
+        return data.choices?.[0]?.message || {};
+    }
+
+    throw new Error(`Unknown provider: ${entry.provider}`);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -92,13 +196,13 @@ export default async function handler(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// GET /api/models — returns available model options for the frontend
+// GET /api/models
 // ════════════════════════════════════════════════════════════════════════════
 async function handleModels(req, res) {
     const models = Object.entries(MODEL_REGISTRY).map(([key, val]) => ({
         key,
-        label: val.label,
-        provider: val.provider
+        label:    val.label,
+        provider: val.provider,
     }));
     return res.json({ success: true, models });
 }
@@ -125,11 +229,9 @@ async function sendFCMToUser(ownerEmail, { title, body, url, tag }) {
             title: title || 'Comex AI Notification',
             body:  body  || '',
             url:   url   || '/',
-            tag:   tag   || 'comex-general'
+            tag:   tag   || 'comex-general',
         },
-        webpush: {
-            fcmOptions: { link: url || '/' }
-        }
+        webpush: { fcmOptions: { link: url || '/' } },
     };
 
     let result;
@@ -147,9 +249,7 @@ async function sendFCMToUser(ownerEmail, { title, body, url, tag }) {
             if (
                 code === 'messaging/registration-token-not-registered' ||
                 code === 'messaging/invalid-registration-token'
-            ) {
-                deadTokens.push(tokens[i]);
-            }
+            ) deadTokens.push(tokens[i]);
         }
     });
 
@@ -166,7 +266,7 @@ function buildBookingNotification(appt) {
         title: '📅 New Appointment Booked!',
         body:  `${appt.customerName} booked ${appt.appointmentDay} at ${appt.appointmentTime}. Contact: ${appt.contactInfo}`,
         url:   '/?view=analytics',
-        tag:   'comex-appointment'
+        tag:   'comex-appointment',
     };
 }
 
@@ -175,7 +275,7 @@ function buildCancellationNotification(appt) {
         title: '❌ Appointment Cancelled',
         body:  `APPOINTMENT CANCELLED\nAppointment booked on ${appt.scheduledDate} at ${appt.appointmentTime} by ${appt.customerName} has been cancelled by the client itself`,
         url:   '/?view=analytics',
-        tag:   'comex-appointment-cancel'
+        tag:   'comex-appointment-cancel',
     };
 }
 
@@ -185,20 +285,19 @@ function buildEditNotification(appt, field, oldData, newData) {
         contactInfo:     'contact info',
         appointmentDay:  'date',
         appointmentTime: 'time',
-        scheduledDate:   'date'
+        scheduledDate:   'date',
     };
     const label = fieldLabels[field] || field;
     return {
         title: '✏️ Appointment Edited',
         body:  `APPOINTMENT EDITED\n${appt.customerName} edited the ${label} from "${oldData}" to "${newData}"`,
         url:   '/?view=analytics',
-        tag:   'comex-appointment-edit'
+        tag:   'comex-appointment-edit',
     };
 }
 
 // ════════════════════════════════════════════════════════════════════════════
 // POST /api/appointment/cancel
-// Called by the chat handler when user confirms cancellation.
 // ════════════════════════════════════════════════════════════════════════════
 async function handleAppointmentCancel(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -208,27 +307,22 @@ async function handleAppointmentCancel(req, res) {
 
     try {
         const db = getDb();
-
-        // Mark as cancelled in global appointments
-        const apptRef = db.collection('appointments').doc(appointmentId);
+        const apptRef  = db.collection('appointments').doc(appointmentId);
         const apptSnap = await apptRef.get();
 
-        if (!apptSnap.exists) {
+        if (!apptSnap.exists)
             return res.status(404).json({ success: false, message: 'Appointment not found.' });
-        }
 
         const appt = apptSnap.data();
         await apptRef.update({ status: 'cancelled', cancelledAt: new Date().toISOString() });
 
-        // Also mark cancelled in bot sub-collection (best-effort, find by conversationId)
         const botApptsRef = db.collection('user_bots').doc(businessId).collection('appointments');
         const q = await botApptsRef.where('conversationId', '==', appt.conversationId).get();
         q.forEach(d => d.ref.update({ status: 'cancelled', cancelledAt: new Date().toISOString() }));
 
-        // Google Calendar: delete the event if we have it
         if (appt.googleCalendarEventId && ownerEmail) {
             try {
-                const userSnap = await db.collection('users').doc(ownerEmail).get();
+                const userSnap   = await db.collection('users').doc(ownerEmail).get();
                 const googleAuth = userSnap.data()?.integrations?.google_calendar;
                 if (googleAuth?.connected) {
                     const token = await refreshTokenIfNeeded(googleAuth, ownerEmail, db);
@@ -237,16 +331,11 @@ async function handleAppointmentCancel(req, res) {
                         { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } }
                     );
                 }
-            } catch (e) {
-                console.error('[Cancel/Calendar]', e.message);
-            }
+            } catch (e) { console.error('[Cancel/Calendar]', e.message); }
         }
 
-        // Send push notification
         const notifyEmail = ownerEmail || appt.owner;
-        if (notifyEmail) {
-            await sendFCMToUser(notifyEmail, buildCancellationNotification(appt));
-        }
+        if (notifyEmail) await sendFCMToUser(notifyEmail, buildCancellationNotification(appt));
 
         return res.json({ success: true, message: 'Appointment cancelled.' });
     } catch (err) {
@@ -264,62 +353,52 @@ async function handleAppointmentEdit(req, res) {
     if (!appointmentId || !field || newValue === undefined)
         return res.status(400).json({ success: false, message: 'Missing required fields.' });
 
-    // Only allow editing safe fields
     const EDITABLE_FIELDS = ['customerName', 'contactInfo', 'appointmentDay', 'appointmentTime', 'scheduledDate'];
     if (!EDITABLE_FIELDS.includes(field))
         return res.status(400).json({ success: false, message: `Field "${field}" is not editable.` });
 
     try {
-        const db = getDb();
-        const apptRef = db.collection('appointments').doc(appointmentId);
+        const db      = getDb();
+        const apptRef  = db.collection('appointments').doc(appointmentId);
         const apptSnap = await apptRef.get();
 
         if (!apptSnap.exists)
             return res.status(404).json({ success: false, message: 'Appointment not found.' });
 
-        const appt = apptSnap.data();
+        const appt     = apptSnap.data();
         const oldValue = appt[field] || '(not set)';
-
-        // If editing date, resolve it
         let resolvedValue = newValue;
+
         if (field === 'appointmentDay') {
-            resolvedValue = newValue;
             const iso = resolveDay(newValue);
             await apptRef.update({ [field]: newValue, scheduledDate: iso, updatedAt: new Date().toISOString() });
         } else {
             await apptRef.update({ [field]: resolvedValue, updatedAt: new Date().toISOString() });
         }
 
-        // Update bot sub-collection too
         if (businessId) {
             const botApptsRef = db.collection('user_bots').doc(businessId).collection('appointments');
             const q = await botApptsRef.where('conversationId', '==', appt.conversationId).get();
             q.forEach(d => d.ref.update({ [field]: resolvedValue, updatedAt: new Date().toISOString() }));
         }
 
-        // Google Calendar: update event if date or time changed
         if ((field === 'appointmentDay' || field === 'appointmentTime') && appt.googleCalendarEventId) {
             const notifyEmail = ownerEmail || appt.owner;
             if (notifyEmail) {
                 try {
-                    const userSnap = await db.collection('users').doc(notifyEmail).get();
+                    const userSnap   = await db.collection('users').doc(notifyEmail).get();
                     const googleAuth = userSnap.data()?.integrations?.google_calendar;
                     if (googleAuth?.connected) {
                         const updatedAppt = { ...appt, [field]: resolvedValue };
                         if (field === 'appointmentDay') updatedAppt.scheduledDate = resolveDay(resolvedValue);
                         await updateCalendarEvent(googleAuth, appt.googleCalendarEventId, updatedAppt, notifyEmail, db);
                     }
-                } catch (e) {
-                    console.error('[Edit/Calendar]', e.message);
-                }
+                } catch (e) { console.error('[Edit/Calendar]', e.message); }
             }
         }
 
-        // Push notification
         const notifyEmail = ownerEmail || appt.owner;
-        if (notifyEmail) {
-            await sendFCMToUser(notifyEmail, buildEditNotification(appt, field, oldValue, resolvedValue));
-        }
+        if (notifyEmail) await sendFCMToUser(notifyEmail, buildEditNotification(appt, field, oldValue, resolvedValue));
 
         return res.json({ success: true, oldValue, newValue: resolvedValue });
     } catch (err) {
@@ -339,16 +418,16 @@ async function handleFCMRegisterToken(req, res) {
         return res.status(400).json({ success: false, message: 'Missing userEmail or fcmToken.' });
 
     try {
-        const db = getDb();
-        const userRef = db.collection('users').doc(userEmail);
-        const snap = await userRef.get();
+        const db      = getDb();
+        const userRef  = db.collection('users').doc(userEmail);
+        const snap     = await userRef.get();
         const existing = snap.exists ? (snap.data()?.fcmTokens || []) : [];
 
         if (!existing.includes(fcmToken)) {
             await userRef.set({
                 fcmTokens: [...existing, fcmToken],
                 notificationsEnabled: true,
-                notificationsConnectedAt: new Date().toISOString()
+                notificationsConnectedAt: new Date().toISOString(),
             }, { merge: true });
         } else {
             await userRef.set({ notificationsEnabled: true }, { merge: true });
@@ -367,12 +446,12 @@ async function handleFCMRemoveToken(req, res) {
     if (!userEmail) return res.status(400).json({ success: false, message: 'Missing userEmail.' });
 
     try {
-        const db = getDb();
-        const userRef = db.collection('users').doc(userEmail);
-        const snap = await userRef.get();
+        const db      = getDb();
+        const userRef  = db.collection('users').doc(userEmail);
+        const snap     = await userRef.get();
         if (!snap.exists) return res.json({ success: true });
 
-        const existing = snap.data()?.fcmTokens || [];
+        const existing  = snap.data()?.fcmTokens || [];
         const remaining = fcmToken ? existing.filter(t => t !== fcmToken) : [];
         await userRef.update({ fcmTokens: remaining, notificationsEnabled: remaining.length > 0 });
 
@@ -393,12 +472,12 @@ async function handleFCMTestNotification(req, res) {
             title: '✅ Notifications Connected!',
             body:  'This is a test alert from Comex AI. You will receive one like this for every new appointment.',
             url:   '/?view=integrations',
-            tag:   'comex-test'
+            tag:   'comex-test',
         });
 
-        if (result.sent === 0) {
+        if (result.sent === 0)
             return res.status(400).json({ success: false, message: 'No active devices found. Try reconnecting.' });
-        }
+
         return res.json({ success: true, message: `Test notification sent to ${result.sent} device(s).` });
     } catch (err) {
         console.error('[FCM-Test]', err.message);
@@ -437,7 +516,7 @@ async function handleScrape(req, res) {
     try {
         const r = await fetch(url, {
             headers: { 'User-Agent': 'Mozilla/5.0 ComexAI/1.0' },
-            signal: AbortSignal.timeout(12000)
+            signal:  AbortSignal.timeout(12000),
         });
         if (!r.ok) throw new Error(`Fetch failed: HTTP ${r.status}`);
         const html = await r.text();
@@ -476,7 +555,7 @@ async function handleConfig(req, res) {
             logoBase64:   b.logoBase64               || null,
             themeColor:   b.designConfig?.themeColor || '#0f172a',
             designConfig: b.designConfig             || {},
-            modelKey:     b.modelKey                 || DEFAULT_MODEL_KEY
+            modelKey:     b.modelKey                 || DEFAULT_MODEL_KEY,
         });
     } catch (err) {
         console.error('[Config]', err.message);
@@ -495,11 +574,9 @@ async function handleChat(req, res) {
 
     if (!businessId || !userMsg)
         return res.status(400).json({ success: false, answer: 'Missing businessId or message.' });
-    if (!process.env.GROQ_API_KEY)
-        return res.status(500).json({ success: false, answer: 'GROQ_API_KEY not set.' });
 
     const convId = inId || `conv-${Date.now()}`;
-    const db = getDb();
+    const db     = getDb();
 
     try {
         const botSnap = await db.collection('user_bots').doc(businessId).get();
@@ -509,8 +586,8 @@ async function handleChat(req, res) {
 
         if (botSnap.exists) {
             const b  = botSnap.data();
-            ownerEmail = b.owner || '';
-            botName    = b.name  || 'Assistant';
+            ownerEmail = b.owner    || '';
+            botName    = b.name     || 'Assistant';
             modelKey   = b.modelKey || DEFAULT_MODEL_KEY;
             const kc   = b.knowledgeContext || {};
             if (kc.systemPrompt) {
@@ -523,27 +600,23 @@ async function handleChat(req, res) {
             }
         }
 
+        // Append shared booking/personality suffix to ALL models
+        sysPrompt += BOOKING_SYSTEM_SUFFIX;
+
         // ── CANCEL / EDIT INTENT DETECTION ────────────────────────────────
         const msgLower = userMsg.toLowerCase().trim();
 
-        // Detect CANCEL confirmation
         const isCancelConfirm = /^(yes,?\s*)?(please\s+)?(cancel|delete|remove)\s*(it|this|the appointment|my appointment)?\.?$/i.test(msgLower) ||
                                  /^(confirm cancel|yes cancel|cancel confirmed|go ahead and cancel)\.?$/i.test(msgLower);
+        const isCancelIntent  = /\bcancel\b/.test(msgLower) && !isCancelConfirm;
+        const isEditIntent    = /\b(edit|change|update|modify|reschedule)\b/.test(msgLower);
 
-        // Detect initial CANCEL intent
-        const isCancelIntent = /\bcancel\b/.test(msgLower) && !isCancelConfirm;
-
-        // Detect EDIT intent
-        const isEditIntent = /\b(edit|change|update|modify|reschedule)\b/.test(msgLower);
-
-        // Check if we're in a pending cancel flow (set via prior assistant message context)
         const safeHistory = (Array.isArray(history) ? history : []).slice(-12).filter(m => m?.role && m?.content);
         const lastAssistantMsg = [...safeHistory].reverse().find(m => m.role === 'assistant')?.content || '';
-        const isPendingCancel = /confirm.*cancel|type.*yes.*cancel|cancel.*confirm/i.test(lastAssistantMsg);
-        const isPendingEdit   = /which.*field|what.*change|name.*contact.*date.*time/i.test(lastAssistantMsg);
-        const isPendingEditValue = /new.*value|what.*would.*you.*like.*change.*to|enter.*new/i.test(lastAssistantMsg);
+        const isPendingCancel     = /confirm.*cancel|type.*yes.*cancel|cancel.*confirm/i.test(lastAssistantMsg);
+        const isPendingEdit       = /which.*field|what.*change|name.*contact.*date.*time/i.test(lastAssistantMsg);
+        const isPendingEditValue  = /new.*value|what.*would.*you.*like.*change.*to|enter.*new/i.test(lastAssistantMsg);
 
-        // Find the most recent appointment for this conversation
         async function findConversationAppointment() {
             const apptSnap = await db.collection('appointments')
                 .where('conversationId', '==', convId)
@@ -551,24 +624,20 @@ async function handleChat(req, res) {
                 .orderBy('createdAt', 'desc')
                 .limit(1)
                 .get();
-
             if (!apptSnap.empty) return { id: apptSnap.docs[0].id, ...apptSnap.docs[0].data() };
 
-            // Also check bot sub-collection
             const botApptSnap = await db.collection('user_bots').doc(businessId)
                 .collection('appointments')
                 .where('status', '==', 'confirmed')
                 .orderBy('createdAt', 'desc')
                 .limit(1)
                 .get();
-
             if (!botApptSnap.empty) return { id: botApptSnap.docs[0].id, ...botApptSnap.docs[0].data() };
             return null;
         }
 
-        // ── HANDLE: User says "CANCEL" ──────────────────────────────────
+        // ── HANDLE: User says "CANCEL" ─────────────────────────────────
         if (isCancelIntent && !isPendingCancel) {
-            // Ask for confirmation
             const reply = `Are you sure you want to cancel your appointment? Type "YES, CANCEL" to confirm, or "no" to keep it.`;
             await logChat(db, businessId, convId, userMsg, reply, false, false);
             return res.json({ success: true, answer: reply, reply });
@@ -581,23 +650,17 @@ async function handleChat(req, res) {
                 const reply = "I couldn't find an active appointment to cancel. Please contact us directly.";
                 return res.json({ success: true, answer: reply, reply });
             }
-
-            // Cancel via internal API call
             try {
                 await db.collection('appointments').doc(appt.id).update({
-                    status: 'cancelled',
-                    cancelledAt: new Date().toISOString()
+                    status: 'cancelled', cancelledAt: new Date().toISOString(),
                 });
-
-                // Update bot sub-collection
                 const botApptsRef = db.collection('user_bots').doc(businessId).collection('appointments');
                 const q = await botApptsRef.where('conversationId', '==', convId).get();
                 q.forEach(d => d.ref.update({ status: 'cancelled', cancelledAt: new Date().toISOString() }));
 
-                // Delete Google Calendar event if present
                 if (appt.googleCalendarEventId && ownerEmail) {
                     try {
-                        const userSnap = await db.collection('users').doc(ownerEmail).get();
+                        const userSnap   = await db.collection('users').doc(ownerEmail).get();
                         const googleAuth = userSnap.data()?.integrations?.google_calendar;
                         if (googleAuth?.connected) {
                             const token = await refreshTokenIfNeeded(googleAuth, ownerEmail, db);
@@ -609,92 +672,70 @@ async function handleChat(req, res) {
                     } catch (e) { console.error('[Cancel/Calendar]', e.message); }
                 }
 
-                // Send push notification
-                if (ownerEmail) {
+                if (ownerEmail)
                     await sendFCMToUser(ownerEmail, buildCancellationNotification(appt)).catch(e => console.error('[Cancel/FCM]', e.message));
-                }
 
                 const reply = `✅ Your appointment has been successfully cancelled.\n\n📅 Cancelled: ${appt.scheduledDate} at ${appt.appointmentTime}\n👤 Name: ${appt.customerName}\n\nIf you'd like to rebook, just say "I want to book an appointment".`;
                 await logChat(db, businessId, convId, userMsg, reply, false, false);
                 return res.json({ success: true, answer: reply, reply });
-
-            } catch (e) {
+            } catch {
                 const reply = 'There was an error cancelling your appointment. Please try again.';
                 return res.json({ success: true, answer: reply, reply });
             }
         }
 
-        // ── HANDLE: User says "EDIT" ────────────────────────────────────
+        // ── HANDLE: User says "EDIT" ───────────────────────────────────
         if (isEditIntent && !isPendingEdit && !isPendingEditValue) {
             const reply = `Which detail would you like to change?\n\n1. **Name**\n2. **Contact info** (email/phone)\n3. **Date**\n4. **Time**\n\nPlease type the number or the field name.`;
             await logChat(db, businessId, convId, userMsg, reply, false, false);
             return res.json({ success: true, answer: reply, reply });
         }
 
-        // ── HANDLE: User picked a field to edit ────────────────────────
+        // ── HANDLE: User picked a field ────────────────────────────────
         if (isPendingEdit && !isPendingEditValue) {
             const fieldMap = {
-                '1': 'customerName',   'name': 'customerName',
-                '2': 'contactInfo',    'contact': 'contactInfo', 'email': 'contactInfo', 'phone': 'contactInfo',
-                '3': 'appointmentDay', 'date': 'appointmentDay',
-                '4': 'appointmentTime','time': 'appointmentTime'
+                '1': 'customerName',    'name':    'customerName',
+                '2': 'contactInfo',     'contact': 'contactInfo', 'email': 'contactInfo', 'phone': 'contactInfo',
+                '3': 'appointmentDay',  'date':    'appointmentDay',
+                '4': 'appointmentTime', 'time':    'appointmentTime',
             };
-            const key = msgLower.replace(/[^a-z0-9]/g,'');
+            const key   = msgLower.replace(/[^a-z0-9]/g, '');
             const field = fieldMap[key] || fieldMap[msgLower.split(/\s+/)[0]];
-
             if (!field) {
                 const reply = 'I didn\'t catch that. Please type: "name", "contact", "date", or "time".';
                 return res.json({ success: true, answer: reply, reply });
             }
-
-            const fieldLabels = { customerName:'name', contactInfo:'contact info', appointmentDay:'date', appointmentTime:'time' };
+            const fieldLabels = { customerName: 'name', contactInfo: 'contact info', appointmentDay: 'date', appointmentTime: 'time' };
             const reply = `What would you like to change the ${fieldLabels[field]} to?`;
             await logChat(db, businessId, convId, userMsg, reply, false, false);
             return res.json({ success: true, answer: reply, reply, _editField: field });
         }
 
-        // ── HANDLE: User provides new value for edit ────────────────────
+        // ── HANDLE: User provides new value ───────────────────────────
         if (isPendingEditValue) {
-            // Extract which field we were editing from history
-            const editFieldMsg = [...safeHistory].reverse().find(m =>
-                m.role === 'assistant' && m.content.includes('_editField:')
-            );
-            // Fallback: parse from last assistant message context
             const fieldHint = lastAssistantMsg.match(/change the (name|contact info|date|time) to/i)?.[1];
             const fieldMap2 = { 'name': 'customerName', 'contact info': 'contactInfo', 'date': 'appointmentDay', 'time': 'appointmentTime' };
-            const field = fieldHint ? fieldMap2[fieldHint.toLowerCase()] : null;
+            const field     = fieldHint ? fieldMap2[fieldHint.toLowerCase()] : null;
 
-            if (!field) {
-                // Can't determine field — fall through to normal LLM handling
-            } else {
+            if (field) {
                 const appt = await findConversationAppointment();
                 if (appt) {
                     const oldValue = appt[field];
-                    let newValue = userMsg.trim();
+                    const newValue = userMsg.trim();
                     let scheduledDateUpdate = {};
-
-                    if (field === 'appointmentDay') {
-                        const iso = resolveDay(newValue);
-                        scheduledDateUpdate = { scheduledDate: iso };
-                    }
+                    if (field === 'appointmentDay') scheduledDateUpdate = { scheduledDate: resolveDay(newValue) };
 
                     await db.collection('appointments').doc(appt.id).update({
-                        [field]: newValue,
-                        ...scheduledDateUpdate,
-                        updatedAt: new Date().toISOString()
+                        [field]: newValue, ...scheduledDateUpdate, updatedAt: new Date().toISOString(),
                     });
-
-                    // Update bot sub-collection
                     const botApptsRef = db.collection('user_bots').doc(businessId).collection('appointments');
                     const q = await botApptsRef.where('conversationId', '==', convId).get();
                     q.forEach(d => d.ref.update({ [field]: newValue, ...scheduledDateUpdate, updatedAt: new Date().toISOString() }));
 
-                    // Send push notification
-                    if (ownerEmail) {
+                    if (ownerEmail)
                         await sendFCMToUser(ownerEmail, buildEditNotification(appt, field, oldValue, newValue)).catch(e => console.error('[Edit/FCM]', e.message));
-                    }
 
-                    const fieldLabels2 = { customerName:'name', contactInfo:'contact info', appointmentDay:'date', appointmentTime:'time' };
+                    const fieldLabels2 = { customerName: 'name', contactInfo: 'contact info', appointmentDay: 'date', appointmentTime: 'time' };
                     const reply = `✅ Updated! Your ${fieldLabels2[field]} has been changed from "${oldValue}" to "${newValue}".\n\nIs there anything else you'd like to change, or are you all set?`;
                     await logChat(db, businessId, convId, userMsg, reply, false, false);
                     return res.json({ success: true, answer: reply, reply });
@@ -702,87 +743,31 @@ async function handleChat(req, res) {
             }
         }
 
-        // ── NORMAL CHAT FLOW ───────────────────────────────────────────
-        sysPrompt += `
-
-PERSONALITY & BEHAVIOR:
-- You are a warm, helpful customer service assistant. Answer questions naturally.
-- Do NOT bring up appointment booking unless the user explicitly asks to book/schedule/set up an appointment.
-- Greetings like "hello", "hi" get a natural, friendly response — no booking prompts.
-- If the user types "CANCEL", ask them to confirm with "YES, CANCEL".
-- If the user types "EDIT", ask which field they want to change: name, contact info, date, or time. Then ask for the new value.
-- NEVER output raw JSON or function call arguments as plain text — that is a critical error.
-
-APPOINTMENT BOOKING (only when user explicitly asks):
-Collect information ONE piece at a time in EXACTLY this order:
-  1. Full name    → ask: "What's your name?"
-  2. Contact info → ask: "What's your email or phone number?"
-  3. Date         → ask: "What date would you prefer?"
-  4. Time         → ask: "What time works best for you on [date]?"
-
-CRITICAL TIME RULES:
-- You MUST ask for the time explicitly. Never assume or skip it.
-- If the user provides a date without a time, ask: "What time works best for you on [date]?"
-- Do NOT trigger the booking function until you have an explicit time confirmed.
-
-OTHER RULES:
-- Extract name from any phrasing: "I am Atharva", "It's Atharva", "My name is Atharva" → name is Atharva.
-- Accept any date: "Monday", "19 June", "next Tuesday", "tomorrow", "17th June".
-- Never re-ask for information already given in conversation history.
-- Once you have all 4 fields confirmed, immediately call the appointmentBooking tool.`;
-
-        const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-        const modelId = resolveModelId(modelKey);
-
+        // ── NORMAL CHAT — call the selected model ───────────────────────
         const allText    = [...safeHistory.map(m => m.content), userMsg].join('\n');
         const allTextLow = allText.toLowerCase();
 
-        const hasName = (
-            /my name is|i am|i'm|it'?s\s+[a-z]+|name[:\s]+/i.test(allText) ||
-            safeHistory.some(m => m.role === 'user' && /^[A-Z][a-z]+ [A-Z][a-z]+/.test(m.content.trim()))
-        );
+        const hasName    = /my name is|i am|i'm|it'?s\s+[a-z]+|name[:\s]+/i.test(allText) ||
+                           safeHistory.some(m => m.role === 'user' && /^[A-Z][a-z]+ [A-Z][a-z]+/.test(m.content.trim()));
         const hasContact = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/.test(allText) ||
                            /(\+?\d[\d\s\-]{6,}\d)/.test(allText);
-        const hasDay  = /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|today|january|february|march|april|may|june|july|august|september|october|november|december|\d{1,2}[\s\/\-](jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\d{1,2}))\b/i.test(allTextLow);
-        const hasTime = /\b(\d{1,2}(:\d{2})?\s*(am|pm))\b/i.test(allText) ||
-                        /\b(morning|afternoon|evening|noon|midday|midnight)\b/i.test(allTextLow) ||
-                        /\b([01]?\d|2[0-3]):[0-5]\d\b/.test(allText);
+        const hasDay     = /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|today|january|february|march|april|may|june|july|august|september|october|november|december|\d{1,2}[\s\/\-](jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\d{1,2}))\b/i.test(allTextLow);
+        const hasTime    = /\b(\d{1,2}(:\d{2})?\s*(am|pm))\b/i.test(allText) ||
+                           /\b(morning|afternoon|evening|noon|midday|midnight)\b/i.test(allTextLow) ||
+                           /\b([01]?\d|2[0-3]):[0-5]\d\b/.test(allText);
 
         const isBookingConversation = /\b(book|schedule|appointment|slot|reserve|set up|fix a)\b/i.test(allTextLow);
-        const allFieldsPresent = isBookingConversation && hasName && hasContact && hasDay && hasTime;
+        const allFieldsPresent      = isBookingConversation && hasName && hasContact && hasDay && hasTime;
 
-        const completion = await groq.chat.completions.create({
-            model:    modelId,
+        const choice = await callLLM({
+            modelKey,
             messages: [
                 { role: 'system', content: sysPrompt },
                 ...safeHistory,
-                { role: 'user', content: userMsg }
+                { role: 'user', content: userMsg },
             ],
-            tools: [{
-                type: 'function',
-                function: {
-                    name: 'appointmentBooking',
-                    description: 'Book an appointment. Call ONLY when you have confirmed: full name, contact info, date, AND an explicit time from the user.',
-                    parameters: {
-                        type: 'object',
-                        properties: {
-                            userName:        { type: 'string', description: 'Full name of the customer' },
-                            contactInfo:     { type: 'string', description: 'Email or phone number' },
-                            appointmentDay:  { type: 'string', description: 'Date or day of the appointment' },
-                            appointmentTime: { type: 'string', description: 'Exact time as stated by the user' }
-                        },
-                        required: ['userName', 'contactInfo', 'appointmentDay', 'appointmentTime']
-                    }
-                }
-            }],
-            tool_choice: allFieldsPresent
-                ? { type: 'function', function: { name: 'appointmentBooking' } }
-                : 'auto',
-            temperature: 0.3,
-            max_tokens:  600
+            allFieldsPresent,
         });
-
-        const choice = completion.choices[0]?.message;
 
         // Safety net: catch leaked JSON
         if (choice?.content && !choice?.tool_calls) {
@@ -792,13 +777,13 @@ OTHER RULES:
                     const leaked = JSON.parse(jsonMatch[0]);
                     if (leaked.userName && leaked.contactInfo && leaked.appointmentDay && leaked.appointmentTime) {
                         choice.tool_calls = [{ function: { name: 'appointmentBooking', arguments: JSON.stringify(leaked) } }];
-                        choice.content = null;
+                        choice.content    = null;
                     }
                 } catch { /* not valid JSON */ }
             }
         }
 
-        // ── Handle booking tool call ──────────────────────────────────────────
+        // ── Handle booking tool call ──────────────────────────────────
         if (choice?.tool_calls?.[0]?.function?.name === 'appointmentBooking') {
             let args;
             try { args = JSON.parse(choice.tool_calls[0].function.arguments); }
@@ -809,13 +794,13 @@ OTHER RULES:
             if (!appointmentTime || appointmentTime.trim() === '' || /^tbd$/i.test(appointmentTime.trim())) {
                 return res.json({
                     success: true,
-                    answer: `Got it! Just one more thing — what time works best for you on ${appointmentDay}?`
+                    answer:  `Got it! Just one more thing — what time works best for you on ${appointmentDay}?`,
                 });
             }
             if (!userName || !contactInfo || !appointmentDay) {
                 return res.json({
                     success: true,
-                    answer: 'I need your name, contact info, preferred date and time to complete the booking. What would you like to provide?'
+                    answer:  'I need your name, contact info, preferred date and time to complete the booking. What would you like to provide?',
                 });
             }
 
@@ -826,20 +811,13 @@ OTHER RULES:
                 const userSnap     = await db.collection('users').doc(ownerEmail).get();
                 const integrations = userSnap.exists ? (userSnap.data()?.integrations || {}) : {};
                 if (integrations.google_calendar?.connected) {
-                    const avail = await checkCalendarAvailability(
-                        integrations.google_calendar, dateISO, appointmentTime, ownerEmail, db
-                    );
+                    const avail = await checkCalendarAvailability(integrations.google_calendar, dateISO, appointmentTime, ownerEmail, db);
                     if (!avail.available) {
-                        const alts = avail.suggestedTimes || [];
+                        const alts    = avail.suggestedTimes || [];
                         const altText = alts.length > 0
-                            ? '\n\nHere are 3 available slots on that day:\n' +
-                              alts.map((t, i) => `  ${i + 1}. ${t}`).join('\n') +
-                              '\n\nWhich one works for you?'
+                            ? '\n\nHere are 3 available slots on that day:\n' + alts.map((t, i) => `  ${i + 1}. ${t}`).join('\n') + '\n\nWhich one works for you?'
                             : '\n\nWould you like to pick a different date or time?';
-                        return res.json({
-                            success: true,
-                            answer: `Sorry, ${appointmentTime} on ${appointmentDay} is already booked.${altText}`
-                        });
+                        return res.json({ success: true, answer: `Sorry, ${appointmentTime} on ${appointmentDay} is already booked.${altText}` });
                     }
                 }
             }
@@ -849,29 +827,21 @@ OTHER RULES:
                 customerName: userName, contactInfo,
                 appointmentDay, appointmentTime, scheduledDate: dateISO,
                 status: 'confirmed', createdAt: new Date().toISOString(),
-                googleCalendarEventId: null
+                googleCalendarEventId: null,
             };
 
             const apptDocRef = await db.collection('appointments').add(appt);
             await db.collection('user_bots').doc(businessId).collection('appointments').add({ ...appt, globalId: apptDocRef.id });
 
-            // Google Calendar event
             if (ownerEmail) {
                 const userSnap     = await db.collection('users').doc(ownerEmail).get();
                 const integrations = userSnap.exists ? (userSnap.data()?.integrations || {}) : {};
                 if (integrations.google_calendar?.connected) {
                     try {
                         const calResult = await addCalendarEvent(integrations.google_calendar, appt, ownerEmail, db);
-                        if (calResult?.eventId) {
-                            await apptDocRef.update({ googleCalendarEventId: calResult.eventId });
-                        }
-                    }
-                    catch (e) { console.error('[Chat/Calendar]', e.message); }
+                        if (calResult?.eventId) await apptDocRef.update({ googleCalendarEventId: calResult.eventId });
+                    } catch (e) { console.error('[Chat/Calendar]', e.message); }
                 }
-            }
-
-            // Push notification
-            if (ownerEmail) {
                 try { await sendFCMToUser(ownerEmail, buildBookingNotification(appt)); }
                 catch (e) { console.error('[FCM] Booking notify error:', e.message); }
             }
@@ -886,7 +856,7 @@ OTHER RULES:
                 `👤 Name:     ${userName}`,
                 `📧 Contact:  ${contactInfo}`,
                 '',
-                'Reply with "CANCEL" to cancel or "EDIT" to change a detail.'
+                'Reply with "CANCEL" to cancel or "EDIT" to change a detail.',
             ].join('\n');
 
             return res.json({ success: true, answer, reply: answer });
@@ -901,8 +871,8 @@ OTHER RULES:
         console.error('[Chat]', err.message);
         return res.status(500).json({
             success: false,
-            answer: 'Something went wrong. Please try again.',
-            reply:  'Something went wrong.'
+            answer:  'Something went wrong. Please try again.',
+            reply:   'Something went wrong.',
         });
     }
 }
@@ -967,9 +937,7 @@ async function handleGoogleCallback(req, res) {
         const parsed = JSON.parse(Buffer.from(state, 'base64').toString('utf-8'));
         email  = parsed.email;
         origin = parsed.origin;
-    } catch {
-        return res.status(400).send('Invalid state parameter.');
-    }
+    } catch { return res.status(400).send('Invalid state parameter.'); }
 
     const clientId     = process.env.GOOGLE_CLIENT_ID;
     const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
@@ -979,32 +947,30 @@ async function handleGoogleCallback(req, res) {
 
     try {
         const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
-            method: 'POST',
+            method:  'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: new URLSearchParams({
+            body:    new URLSearchParams({
                 code, client_id: clientId, client_secret: clientSecret,
-                redirect_uri: redirectUri, grant_type: 'authorization_code'
-            })
+                redirect_uri: redirectUri, grant_type: 'authorization_code',
+            }),
         });
 
         const tokens = await tokenRes.json();
         if (tokens.error) return res.status(400).send(`Token error: ${tokens.error_description || tokens.error}`);
 
-        // Fetch user's Google profile to get calendar label
         let calendarLabel = email;
         try {
             const profileRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
-                headers: { Authorization: `Bearer ${tokens.access_token}` }
+                headers: { Authorization: `Bearer ${tokens.access_token}` },
             });
             const profile = await profileRes.json();
             calendarLabel = profile.email || email;
-        } catch (e) { /* best-effort */ }
+        } catch { /* best-effort */ }
 
-        const db = getDb();
+        const db       = getDb();
         const userSnap = await db.collection('users').doc(email).get();
         const existing = userSnap.exists ? (userSnap.data()?.integrations?.google_calendar_accounts || []) : [];
 
-        // Store this account in an array so multiple accounts are supported
         const newAccount = {
             email:         calendarLabel,
             connected:     true,
@@ -1013,25 +979,22 @@ async function handleGoogleCallback(req, res) {
             expiry_date:   tokens.expires_in
                 ? new Date(Date.now() + tokens.expires_in * 1000).toISOString()
                 : new Date(Date.now() + 3600 * 1000).toISOString(),
-            connectedAt:   new Date().toISOString()
+            connectedAt: new Date().toISOString(),
         };
 
-        // Upsert by email
         const idx = existing.findIndex(a => a.email === calendarLabel);
-        if (idx >= 0) existing[idx] = newAccount;
-        else existing.push(newAccount);
+        if (idx >= 0) existing[idx] = newAccount; else existing.push(newAccount);
 
         await db.collection('users').doc(email).set({
             integrations: {
-                // Keep legacy single-account field for backwards-compat with chat handler
                 google_calendar: {
                     connected:     true,
                     access_token:  tokens.access_token,
                     refresh_token: tokens.refresh_token || null,
-                    expiry_date:   newAccount.expiry_date
+                    expiry_date:   newAccount.expiry_date,
                 },
-                google_calendar_accounts: existing
-            }
+                google_calendar_accounts: existing,
+            },
         }, { merge: true });
 
         const appUrl = origin ||
@@ -1039,7 +1002,6 @@ async function handleGoogleCallback(req, res) {
                        `https://${req.headers.host.replace('comex-backend', 'cometchat-ai-platform').replace('.vercel.app', '.web.app')}`;
 
         return res.redirect(302, `${appUrl}?calendar_connected=1`);
-
     } catch (err) {
         console.error('[OAuth/Google]', err.message);
         return res.status(500).send(`Server error: ${err.message}`);
@@ -1054,7 +1016,7 @@ async function logChat(db, businessId, convId, question, answer, isGenuineQuery,
     try {
         await db.collection('user_bots').doc(businessId).collection('chats').add({
             conversationId: convId, question, answer, isGenuineQuery, isLeadCaptured,
-            createdAt: new Date().toISOString()
+            createdAt: new Date().toISOString(),
         });
     } catch (e) { console.warn('[Chat] Log error:', e.message); }
 }
@@ -1072,9 +1034,9 @@ function resolveDay(dayName) {
     if (lower === 'tomorrow') { const d = new Date(); d.setDate(d.getDate()+1); return fmt(d); }
 
     const months = {
-        january:0, february:1, march:2, april:3, may:4, june:5,
-        july:6, august:7, september:8, october:9, november:10, december:11,
-        jan:0, feb:1, mar:2, apr:3, jun:5, jul:6, aug:7, sep:8, oct:9, nov:10, dec:11
+        january:0,february:1,march:2,april:3,may:4,june:5,
+        july:6,august:7,september:8,october:9,november:10,december:11,
+        jan:0,feb:1,mar:2,apr:3,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11,
     };
 
     const dmy = lower.match(/^(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]+)(?:\s+(\d{4}))?$/);
@@ -1099,7 +1061,7 @@ function resolveDay(dayName) {
         }
     }
 
-    const days = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
+    const days    = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
     const cleaned = lower.replace(/^next\s+/, '').trim();
     const target  = days.indexOf(cleaned);
     if (target !== -1) {
@@ -1125,7 +1087,7 @@ function parseTime(timeStr) {
     if (s === 'midnight')               return { h: 0,  min: 0 };
     const m = s.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/);
     if (m) {
-        let h = parseInt(m[1], 10);
+        let h   = parseInt(m[1], 10);
         const min = parseInt(m[2] || '0', 10);
         if (m[3] === 'pm' && h !== 12) h += 12;
         if (m[3] === 'am' && h === 12) h  = 0;
@@ -1149,14 +1111,14 @@ async function refreshTokenIfNeeded(googleAuth, ownerEmail, db) {
         const expiryMs = new Date(googleAuth.expiry_date).getTime();
         if (!isNaN(expiryMs) && expiryMs < Date.now() + 60000) {
             const r = await fetch('https://oauth2.googleapis.com/token', {
-                method: 'POST',
+                method:  'POST',
                 headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                body: new URLSearchParams({
+                body:    new URLSearchParams({
                     client_id:     process.env.GOOGLE_CLIENT_ID,
                     client_secret: process.env.GOOGLE_CLIENT_SECRET,
                     refresh_token: googleAuth.refresh_token,
-                    grant_type:    'refresh_token'
-                })
+                    grant_type:    'refresh_token',
+                }),
             });
             const t = await r.json();
             if (t.access_token) {
@@ -1164,7 +1126,7 @@ async function refreshTokenIfNeeded(googleAuth, ownerEmail, db) {
                 await db.collection('users').doc(ownerEmail).update({
                     'integrations.google_calendar.access_token': t.access_token,
                     'integrations.google_calendar.expiry_date':
-                        new Date(Date.now() + (t.expires_in || 3500) * 1000).toISOString()
+                        new Date(Date.now() + (t.expires_in || 3500) * 1000).toISOString(),
                 });
             }
         }
@@ -1188,7 +1150,7 @@ async function checkCalendarAvailability(googleAuth, dateISO, timeStr, ownerEmai
             const naive = new Date(localStr + 'Z');
             const fmt   = new Intl.DateTimeFormat('en-CA', {
                 timeZone: tz, year:'numeric', month:'2-digit', day:'2-digit',
-                hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false
+                hour:'2-digit', minute:'2-digit', second:'2-digit', hour12: false,
             });
             const parts = fmt.formatToParts(naive);
             const get   = type => parseInt(parts.find(p => p.type === type)?.value || '0', 10);
@@ -1209,7 +1171,7 @@ async function checkCalendarAvailability(googleAuth, dateISO, timeStr, ownerEmai
         );
         if (!r.ok) return { available: true };
 
-        const events = (await r.json()).items || [];
+        const events   = (await r.json()).items || [];
         const isBooked = events.some(ev => {
             const evS = new Date(ev.start?.dateTime || ev.start?.date);
             const evE = new Date(ev.end?.dateTime   || ev.end?.date);
@@ -1217,9 +1179,9 @@ async function checkCalendarAvailability(googleAuth, dateISO, timeStr, ownerEmai
         });
         if (!isBooked) return { available: true };
 
-        const booked = events.map(ev => ({
+        const booked      = events.map(ev => ({
             start: new Date(ev.start?.dateTime || ev.start?.date),
-            end:   new Date(ev.end?.dateTime   || ev.end?.date)
+            end:   new Date(ev.end?.dateTime   || ev.end?.date),
         }));
         const suggestions = [];
         for (let sh = 9; sh < 18 && suggestions.length < 3; sh++) {
@@ -1253,14 +1215,14 @@ async function addCalendarEvent(googleAuth, appt, ownerEmail, db) {
     const localEnd = `${appt.scheduledDate}T${String(endH).padStart(2,'0')}:${String(endMin).padStart(2,'0')}:00`;
 
     const r = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
-        method: 'POST',
+        method:  'POST',
         headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+        body:    JSON.stringify({
             summary:     `Appointment: ${appt.customerName}`,
             description: `Contact: ${appt.contactInfo}\nBooked via Comex AI`,
             start: { dateTime: localStart, timeZone },
-            end:   { dateTime: localEnd,   timeZone }
-        })
+            end:   { dateTime: localEnd,   timeZone },
+        }),
     });
     const data = await r.json();
     if (!r.ok) { console.error('[Calendar] Event error:', data.error?.message); return null; }
@@ -1279,14 +1241,14 @@ async function updateCalendarEvent(googleAuth, eventId, appt, ownerEmail, db) {
     const localEnd = `${appt.scheduledDate}T${String(endH).padStart(2,'0')}:${String(endMin).padStart(2,'0')}:00`;
 
     const r = await fetch(`https://www.googleapis.com/calendar/v3/calendars/primary/events/${eventId}`, {
-        method: 'PATCH',
+        method:  'PATCH',
         headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+        body:    JSON.stringify({
             summary:     `Appointment: ${appt.customerName}`,
             description: `Contact: ${appt.contactInfo}\nBooked via Comex AI`,
             start: { dateTime: localStart, timeZone },
-            end:   { dateTime: localEnd,   timeZone }
-        })
+            end:   { dateTime: localEnd,   timeZone },
+        }),
     });
     if (!r.ok) {
         const d = await r.json();
