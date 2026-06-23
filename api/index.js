@@ -32,23 +32,31 @@ function cors(res) {
 
 /**
  * Models are served via:
- *  - Groq: fast open-source inference (LLaMA, Gemma on Groq, Mistral, Qwen)
+ *  - Groq: fast open-source inference (LLaMA, GPT-OSS, Qwen — all on Groq's LPU hardware)
+ *  - Mistral AI: native API (uses MISTRAL_API_KEY) — NOT available on Groq anymore
  *  - Google AI Studio: Gemini 2.5 Flash (uses GOOGLE_AI_STUDIO_API_KEY)
  *
- * All models share identical system prompt + tool-calling behaviour as LLaMA.
- * Gemini uses the Google AI Studio REST API (OpenAI-compatible endpoint).
+ * IMPORTANT: Groq periodically deprecates model IDs without much notice.
+ * Every ID below was verified live against https://console.groq.com/docs/models
+ * on 2026-06-23. Old IDs that no longer exist on Groq (mistral-saba-24b,
+ * gemma2-9b-it, qwen-qwq-32b, llama3-groq-70b-8192-tool-use-preview) have been
+ * removed — calling them returns a model_decommissioned error, which is why
+ * picking "Mistral" (or several others) previously failed silently.
+ *
+ * All models share identical system prompt + tool-calling behaviour.
+ * Gemini and Mistral use their native OpenAI-compatible REST endpoints.
  */
 const MODEL_REGISTRY = {
-    // ── Groq-hosted models ────────────────────────────────────────────────
-    'llama-3.3-70b':     { id: 'llama-3.3-70b-versatile',                provider: 'groq',   label: 'Meta LLaMA 3.3 70B'              },
-    'llama-3.1-8b':      { id: 'llama-3.1-8b-instant',                   provider: 'groq',   label: 'Meta LLaMA 3.1 8B (Fast)'        },
-    'gemma-3-27b':       { id: 'gemma2-9b-it',                           provider: 'groq',   label: 'Google Gemma 2 9B'               },
-    'mistral-saba':      { id: 'mistral-saba-24b',                       provider: 'groq',   label: 'Mistral Saba 24B'                },
-    'qwen-3-32b':        { id: 'qwen-qwq-32b',                          provider: 'groq',   label: 'Alibaba Qwen QwQ 32B'            },
-    'groq-llama-tool':   { id: 'llama3-groq-70b-8192-tool-use-preview',  provider: 'groq',   label: 'Tool-Optimized LLaMA 70B'        },
-    'openai-gpt4o-mini': { id: 'llama-3.3-70b-versatile',               provider: 'groq',   label: 'GPT-4o Mini Compatible (LLaMA)'  },
-    // ── Google AI Studio ──────────────────────────────────────────────────
-    'gemini-2.5-flash':  { id: 'gemini-2.5-flash',                       provider: 'google', label: 'Gemini 2.5 Flash'                },
+    // ── Groq-hosted models (production) ───────────────────────────────────
+    'llama-3.3-70b':     { id: 'llama-3.3-70b-versatile', provider: 'groq',    label: 'Meta LLaMA 3.3 70B'      },
+    'llama-3.1-8b':      { id: 'llama-3.1-8b-instant',    provider: 'groq',    label: 'Meta LLaMA 3.1 8B (Fast)' },
+    'gpt-oss-120b':      { id: 'openai/gpt-oss-120b',     provider: 'groq',    label: 'OpenAI GPT-OSS 120B'     },
+    'gpt-oss-20b':       { id: 'openai/gpt-oss-20b',      provider: 'groq',    label: 'OpenAI GPT-OSS 20B (Fast)' },
+    // ── Mistral AI (native API — Mistral is no longer hosted on Groq) ─────
+    'mistral-large':     { id: 'mistral-large-latest',    provider: 'mistral', label: 'Mistral Large'           },
+    'mistral-small':     { id: 'mistral-small-latest',    provider: 'mistral', label: 'Mistral Small (Fast)'    },
+    // ── Google AI Studio ───────────────────────────────────────────────────
+    'gemini-2.5-flash':  { id: 'gemini-2.5-flash',        provider: 'google',  label: 'Gemini 2.5 Flash'        },
 };
 
 const DEFAULT_MODEL_KEY = 'llama-3.3-70b';
@@ -127,6 +135,54 @@ async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent }) {
             max_tokens:  600,
         });
         return completion.choices[0]?.message || {};
+    }
+
+    // ── Mistral AI (native API — OpenAI-compatible endpoint) ──────────────
+    if (entry.provider === 'mistral') {
+        const apiKey = process.env.MISTRAL_API_KEY;
+        if (!apiKey) throw new Error('MISTRAL_API_KEY not set.');
+
+        const body = {
+            model:       entry.id,
+            messages,
+            tools:       [BOOKING_TOOL_DEF],
+            tool_choice: allFieldsPresent
+                ? { type: 'function', function: { name: 'appointmentBooking' } }
+                : 'auto',
+            temperature: 0.3,
+            max_tokens:  600,
+        };
+
+        const r = await fetch('https://api.mistral.ai/v1/chat/completions', {
+            method:  'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${apiKey}`,
+            },
+            body: JSON.stringify(body),
+        });
+
+        if (!r.ok) {
+            const err = await r.text();
+            throw new Error(`Mistral AI error ${r.status}: ${err}`);
+        }
+
+        const data = await r.json();
+        const msg  = data.choices?.[0]?.message || {};
+
+        // Mistral's tool_calls arguments are sometimes returned as an object
+        // instead of a JSON string (unlike Groq/OpenAI) — normalise to string
+        // so the shared parsing logic downstream works unchanged.
+        if (Array.isArray(msg.tool_calls)) {
+            msg.tool_calls = msg.tool_calls.map(tc => {
+                if (tc?.function && typeof tc.function.arguments !== 'string') {
+                    return { ...tc, function: { ...tc.function, arguments: JSON.stringify(tc.function.arguments) } };
+                }
+                return tc;
+            });
+        }
+
+        return msg;
     }
 
     // ── Google AI Studio (OpenAI-compatible endpoint) ─────────────────────
