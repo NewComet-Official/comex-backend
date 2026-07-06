@@ -1,27 +1,12 @@
 {
   "version": 2,
   "routes": [
-    {
-      "source": "/widget.js",
-      "dest": "/public/widget.js"
-    },
-    {
-      "source": "/api/oauth/google/callback",
-      "dest": "/api/oauth/google/callback.js"
+    { "source": "/widget.js",
+    "dest": "/public/widget.js"
     },
     {
       "source": "/api/(.*)",
-      "dest": "/api/$1.js"
-    }
-  ],
-  "crons": [
-    {
-      "path": "/api/security/scan-accounts",
-      "schedule": "*/30 * * * *"
-    },
-    {
-      "path": "/api/security/purge-accounts",
-      "schedule": "0 * * * *"
+      "dest": "/api/index.js" 
     }
   ]
 }
