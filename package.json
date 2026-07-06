@@ -1,9 +1,15 @@
 {
-  "name": "comex-backend",
-  "version": "1.0.0",
-  "type": "module",
-  "dependencies": {
-    "firebase-admin": "^12.0.0",
-    "groq-sdk": "^0.5.0"
-  }
+  "version": 2,
+  "routes": [
+    { "source": "/widget.js",
+    "dest": "/public/widget.js"
+    },
+    {
+      "source": "/api/(.*)",
+      "dest": "/api/index.js" 
+    }
+  ],
+  "crons": [
+    { "path": "/api/cron/daily-sweep", "schedule": "0 3 * * *" }
+  ]
 }
