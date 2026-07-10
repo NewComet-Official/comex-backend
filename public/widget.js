@@ -305,8 +305,8 @@
     welcomeCard.innerHTML = `
         <p>Hello! Welcome to our automated support helper. Choose a quick question below or type your inquiry natively.</p>
         <div class="cc-suggested-grid">
-            <div class="cc-suggested-chip" data-msg="What services do you offer?"><img src="https://github.com/NewComet-Official/comex-backend/blob/main/ask_services.png" width="35" height="35"> What services do you offer?</div>
-            <div class="cc-suggested-chip" data-msg="Speak to human support"><img src="https://github.com/NewComet-Official/comex-backend/blob/main/connect_human.png" width="35" height="35">
+            <div class="cc-suggested-chip" data-msg="What services do you offer?"><img src="https://index-cfr.pages.dev/ask_services.png" width="35" height="35"> What services do you offer?</div>
+            <div class="cc-suggested-chip" data-msg="Speak to human support"><img src="https://index-cfr.pages.dev/connect_human.png" width="35" height="35">
  Connect to human agent</div>
         </div>
     `;
