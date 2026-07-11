@@ -35,38 +35,18 @@ function cors(res) {
 // MULTI-MODEL LLM ROUTER
 // ════════════════════════════════════════════════════════════════════════════
 
-/**
- * Models are served via:
- *  - Groq: fast open-source inference (LLaMA, GPT-OSS, Qwen — all on Groq's LPU hardware)
- *  - Mistral AI: native API (uses MISTRAL_API_KEY) — NOT available on Groq anymore
- *  - Google AI Studio: Gemini 2.5 Flash (uses GOOGLE_AI_STUDIO_API_KEY)
- *
- * IMPORTANT: Groq periodically deprecates model IDs without much notice.
- * Every ID below was verified live against https://console.groq.com/docs/models
- * on 2026-06-23. Old IDs that no longer exist on Groq (mistral-saba-24b,
- * gemma2-9b-it, qwen-qwq-32b, llama3-groq-70b-8192-tool-use-preview) have been
- * removed — calling them returns a model_decommissioned error, which is why
- * picking "Mistral" (or several others) previously failed silently.
- *
- * All models share identical system prompt + tool-calling behaviour.
- * Gemini and Mistral use their native OpenAI-compatible REST endpoints.
- */
 const MODEL_REGISTRY = {
-    // ── Groq-hosted models (production) ───────────────────────────────────
     'llama-3.3-70b':     { id: 'llama-3.3-70b-versatile', provider: 'groq',    label: 'Meta LLaMA 3.3 70B'      },
     'llama-3.1-8b':      { id: 'llama-3.1-8b-instant',    provider: 'groq',    label: 'Meta LLaMA 3.1 8B (Fast)' },
     'gpt-oss-120b':      { id: 'openai/gpt-oss-120b',     provider: 'groq',    label: 'OpenAI GPT-OSS 120B'     },
     'gpt-oss-20b':       { id: 'openai/gpt-oss-20b',      provider: 'groq',    label: 'OpenAI GPT-OSS 20B (Fast)' },
-    // ── Mistral AI (native API — Mistral is no longer hosted on Groq) ─────
     'mistral-large':     { id: 'mistral-large-latest',    provider: 'mistral', label: 'Mistral Large'           },
     'mistral-small':     { id: 'mistral-small-latest',    provider: 'mistral', label: 'Mistral Small (Fast)'    },
-    // ── Google AI Studio ───────────────────────────────────────────────────
     'gemini-2.5-flash':  { id: 'gemini-2.5-flash',        provider: 'google',  label: 'Gemini 2.5 Flash'        },
 };
 
 const DEFAULT_MODEL_KEY = 'llama-3.3-70b';
 
-/** Shared system prompt additions injected for every model. */
 const BOOKING_SYSTEM_SUFFIX = `
 
 PERSONALITY & BEHAVIOR:
@@ -95,7 +75,6 @@ OTHER RULES:
 - Never re-ask for information already given in conversation history.
 - Once you have all 4 fields confirmed, immediately call the appointmentBooking tool.`;
 
-/** The tool definition shared across all providers. */
 const BOOKING_TOOL_DEF = {
     type: 'function',
     function: {
@@ -114,14 +93,6 @@ const BOOKING_TOOL_DEF = {
     },
 };
 
-// ════════════════════════════════════════════════════════════════════════════
-// PROVIDER ABSTRACTION — identical interface for all models
-// ════════════════════════════════════════════════════════════════════════════
-
-/**
- * Call the correct provider for the given model key.
- * Returns { content, tool_calls } — same shape regardless of provider.
- */
 async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent, enableBookingTool }) {
     const entry = MODEL_REGISTRY[modelKey] || MODEL_REGISTRY[DEFAULT_MODEL_KEY];
     const tools = enableBookingTool ? [BOOKING_TOOL_DEF] : undefined;
@@ -129,7 +100,6 @@ async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent, enabl
         ? (allFieldsPresent ? { type: 'function', function: { name: 'appointmentBooking' } } : 'auto')
         : undefined;
 
-    // ── Groq ──────────────────────────────────────────────────────────────
     if (entry.provider === 'groq') {
         if (!process.env.GROQ_API_KEY) throw new Error('GROQ_API_KEY not set.');
         const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
@@ -143,7 +113,6 @@ async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent, enabl
         return completion.choices[0]?.message || {};
     }
 
-    // ── Mistral AI (native API — OpenAI-compatible endpoint) ──────────────
     if (entry.provider === 'mistral') {
         const apiKey = process.env.MISTRAL_API_KEY;
         if (!apiKey) throw new Error('MISTRAL_API_KEY not set.');
@@ -173,9 +142,6 @@ async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent, enabl
         const data = await r.json();
         const msg  = data.choices?.[0]?.message || {};
 
-        // Mistral's tool_calls arguments are sometimes returned as an object
-        // instead of a JSON string (unlike Groq/OpenAI) — normalise to string
-        // so the shared parsing logic downstream works unchanged.
         if (Array.isArray(msg.tool_calls)) {
             msg.tool_calls = msg.tool_calls.map(tc => {
                 if (tc?.function && typeof tc.function.arguments !== 'string') {
@@ -188,7 +154,6 @@ async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent, enabl
         return msg;
     }
 
-    // ── Google AI Studio (OpenAI-compatible endpoint) ─────────────────────
     if (entry.provider === 'google') {
         const apiKey = process.env.GOOGLE_AI_STUDIO_API_KEY;
         if (!apiKey) throw new Error('GOOGLE_AI_STUDIO_API_KEY not set.');
@@ -251,6 +216,14 @@ export default async function handler(req, res) {
     if (path === '/api/bot/delete-cascade')       return handleBotDeleteCascade(req, res);
     if (path === '/api/account/delete-cascade')   return handleAccountDeleteCascade(req, res);
 
+    // ── Database source integrations (Firebase Project / Supabase) ────────
+    if (path === '/api/oauth/firebase-project')          return handleFirebaseProjectOAuth(req, res);
+    if (path === '/api/oauth/firebase-project/callback')  return handleFirebaseProjectCallback(req, res);
+    if (path === '/api/oauth/supabase')                   return handleSupabaseOAuth(req, res);
+    if (path === '/api/oauth/supabase/callback')          return handleSupabaseCallback(req, res);
+    if (path === '/api/integrations/list-projects')       return handleListProjects(req, res);
+    if (path === '/api/integrations/disconnect-database')  return handleDisconnectDatabase(req, res);
+
     return res.status(404).json({ success: false, message: `Unknown route: ${path}` });
 }
 
@@ -270,7 +243,6 @@ async function handleModels(req, res) {
 // CASCADE-DELETE HELPERS
 // ════════════════════════════════════════════════════════════════════════════
 
-/** Deletes every document returned by a query, in batches, recursively (handles >500 docs). */
 async function deleteQueryBatch(db, queryRef, batchSize = 400) {
     let deleted = 0;
     // eslint-disable-next-line no-constant-condition
@@ -286,18 +258,10 @@ async function deleteQueryBatch(db, queryRef, batchSize = 400) {
     return deleted;
 }
 
-/** Deletes a subcollection under a parent doc ref entirely. */
 async function deleteSubcollection(db, parentRef, subName) {
     return deleteQueryBatch(db, parentRef.collection(subName));
 }
 
-/**
- * Fully wipes a single bot: its own doc, its subcollections (chats, appointments,
- * reports), and every top-level document elsewhere in the database that
- * references this businessId (top-level appointments, reports, leads).
- * This is what makes "permanent delete" actually permanent, and what stops a
- * newly-created bot with the same name (same slug id) from inheriting old data.
- */
 async function wipeBotCompletely(db, botId) {
     const botRef = db.collection('user_bots').doc(botId);
 
@@ -325,8 +289,6 @@ async function handleBotDeleteCascade(req, res) {
         const db = getDb();
         const botSnap = await db.collection('user_bots').doc(businessId).get();
 
-        // Only the owner may wipe their own bot. If the doc is already gone
-        // (e.g. a retry), still clean up any orphaned data for that id.
         if (botSnap.exists && botSnap.data()?.owner !== ownerEmail) {
             return res.status(403).json({ success: false, message: 'You do not own this agent.' });
         }
@@ -351,30 +313,22 @@ async function handleAccountDeleteCascade(req, res) {
     try {
         const db = getDb();
 
-        // Wipe every bot this user owns (each bot wipe also clears its
-        // top-level appointments/reports/leads/subcollections).
         const botsSnap = await db.collection('user_bots').where('owner', '==', email).get();
         for (const d of botsSnap.docs) {
             await wipeBotCompletely(db, d.id);
         }
 
-        // Catch any appointments/reports/leads left over that reference this
-        // owner directly (defensive — in case a bot doc was already missing).
         await deleteQueryBatch(db, db.collection('appointments').where('owner', '==', email));
         await deleteQueryBatch(db, db.collection('reports').where('owner', '==', email));
         await deleteQueryBatch(db, db.collection('leads').where('owner', '==', email));
 
-        // Wipe the user profile doc (fcm tokens, integrations, etc.)
         await db.collection('users').doc(email).delete().catch(() => {});
 
-        // Best-effort: also remove the Firebase Auth user via Admin SDK, so the
-        // account is gone even if the client-side reauth/delete step fails.
         try {
             const authAdmin = getAuthAdmin();
             const userRecord = await authAdmin.getUserByEmail(email);
             await authAdmin.deleteUser(userRecord.uid);
         } catch (e) {
-            // Non-fatal: client already handles its own Auth deletion+reauth flow.
             console.warn('[AccountDeleteCascade] Auth admin delete skipped:', e.message);
         }
 
@@ -802,6 +756,19 @@ async function handleChat(req, res) {
             if (kc.fileContents) {
                 sysPrompt += `\n\n[REFERENCE DOCUMENTS]:\n${String(kc.fileContents).substring(0, 6000)}`;
             }
+
+            // ── Database sources (Firebase Project / Supabase) ──────────────
+            // NOTE — PHASE 1 STUB: we only tell the model *that* a database is
+            // connected, we do not read its live contents yet. Doing that for
+            // real (potentially huge Postgres/Firestore projects) requires the
+            // RAG pipeline (chunk → embed → vector search) described in
+            // knowledgeContext.databaseSources — this is intentionally left as
+            // a follow-up so we don't silently pretend to read data we aren't.
+            const dbSources = kc.databaseSources || [];
+            if (dbSources.length) {
+                const list = dbSources.map(s => `- ${s.service} project "${s.projectName || s.projectId}"`).join('\n');
+                sysPrompt += `\n\n[CONNECTED DATABASES]:\nThe following databases are linked to this agent, but live querying is not yet wired up:\n${list}\nIf asked about live data in these databases, say that live database lookups are coming soon rather than guessing.`;
+            }
         }
 
         // ── Behavior toggles: out-of-topic / web search / hallucination ────
@@ -816,7 +783,6 @@ async function handleChat(req, res) {
             ? `\n- If you do not know the exact answer, you may provide your best reasonable guess, but keep it plausible.`
             : `\n- If you do not know the answer or it is not in the provided context, honestly say you don't have that information instead of guessing or making something up.`;
 
-        // Append booking suffix + tool ONLY if appointment booking is enabled
         const bookingEnabled = !!behaviorConfig.allowAppointmentBooking;
         if (bookingEnabled) {
             sysPrompt += BOOKING_SYSTEM_SUFFIX;
@@ -824,7 +790,6 @@ async function handleChat(req, res) {
             sysPrompt += `\n\n- Appointment booking is DISABLED for this agent. If a user asks to book an appointment, politely let them know booking isn't available here and offer to help another way.`;
         }
 
-        // ── CANCEL / EDIT INTENT DETECTION ────────────────────────────────
         const msgLower = userMsg.toLowerCase().trim();
 
         const isCancelConfirm = bookingEnabled && (/^(yes,?\s*)?(please\s+)?(cancel|delete|remove)\s*(it|this|the appointment|my appointment)?\.?$/i.test(msgLower) ||
@@ -857,14 +822,12 @@ async function handleChat(req, res) {
             return null;
         }
 
-        // ── HANDLE: User says "CANCEL" ─────────────────────────────────
         if (isCancelIntent && !isPendingCancel) {
             const reply = `Are you sure you want to cancel your appointment? Type "YES, CANCEL" to confirm, or "no" to keep it.`;
             await logChat(db, businessId, convId, userMsg, reply, false, false);
             return res.json({ success: true, answer: reply, reply });
         }
 
-        // ── HANDLE: User confirms cancellation ─────────────────────────
         if (bookingEnabled && ((isCancelConfirm && isPendingCancel) || (msgLower === 'yes, cancel' || msgLower === 'yes cancel'))) {
             const appt = await findConversationAppointment();
             if (!appt) {
@@ -905,14 +868,12 @@ async function handleChat(req, res) {
             }
         }
 
-        // ── HANDLE: User says "EDIT" ───────────────────────────────────
         if (isEditIntent && !isPendingEdit && !isPendingEditValue) {
             const reply = `Which detail would you like to change?\n\n1. **Name**\n2. **Contact info** (email/phone)\n3. **Date**\n4. **Time**\n\nPlease type the number or the field name.`;
             await logChat(db, businessId, convId, userMsg, reply, false, false);
             return res.json({ success: true, answer: reply, reply });
         }
 
-        // ── HANDLE: User picked a field ────────────────────────────────
         if (isPendingEdit && !isPendingEditValue) {
             const fieldMap = {
                 '1': 'customerName',    'name':    'customerName',
@@ -932,7 +893,6 @@ async function handleChat(req, res) {
             return res.json({ success: true, answer: reply, reply, _editField: field });
         }
 
-        // ── HANDLE: User provides new value ───────────────────────────
         if (isPendingEditValue) {
             const fieldHint = lastAssistantMsg.match(/change the (name|contact info|date|time) to/i)?.[1];
             const fieldMap2 = { 'name': 'customerName', 'contact info': 'contactInfo', 'date': 'appointmentDay', 'time': 'appointmentTime' };
@@ -964,7 +924,6 @@ async function handleChat(req, res) {
             }
         }
 
-        // ── NORMAL CHAT — call the selected model ───────────────────────
         const allText    = [...safeHistory.map(m => m.content), userMsg].join('\n');
         const allTextLow = allText.toLowerCase();
 
@@ -991,7 +950,6 @@ async function handleChat(req, res) {
             enableBookingTool: bookingEnabled,
         });
 
-        // Safety net: catch leaked JSON
         if (bookingEnabled && choice?.content && !choice?.tool_calls) {
             const jsonMatch = choice.content.match(/\{[\s\S]*?"userName"[\s\S]*?"contactInfo"[\s\S]*?\}/);
             if (jsonMatch) {
@@ -1005,7 +963,6 @@ async function handleChat(req, res) {
             }
         }
 
-        // ── Handle booking tool call ──────────────────────────────────
         if (bookingEnabled && choice?.tool_calls?.[0]?.function?.name === 'appointmentBooking') {
             let args;
             try { args = JSON.parse(choice.tool_calls[0].function.arguments); }
@@ -1028,7 +985,6 @@ async function handleChat(req, res) {
 
             const dateISO = resolveDay(appointmentDay);
 
-            // Availability check
             if (ownerEmail) {
                 const userSnap     = await db.collection('users').doc(ownerEmail).get();
                 const integrations = userSnap.exists ? (userSnap.data()?.integrations || {}) : {};
@@ -1084,7 +1040,6 @@ async function handleChat(req, res) {
             return res.json({ success: true, answer, reply: answer });
         }
 
-        // Plain reply
         const answer = choice?.content?.trim() || 'How can I help you?';
         await logChat(db, businessId, convId, userMsg, answer, true, false);
         return res.json({ success: true, answer, reply: answer });
@@ -1180,7 +1135,7 @@ async function handleReportSubmit(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// GOOGLE OAUTH
+// GOOGLE OAUTH (Calendar)
 // ════════════════════════════════════════════════════════════════════════════
 async function handleGoogleOAuth(req, res) {
     const { email, origin } = req.query;
@@ -1283,6 +1238,299 @@ async function handleGoogleCallback(req, res) {
         console.error('[OAuth/Google]', err.message);
         return res.status(500).send(`Server error: ${err.message}`);
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// FIREBASE PROJECT OAUTH (data source, NOT the calendar flow above)
+// Uses standard Google OAuth with Firebase Management + Cloud Platform
+// read-only scopes so we can list & later read a client's Firebase projects.
+// Requires the SAME Google OAuth client as Calendar (GOOGLE_CLIENT_ID/SECRET)
+// registered with these extra scopes enabled on the consent screen.
+// ════════════════════════════════════════════════════════════════════════════
+async function handleFirebaseProjectOAuth(req, res) {
+    const { email, origin } = req.query;
+    if (!email) return res.status(400).send('Missing email.');
+
+    const clientId    = process.env.GOOGLE_CLIENT_ID;
+    const redirectUri = process.env.GOOGLE_REDIRECT_URI_FIREBASE ||
+                        `https://${req.headers.host}/api/oauth/firebase-project/callback`;
+    if (!clientId) return res.status(500).send('Missing GOOGLE_CLIENT_ID env var.');
+
+    const state = Buffer.from(JSON.stringify({ email, origin: origin || null })).toString('base64');
+    const url   = new URL('https://accounts.google.com/o/oauth2/v2/auth');
+    url.searchParams.set('client_id',     clientId);
+    url.searchParams.set('redirect_uri',  redirectUri);
+    url.searchParams.set('response_type', 'code');
+    // read-only project listing + Firestore read access
+    url.searchParams.set('scope', [
+        'https://www.googleapis.com/auth/firebase.readonly',
+        'https://www.googleapis.com/auth/datastore.readonly',
+        'https://www.googleapis.com/auth/cloud-platform.read-only',
+    ].join(' '));
+    url.searchParams.set('access_type',   'offline');
+    url.searchParams.set('prompt',        'consent');
+    url.searchParams.set('state',         state);
+
+    return res.redirect(302, url.toString());
+}
+
+async function handleFirebaseProjectCallback(req, res) {
+    const { code, state, error } = req.query;
+    if (error) return res.status(400).send(`OAuth error: ${error}`);
+    if (!code || !state) return res.status(400).send('Missing code or state.');
+
+    let email = '', origin = null;
+    try {
+        const parsed = JSON.parse(Buffer.from(state, 'base64').toString('utf-8'));
+        email  = parsed.email;
+        origin = parsed.origin;
+    } catch { return res.status(400).send('Invalid state parameter.'); }
+
+    const clientId     = process.env.GOOGLE_CLIENT_ID;
+    const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+    const redirectUri  = process.env.GOOGLE_REDIRECT_URI_FIREBASE ||
+                         `https://${req.headers.host}/api/oauth/firebase-project/callback`;
+    if (!clientId || !clientSecret) return res.status(500).send('Missing Google OAuth env vars.');
+
+    try {
+        const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body:    new URLSearchParams({
+                code, client_id: clientId, client_secret: clientSecret,
+                redirect_uri: redirectUri, grant_type: 'authorization_code',
+            }),
+        });
+        const tokens = await tokenRes.json();
+        if (tokens.error) return res.status(400).send(`Token error: ${tokens.error_description || tokens.error}`);
+
+        let accountLabel = email;
+        try {
+            const profileRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+                headers: { Authorization: `Bearer ${tokens.access_token}` },
+            });
+            const profile = await profileRes.json();
+            accountLabel = profile.email || email;
+        } catch { /* best-effort */ }
+
+        const db = getDb();
+        await db.collection('users').doc(email).set({
+            integrations: {
+                firebase_project: {
+                    connected:     true,
+                    accountLabel,
+                    access_token:  tokens.access_token,
+                    refresh_token: tokens.refresh_token || null,
+                    expiry_date:   tokens.expires_in
+                        ? new Date(Date.now() + tokens.expires_in * 1000).toISOString()
+                        : new Date(Date.now() + 3600 * 1000).toISOString(),
+                    connectedAt: new Date().toISOString(),
+                },
+            },
+        }, { merge: true });
+
+        const appUrl = origin || process.env.APP_URL ||
+                       `https://${req.headers.host.replace('comex-backend', 'cometchat-ai-platform').replace('.vercel.app', '.web.app')}`;
+        return res.redirect(302, `${appUrl}?firebase_project_connected=1`);
+    } catch (err) {
+        console.error('[OAuth/FirebaseProject]', err.message);
+        return res.status(500).send(`Server error: ${err.message}`);
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// SUPABASE OAUTH (data source)
+// Requires a Supabase OAuth app registered at https://supabase.com/dashboard/org/_/apps
+// with SUPABASE_CLIENT_ID / SUPABASE_CLIENT_SECRET env vars.
+// ════════════════════════════════════════════════════════════════════════════
+async function handleSupabaseOAuth(req, res) {
+    const { email, origin } = req.query;
+    if (!email) return res.status(400).send('Missing email.');
+
+    const clientId    = process.env.SUPABASE_CLIENT_ID;
+    const redirectUri = process.env.SUPABASE_REDIRECT_URI ||
+                        `https://${req.headers.host}/api/oauth/supabase/callback`;
+    if (!clientId) return res.status(500).send('Missing SUPABASE_CLIENT_ID env var.');
+
+    const state = Buffer.from(JSON.stringify({ email, origin: origin || null })).toString('base64');
+    const url   = new URL('https://api.supabase.com/v1/oauth/authorize');
+    url.searchParams.set('client_id',     clientId);
+    url.searchParams.set('redirect_uri',  redirectUri);
+    url.searchParams.set('response_type', 'code');
+    url.searchParams.set('state',         state);
+
+    return res.redirect(302, url.toString());
+}
+
+async function handleSupabaseCallback(req, res) {
+    const { code, state, error } = req.query;
+    if (error) return res.status(400).send(`OAuth error: ${error}`);
+    if (!code || !state) return res.status(400).send('Missing code or state.');
+
+    let email = '', origin = null;
+    try {
+        const parsed = JSON.parse(Buffer.from(state, 'base64').toString('utf-8'));
+        email  = parsed.email;
+        origin = parsed.origin;
+    } catch { return res.status(400).send('Invalid state parameter.'); }
+
+    const clientId     = process.env.SUPABASE_CLIENT_ID;
+    const clientSecret  = process.env.SUPABASE_CLIENT_SECRET;
+    const redirectUri   = process.env.SUPABASE_REDIRECT_URI ||
+                          `https://${req.headers.host}/api/oauth/supabase/callback`;
+    if (!clientId || !clientSecret) return res.status(500).send('Missing Supabase OAuth env vars.');
+
+    try {
+        const tokenRes = await fetch('https://api.supabase.com/v1/oauth/token', {
+            method:  'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Authorization': 'Basic ' + Buffer.from(`${clientId}:${clientSecret}`).toString('base64'),
+            },
+            body: new URLSearchParams({
+                code, redirect_uri: redirectUri, grant_type: 'authorization_code',
+            }),
+        });
+        const tokens = await tokenRes.json();
+        if (tokens.error) return res.status(400).send(`Token error: ${tokens.error_description || tokens.error}`);
+
+        const db = getDb();
+        await db.collection('users').doc(email).set({
+            integrations: {
+                supabase: {
+                    connected:     true,
+                    access_token:  tokens.access_token,
+                    refresh_token: tokens.refresh_token || null,
+                    expiry_date:   tokens.expires_in
+                        ? new Date(Date.now() + tokens.expires_in * 1000).toISOString()
+                        : new Date(Date.now() + 3600 * 1000).toISOString(),
+                    connectedAt: new Date().toISOString(),
+                },
+            },
+        }, { merge: true });
+
+        const appUrl = origin || process.env.APP_URL ||
+                       `https://${req.headers.host.replace('comex-backend', 'cometchat-ai-platform').replace('.vercel.app', '.web.app')}`;
+        return res.redirect(302, `${appUrl}?supabase_connected=1`);
+    } catch (err) {
+        console.error('[OAuth/Supabase]', err.message);
+        return res.status(500).send(`Server error: ${err.message}`);
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/integrations/list-projects?service=firebase|supabase&ownerEmail=...
+// Lists the projects available under the connected account so the "Configure
+// New Agent" flow can offer a project picker.
+// ════════════════════════════════════════════════════════════════════════════
+async function handleListProjects(req, res) {
+    const { service, ownerEmail } = req.query;
+    if (!service || !ownerEmail)
+        return res.status(400).json({ success: false, message: 'Missing service or ownerEmail.' });
+
+    try {
+        const db = getDb();
+        const userSnap = await db.collection('users').doc(ownerEmail).get();
+        const integrations = userSnap.exists ? (userSnap.data()?.integrations || {}) : {};
+
+        if (service === 'firebase') {
+            const fb = integrations.firebase_project;
+            if (!fb?.connected) return res.status(400).json({ success: false, message: 'Firebase not connected.' });
+
+            const accessToken = await refreshGenericGoogleToken(fb, ownerEmail, db, 'firebase_project');
+            const r = await fetch('https://firebase.googleapis.com/v1beta1/projects', {
+                headers: { Authorization: `Bearer ${accessToken}` },
+            });
+            if (!r.ok) {
+                const errBody = await r.text();
+                return res.status(502).json({ success: false, message: `Firebase API error: ${errBody}` });
+            }
+            const data = await r.json();
+            const projects = (data.results || []).map(p => ({
+                id:   p.projectId,
+                name: p.displayName || p.projectId,
+            }));
+            return res.json({ success: true, projects });
+        }
+
+        if (service === 'supabase') {
+            const sb = integrations.supabase;
+            if (!sb?.connected) return res.status(400).json({ success: false, message: 'Supabase not connected.' });
+
+            const r = await fetch('https://api.supabase.com/v1/projects', {
+                headers: { Authorization: `Bearer ${sb.access_token}` },
+            });
+            if (!r.ok) {
+                const errBody = await r.text();
+                return res.status(502).json({ success: false, message: `Supabase API error: ${errBody}` });
+            }
+            const data = await r.json();
+            const projects = (Array.isArray(data) ? data : []).map(p => ({
+                id:   p.id,
+                name: p.name || p.id,
+            }));
+            return res.json({ success: true, projects });
+        }
+
+        return res.status(400).json({ success: false, message: `Unknown service: ${service}` });
+    } catch (err) {
+        console.error('[ListProjects]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/integrations/disconnect-database  { ownerEmail, service }
+// ════════════════════════════════════════════════════════════════════════════
+async function handleDisconnectDatabase(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { ownerEmail, service } = req.body || {};
+    if (!ownerEmail || !service)
+        return res.status(400).json({ success: false, message: 'Missing ownerEmail or service.' });
+
+    const fieldMap = { firebase: 'firebase_project', supabase: 'supabase' };
+    const field = fieldMap[service];
+    if (!field) return res.status(400).json({ success: false, message: `Unknown service: ${service}` });
+
+    try {
+        const db = getDb();
+        await db.collection('users').doc(ownerEmail).set({
+            integrations: { [field]: null },
+        }, { merge: true });
+        return res.json({ success: true });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+/** Generic Google token refresh, shared by any integration stored under integrations.<key> with the same token shape. */
+async function refreshGenericGoogleToken(authObj, ownerEmail, db, key) {
+    let accessToken = authObj.access_token;
+    if (authObj.refresh_token && authObj.expiry_date) {
+        const expiryMs = new Date(authObj.expiry_date).getTime();
+        if (!isNaN(expiryMs) && expiryMs < Date.now() + 60000) {
+            const r = await fetch('https://oauth2.googleapis.com/token', {
+                method:  'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body:    new URLSearchParams({
+                    client_id:     process.env.GOOGLE_CLIENT_ID,
+                    client_secret: process.env.GOOGLE_CLIENT_SECRET,
+                    refresh_token: authObj.refresh_token,
+                    grant_type:    'refresh_token',
+                }),
+            });
+            const t = await r.json();
+            if (t.access_token) {
+                accessToken = t.access_token;
+                await db.collection('users').doc(ownerEmail).update({
+                    [`integrations.${key}.access_token`]: t.access_token,
+                    [`integrations.${key}.expiry_date`]:
+                        new Date(Date.now() + (t.expires_in || 3500) * 1000).toISOString(),
+                });
+            }
+        }
+    }
+    return accessToken;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
