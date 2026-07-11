@@ -117,8 +117,12 @@ const BOOKING_TOOL_DEF = {
  * Call the correct provider for the given model key.
  * Returns { content, tool_calls } — same shape regardless of provider.
  */
-async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent }) {
+async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent, enableBookingTool }) {
     const entry = MODEL_REGISTRY[modelKey] || MODEL_REGISTRY[DEFAULT_MODEL_KEY];
+    const tools = enableBookingTool ? [BOOKING_TOOL_DEF] : undefined;
+    const toolChoiceValue = enableBookingTool
+        ? (allFieldsPresent ? { type: 'function', function: { name: 'appointmentBooking' } } : 'auto')
+        : undefined;
 
     // ── Groq ──────────────────────────────────────────────────────────────
     if (entry.provider === 'groq') {
@@ -127,10 +131,7 @@ async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent }) {
         const completion = await groq.chat.completions.create({
             model:       entry.id,
             messages,
-            tools:       [BOOKING_TOOL_DEF],
-            tool_choice: allFieldsPresent
-                ? { type: 'function', function: { name: 'appointmentBooking' } }
-                : 'auto',
+            ...(tools ? { tools, tool_choice: toolChoiceValue } : {}),
             temperature: 0.3,
             max_tokens:  600,
         });
@@ -145,10 +146,7 @@ async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent }) {
         const body = {
             model:       entry.id,
             messages,
-            tools:       [BOOKING_TOOL_DEF],
-            tool_choice: allFieldsPresent
-                ? { type: 'function', function: { name: 'appointmentBooking' } }
-                : 'auto',
+            ...(tools ? { tools, tool_choice: toolChoiceValue } : {}),
             temperature: 0.3,
             max_tokens:  600,
         };
@@ -195,10 +193,7 @@ async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent }) {
         const body = {
             model:       entry.id,
             messages,
-            tools:       [BOOKING_TOOL_DEF],
-            tool_choice: allFieldsPresent
-                ? { type: 'function', function: { name: 'appointmentBooking' } }
-                : 'auto',
+            ...(tools ? { tools, tool_choice: toolChoiceValue } : {}),
             temperature: 0.3,
             max_tokens:  600,
         };
@@ -247,6 +242,7 @@ export default async function handler(req, res) {
     if (path === '/api/appointment/edit')         return handleAppointmentEdit(req, res);
     if (path === '/api/oauth/google')             return handleGoogleOAuth(req, res);
     if (path === '/api/oauth/google/callback')    return handleGoogleCallback(req, res);
+    if (path === '/api/report/submit')            return handleReportSubmit(req, res);
 
     return res.status(404).json({ success: false, message: `Unknown route: ${path}` });
 }
@@ -349,6 +345,15 @@ function buildEditNotification(appt, field, oldData, newData) {
         body:  `APPOINTMENT EDITED\n${appt.customerName} edited the ${label} from "${oldData}" to "${newData}"`,
         url:   '/?view=analytics',
         tag:   'comex-appointment-edit',
+    };
+}
+
+function buildReportNotification(botName, writtenReport) {
+    return {
+        title: '🚩 New Bot Report',
+        body:  `A user reported an answer from "${botName}": ${String(writtenReport || '').substring(0, 120)}`,
+        url:   '/?view=reports',
+        tag:   'comex-report',
     };
 }
 
@@ -605,13 +610,23 @@ async function handleConfig(req, res) {
         if (!snap.exists) return res.status(404).json({ success: false, error: 'Bot not found.' });
         const b = snap.data();
         return res.status(200).json({
-            success:      true,
-            name:         b.name                     || 'AI Assistant',
-            position:     b.position                 || 'bottom-right',
-            logoBase64:   b.logoBase64               || null,
-            themeColor:   b.designConfig?.themeColor || '#0f172a',
-            designConfig: b.designConfig             || {},
-            modelKey:     b.modelKey                 || DEFAULT_MODEL_KEY,
+            success:         true,
+            name:            b.name                     || 'AI Assistant',
+            position:        b.position                 || 'bottom-right',
+            logoBase64:      b.logoBase64               || null,
+            themeColor:      b.designConfig?.themeColor || '#0f172a',
+            designConfig:    b.designConfig             || {},
+            modelKey:        b.modelKey                 || DEFAULT_MODEL_KEY,
+            behaviorConfig:  Object.assign({
+                allowOutOfTopic:      true,
+                allowWebSearch:       true,
+                allowHallucination:   false,
+                allowAppointmentBooking: false,
+            }, b.behaviorConfig || {}),
+            messageConfig:   Object.assign({
+                user: { showTime: true, editMessage: true, copy: true },
+                bot:  { showTime: true, copy: true, regenerate: true, report: true },
+            }, b.messageConfig || {}),
         });
     } catch (err) {
         console.error('[Config]', err.message);
@@ -639,12 +654,19 @@ async function handleChat(req, res) {
         let sysPrompt  = 'You are a helpful, friendly customer service assistant.';
         let ownerEmail = '', botName = 'Assistant';
         let modelKey   = DEFAULT_MODEL_KEY;
+        let behaviorConfig = {
+            allowOutOfTopic: true,
+            allowWebSearch: true,
+            allowHallucination: false,
+            allowAppointmentBooking: false,
+        };
 
         if (botSnap.exists) {
             const b  = botSnap.data();
             ownerEmail = b.owner    || '';
             botName    = b.name     || 'Assistant';
             modelKey   = b.modelKey || DEFAULT_MODEL_KEY;
+            behaviorConfig = Object.assign(behaviorConfig, b.behaviorConfig || {});
             const kc   = b.knowledgeContext || {};
             if (kc.systemPrompt) {
                 sysPrompt = kc.systemPrompt;
@@ -656,22 +678,39 @@ async function handleChat(req, res) {
             }
         }
 
-        // Append shared booking/personality suffix to ALL models
-        sysPrompt += BOOKING_SYSTEM_SUFFIX;
+        // ── Behavior toggles: out-of-topic / web search / hallucination ────
+        sysPrompt += `\n\nBEHAVIOR SETTINGS:`;
+        sysPrompt += behaviorConfig.allowOutOfTopic
+            ? `\n- You MAY answer casual, general-knowledge, or out-of-topic questions (e.g. "What is Google?") in a friendly way, even if unrelated to the business.`
+            : `\n- You must ONLY answer questions related to this business/agent's knowledge base. If the user asks an unrelated, casual, or general-knowledge question, politely explain you can only help with questions about this business and steer them back.`;
+        sysPrompt += behaviorConfig.allowWebSearch
+            ? `\n- You may reason as if you have broad general knowledge of the world to help answer questions beyond the provided context.`
+            : `\n- Do NOT claim to search the web or provide information beyond the given business context and your own reliable general knowledge; if you don't have the information in your context, say so.`;
+        sysPrompt += behaviorConfig.allowHallucination
+            ? `\n- If you do not know the exact answer, you may provide your best reasonable guess, but keep it plausible.`
+            : `\n- If you do not know the answer or it is not in the provided context, honestly say you don't have that information instead of guessing or making something up.`;
+
+        // Append booking suffix + tool ONLY if appointment booking is enabled
+        const bookingEnabled = !!behaviorConfig.allowAppointmentBooking;
+        if (bookingEnabled) {
+            sysPrompt += BOOKING_SYSTEM_SUFFIX;
+        } else {
+            sysPrompt += `\n\n- Appointment booking is DISABLED for this agent. If a user asks to book an appointment, politely let them know booking isn't available here and offer to help another way.`;
+        }
 
         // ── CANCEL / EDIT INTENT DETECTION ────────────────────────────────
         const msgLower = userMsg.toLowerCase().trim();
 
-        const isCancelConfirm = /^(yes,?\s*)?(please\s+)?(cancel|delete|remove)\s*(it|this|the appointment|my appointment)?\.?$/i.test(msgLower) ||
-                                 /^(confirm cancel|yes cancel|cancel confirmed|go ahead and cancel)\.?$/i.test(msgLower);
-        const isCancelIntent  = /\bcancel\b/.test(msgLower) && !isCancelConfirm;
-        const isEditIntent    = /\b(edit|change|update|modify|reschedule)\b/.test(msgLower);
+        const isCancelConfirm = bookingEnabled && (/^(yes,?\s*)?(please\s+)?(cancel|delete|remove)\s*(it|this|the appointment|my appointment)?\.?$/i.test(msgLower) ||
+                                 /^(confirm cancel|yes cancel|cancel confirmed|go ahead and cancel)\.?$/i.test(msgLower));
+        const isCancelIntent  = bookingEnabled && /\bcancel\b/.test(msgLower) && !isCancelConfirm;
+        const isEditIntent    = bookingEnabled && /\b(edit|change|update|modify|reschedule)\b/.test(msgLower);
 
         const safeHistory = (Array.isArray(history) ? history : []).slice(-12).filter(m => m?.role && m?.content);
         const lastAssistantMsg = [...safeHistory].reverse().find(m => m.role === 'assistant')?.content || '';
-        const isPendingCancel     = /confirm.*cancel|type.*yes.*cancel|cancel.*confirm/i.test(lastAssistantMsg);
-        const isPendingEdit       = /which.*field|what.*change|name.*contact.*date.*time/i.test(lastAssistantMsg);
-        const isPendingEditValue  = /new.*value|what.*would.*you.*like.*change.*to|enter.*new/i.test(lastAssistantMsg);
+        const isPendingCancel     = bookingEnabled && /confirm.*cancel|type.*yes.*cancel|cancel.*confirm/i.test(lastAssistantMsg);
+        const isPendingEdit       = bookingEnabled && /which.*field|what.*change|name.*contact.*date.*time/i.test(lastAssistantMsg);
+        const isPendingEditValue  = bookingEnabled && /new.*value|what.*would.*you.*like.*change.*to|enter.*new/i.test(lastAssistantMsg);
 
         async function findConversationAppointment() {
             const apptSnap = await db.collection('appointments')
@@ -700,7 +739,7 @@ async function handleChat(req, res) {
         }
 
         // ── HANDLE: User confirms cancellation ─────────────────────────
-        if ((isCancelConfirm && isPendingCancel) || (msgLower === 'yes, cancel' || msgLower === 'yes cancel')) {
+        if (bookingEnabled && ((isCancelConfirm && isPendingCancel) || (msgLower === 'yes, cancel' || msgLower === 'yes cancel'))) {
             const appt = await findConversationAppointment();
             if (!appt) {
                 const reply = "I couldn't find an active appointment to cancel. Please contact us directly.";
@@ -812,7 +851,7 @@ async function handleChat(req, res) {
                            /\b(morning|afternoon|evening|noon|midday|midnight)\b/i.test(allTextLow) ||
                            /\b([01]?\d|2[0-3]):[0-5]\d\b/.test(allText);
 
-        const isBookingConversation = /\b(book|schedule|appointment|slot|reserve|set up|fix a)\b/i.test(allTextLow);
+        const isBookingConversation = bookingEnabled && /\b(book|schedule|appointment|slot|reserve|set up|fix a)\b/i.test(allTextLow);
         const allFieldsPresent      = isBookingConversation && hasName && hasContact && hasDay && hasTime;
 
         const choice = await callLLM({
@@ -823,10 +862,11 @@ async function handleChat(req, res) {
                 { role: 'user', content: userMsg },
             ],
             allFieldsPresent,
+            enableBookingTool: bookingEnabled,
         });
 
         // Safety net: catch leaked JSON
-        if (choice?.content && !choice?.tool_calls) {
+        if (bookingEnabled && choice?.content && !choice?.tool_calls) {
             const jsonMatch = choice.content.match(/\{[\s\S]*?"userName"[\s\S]*?"contactInfo"[\s\S]*?\}/);
             if (jsonMatch) {
                 try {
@@ -840,7 +880,7 @@ async function handleChat(req, res) {
         }
 
         // ── Handle booking tool call ──────────────────────────────────
-        if (choice?.tool_calls?.[0]?.function?.name === 'appointmentBooking') {
+        if (bookingEnabled && choice?.tool_calls?.[0]?.function?.name === 'appointmentBooking') {
             let args;
             try { args = JSON.parse(choice.tool_calls[0].function.arguments); }
             catch { return res.json({ success: true, answer: 'Could you confirm your booking details again?' }); }
@@ -954,6 +994,61 @@ async function handleROI(req, res) {
         const resolutionRate = genuine > 0 ? Math.round(((genuine - leads) / genuine) * 100) : 100;
         return res.json({ success: true, totalConversations: total, hoursSaved, moneySaved, leadsCaptured: leads, resolutionRate });
     } catch (err) {
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// REPORTS & FEEDBACK
+// ════════════════════════════════════════════════════════════════════════════
+async function handleReportSubmit(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const {
+        businessId, conversationId, email, countryCode, mobileNumber,
+        writtenReport, botMessage, feedbackRating,
+    } = req.body || {};
+
+    if (!businessId || !email || !mobileNumber || !writtenReport || !botMessage)
+        return res.status(400).json({ success: false, message: 'Missing required report fields.' });
+
+    try {
+        const db = getDb();
+        const botSnap = await db.collection('user_bots').doc(businessId).get();
+        if (!botSnap.exists) return res.status(404).json({ success: false, message: 'Agent not found.' });
+
+        const b = botSnap.data();
+        const owner   = b.owner || '';
+        const botName = b.name  || 'Assistant';
+
+        let rating = null;
+        if (feedbackRating !== undefined && feedbackRating !== null && feedbackRating !== '') {
+            const n = parseInt(feedbackRating, 10);
+            if (!isNaN(n) && n >= 1 && n <= 5) rating = n;
+        }
+
+        const report = {
+            businessId, botName, owner,
+            conversationId: conversationId || null,
+            email: String(email).trim(),
+            countryCode: String(countryCode || '').trim(),
+            mobileNumber: String(mobileNumber).trim(),
+            writtenReport: String(writtenReport).trim(),
+            botMessage: String(botMessage).trim(),
+            feedbackRating: rating,
+            createdAt: new Date().toISOString(),
+        };
+
+        const ref = await db.collection('reports').add(report);
+        await db.collection('user_bots').doc(businessId).collection('reports').add({ ...report, globalId: ref.id });
+
+        if (owner) {
+            await sendFCMToUser(owner, buildReportNotification(botName, writtenReport))
+                .catch(e => console.error('[Report/FCM]', e.message));
+        }
+
+        return res.json({ success: true, message: 'Report submitted. Thank you for the feedback.' });
+    } catch (err) {
+        console.error('[ReportSubmit]', err.message);
         return res.status(500).json({ success: false, message: err.message });
     }
 }
