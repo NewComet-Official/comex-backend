@@ -20,6 +20,11 @@ function getMessaging() {
     return admin.messaging();
 }
 
+function getAuthAdmin() {
+    if (!admin.apps.length) getDb();
+    return admin.auth();
+}
+
 function cors(res) {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -243,6 +248,8 @@ export default async function handler(req, res) {
     if (path === '/api/oauth/google')             return handleGoogleOAuth(req, res);
     if (path === '/api/oauth/google/callback')    return handleGoogleCallback(req, res);
     if (path === '/api/report/submit')            return handleReportSubmit(req, res);
+    if (path === '/api/bot/delete-cascade')       return handleBotDeleteCascade(req, res);
+    if (path === '/api/account/delete-cascade')   return handleAccountDeleteCascade(req, res);
 
     return res.status(404).json({ success: false, message: `Unknown route: ${path}` });
 }
@@ -257,6 +264,125 @@ async function handleModels(req, res) {
         provider: val.provider,
     }));
     return res.json({ success: true, models });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// CASCADE-DELETE HELPERS
+// ════════════════════════════════════════════════════════════════════════════
+
+/** Deletes every document returned by a query, in batches, recursively (handles >500 docs). */
+async function deleteQueryBatch(db, queryRef, batchSize = 400) {
+    let deleted = 0;
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+        const snap = await queryRef.limit(batchSize).get();
+        if (snap.empty) break;
+        const batch = db.batch();
+        snap.docs.forEach(d => batch.delete(d.ref));
+        await batch.commit();
+        deleted += snap.size;
+        if (snap.size < batchSize) break;
+    }
+    return deleted;
+}
+
+/** Deletes a subcollection under a parent doc ref entirely. */
+async function deleteSubcollection(db, parentRef, subName) {
+    return deleteQueryBatch(db, parentRef.collection(subName));
+}
+
+/**
+ * Fully wipes a single bot: its own doc, its subcollections (chats, appointments,
+ * reports), and every top-level document elsewhere in the database that
+ * references this businessId (top-level appointments, reports, leads).
+ * This is what makes "permanent delete" actually permanent, and what stops a
+ * newly-created bot with the same name (same slug id) from inheriting old data.
+ */
+async function wipeBotCompletely(db, botId) {
+    const botRef = db.collection('user_bots').doc(botId);
+
+    await deleteSubcollection(db, botRef, 'chats');
+    await deleteSubcollection(db, botRef, 'appointments');
+    await deleteSubcollection(db, botRef, 'reports');
+
+    await deleteQueryBatch(db, db.collection('appointments').where('businessId', '==', botId));
+    await deleteQueryBatch(db, db.collection('reports').where('businessId', '==', botId));
+    await deleteQueryBatch(db, db.collection('leads').where('businessId', '==', botId));
+
+    await botRef.delete().catch(() => {});
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/bot/delete-cascade  — permanently wipes a bot and ALL of its data
+// ════════════════════════════════════════════════════════════════════════════
+async function handleBotDeleteCascade(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { businessId, ownerEmail } = req.body || {};
+    if (!businessId || !ownerEmail)
+        return res.status(400).json({ success: false, message: 'Missing businessId or ownerEmail.' });
+
+    try {
+        const db = getDb();
+        const botSnap = await db.collection('user_bots').doc(businessId).get();
+
+        // Only the owner may wipe their own bot. If the doc is already gone
+        // (e.g. a retry), still clean up any orphaned data for that id.
+        if (botSnap.exists && botSnap.data()?.owner !== ownerEmail) {
+            return res.status(403).json({ success: false, message: 'You do not own this agent.' });
+        }
+
+        await wipeBotCompletely(db, businessId);
+
+        return res.json({ success: true, message: 'Agent and all associated data permanently deleted.' });
+    } catch (err) {
+        console.error('[BotDeleteCascade]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/account/delete-cascade — permanently wipes a user + everything they own
+// ════════════════════════════════════════════════════════════════════════════
+async function handleAccountDeleteCascade(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { email } = req.body || {};
+    if (!email) return res.status(400).json({ success: false, message: 'Missing email.' });
+
+    try {
+        const db = getDb();
+
+        // Wipe every bot this user owns (each bot wipe also clears its
+        // top-level appointments/reports/leads/subcollections).
+        const botsSnap = await db.collection('user_bots').where('owner', '==', email).get();
+        for (const d of botsSnap.docs) {
+            await wipeBotCompletely(db, d.id);
+        }
+
+        // Catch any appointments/reports/leads left over that reference this
+        // owner directly (defensive — in case a bot doc was already missing).
+        await deleteQueryBatch(db, db.collection('appointments').where('owner', '==', email));
+        await deleteQueryBatch(db, db.collection('reports').where('owner', '==', email));
+        await deleteQueryBatch(db, db.collection('leads').where('owner', '==', email));
+
+        // Wipe the user profile doc (fcm tokens, integrations, etc.)
+        await db.collection('users').doc(email).delete().catch(() => {});
+
+        // Best-effort: also remove the Firebase Auth user via Admin SDK, so the
+        // account is gone even if the client-side reauth/delete step fails.
+        try {
+            const authAdmin = getAuthAdmin();
+            const userRecord = await authAdmin.getUserByEmail(email);
+            await authAdmin.deleteUser(userRecord.uid);
+        } catch (e) {
+            // Non-fatal: client already handles its own Auth deletion+reauth flow.
+            console.warn('[AccountDeleteCascade] Auth admin delete skipped:', e.message);
+        }
+
+        return res.json({ success: true, message: 'Account and all associated data permanently deleted.' });
+    } catch (err) {
+        console.error('[AccountDeleteCascade]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
