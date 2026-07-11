@@ -212,6 +212,7 @@ export default async function handler(req, res) {
     if (path === '/api/appointment/edit')         return handleAppointmentEdit(req, res);
     if (path === '/api/oauth/google')             return handleGoogleOAuth(req, res);
     if (path === '/api/oauth/google/callback')    return handleGoogleCallback(req, res);
+    if (path === '/api/disconnect-calendar')      return handleDisconnectCalendar(req, res);
     if (path === '/api/report/submit')            return handleReportSubmit(req, res);
     if (path === '/api/bot/delete-cascade')       return handleBotDeleteCascade(req, res);
     if (path === '/api/account/delete-cascade')   return handleAccountDeleteCascade(req, res);
@@ -1241,6 +1242,58 @@ async function handleGoogleCallback(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// POST /api/disconnect-calendar  { userEmail, calendarId? , all? }
+// Frontend already called this route; it never existed on the backend, so
+// clicking "Disconnect" on the calendar card was silently failing. Fixing
+// that here since it's part of the same connections page.
+// ════════════════════════════════════════════════════════════════════════════
+async function handleDisconnectCalendar(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { userEmail, calendarId, all } = req.body || {};
+    if (!userEmail) return res.status(400).json({ success: false, message: 'Missing userEmail.' });
+
+    try {
+        const db = getDb();
+        const userRef = db.collection('users').doc(userEmail);
+
+        if (all) {
+            await userRef.set({
+                integrations: { google_calendar: null, google_calendar_accounts: [] },
+            }, { merge: true });
+            return res.json({ success: true, message: 'All Google Calendars disconnected.' });
+        }
+
+        if (!calendarId)
+            return res.status(400).json({ success: false, message: 'Missing calendarId.' });
+
+        const snap = await userRef.get();
+        const existing = snap.exists ? (snap.data()?.integrations?.google_calendar_accounts || []) : [];
+        const remaining = existing.filter(a => a.email !== calendarId);
+
+        // Keep the flattened `google_calendar` field (used for booking/availability
+        // checks) pointed at whichever account is left, or clear it if none remain.
+        const newPrimary = remaining[0] || null;
+
+        await userRef.set({
+            integrations: {
+                google_calendar_accounts: remaining,
+                google_calendar: newPrimary ? {
+                    connected:     true,
+                    access_token:  newPrimary.access_token,
+                    refresh_token: newPrimary.refresh_token || null,
+                    expiry_date:   newPrimary.expiry_date,
+                } : null,
+            },
+        }, { merge: true });
+
+        return res.json({ success: true, message: 'Calendar disconnected.' });
+    } catch (err) {
+        console.error('[DisconnectCalendar]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // FIREBASE PROJECT OAUTH (data source, NOT the calendar flow above)
 // Uses standard Google OAuth with Firebase Management + Cloud Platform
 // read-only scopes so we can list & later read a client's Firebase projects.
@@ -1261,10 +1314,14 @@ async function handleFirebaseProjectOAuth(req, res) {
     url.searchParams.set('client_id',     clientId);
     url.searchParams.set('redirect_uri',  redirectUri);
     url.searchParams.set('response_type', 'code');
-    // read-only project listing + Firestore read access
+    // Phase 1 only lists projects — no data-read scope requested yet.
+    // (There is no "datastore.readonly" scope; reading Firestore/RTDB data
+    // for real in a later phase will require the broader
+    // 'https://www.googleapis.com/auth/cloud-platform' or
+    // 'https://www.googleapis.com/auth/datastore' scope, which needs a
+    // fresh consent + re-connect once that phase is built.)
     url.searchParams.set('scope', [
         'https://www.googleapis.com/auth/firebase.readonly',
-        'https://www.googleapis.com/auth/datastore.readonly',
         'https://www.googleapis.com/auth/cloud-platform.read-only',
     ].join(' '));
     url.searchParams.set('access_type',   'offline');
