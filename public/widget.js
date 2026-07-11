@@ -28,6 +28,16 @@
             sendButtonStyle: 'icon',
             loadingAnim:      'dots',
             voiceEnabled:    false
+        },
+        behaviorConfig: {
+            allowOutOfTopic: true,
+            allowWebSearch: true,
+            allowHallucination: false,
+            allowAppointmentBooking: false
+        },
+        messageConfig: {
+            user: { showTime: true, editMessage: true, copy: true },
+            bot:  { showTime: true, copy: true, regenerate: true, report: true }
         }
     };
 
@@ -40,6 +50,13 @@
                 config.position    = result.position    || config.position;
                 config.logoBase64  = result.logoBase64  || config.logoBase64;
                 config.designConfig = { ...config.designConfig, ...(result.designConfig || {}) };
+                if (result.behaviorConfig) config.behaviorConfig = { ...config.behaviorConfig, ...result.behaviorConfig };
+                if (result.messageConfig) {
+                    config.messageConfig = {
+                        user: { ...config.messageConfig.user, ...(result.messageConfig.user || {}) },
+                        bot:  { ...config.messageConfig.bot,  ...(result.messageConfig.bot  || {}) }
+                    };
+                }
             }
         }
     } catch (err) {
@@ -47,6 +64,8 @@
     }
 
     const { themeColor, typebarSize, sendButtonStyle, loadingAnim, voiceEnabled } = config.designConfig;
+    const userMsgCfg = config.messageConfig.user;
+    const botMsgCfg  = config.messageConfig.bot;
 
     // ── Position Computations ────────────────────────────────────────────────
     const positions = {
@@ -173,7 +192,19 @@
             background: #ffffff; color: #1e293b; border-bottom-left-radius: 4px;
             border: 1px solid rgba(226,232,240,0.8); box-shadow: 0 8px 20px -4px rgba(15,23,42,0.04);
         }
-        .cc-meta { font-size: 11px; color: #94a3b8; margin-top: 6px; padding: 0 6px; font-weight: 500; }
+        .cc-meta-row { display: flex; align-items: center; gap: 10px; margin-top: 6px; padding: 0 6px; }
+        .cc-user .cc-meta-row { flex-direction: row-reverse; }
+        .cc-meta { font-size: 11px; color: #94a3b8; font-weight: 500; }
+        .cc-msg-actions { display: flex; align-items: center; gap: 4px; opacity: 0; transition: opacity 0.15s ease; }
+        .cc-bubble-container:hover .cc-msg-actions { opacity: 1; }
+        .cc-action-btn {
+            background: transparent; border: none; cursor: pointer; color: #94a3b8;
+            width: 22px; height: 22px; display: flex; align-items: center; justify-content: center;
+            border-radius: 6px; transition: background 0.15s, color 0.15s; padding: 0;
+        }
+        .cc-action-btn:hover { background: #e2e8f0; color: #334155; }
+        .cc-action-btn.cc-reported { color: #ef4444; }
+        .cc-action-btn svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
         
         .cc-footer {
             padding: 18px 24px; background: #ffffff; border-top: 1px solid #f1f5f9;
@@ -227,6 +258,41 @@
         .cc-brand-footer { text-align: center; font-size: 11px; color: #94a3b8; padding: 0 0 16px 0; background: #fff; font-weight: 600; letter-spacing: 0.02em; }
         .cc-brand-footer a { color: #64748b; text-decoration: none; font-weight: 700; transition: color 0.2s; }
         .cc-brand-footer a:hover { color: ${themeColor}; }
+
+        /* ── REPORT MODAL ── */
+        .cc-report-overlay {
+            position: fixed; inset: 0; background: rgba(2,6,23,0.55); z-index: 1000000;
+            display: flex; align-items: center; justify-content: center; padding: 20px;
+            font-family: 'Plus Jakarta Sans', -apple-system, sans-serif;
+        }
+        .cc-report-card {
+            background: #fff; border-radius: 20px; width: 100%; max-width: 400px;
+            max-height: 90vh; overflow-y: auto; padding: 26px; box-shadow: 0 20px 50px rgba(0,0,0,0.3);
+        }
+        .cc-report-card h3 { margin: 0 0 4px; font-size: 17px; color: #0f172a; font-weight: 800; }
+        .cc-report-card p.cc-rsub { margin: 0 0 18px; font-size: 12.5px; color: #64748b; font-weight: 500; }
+        .cc-rfield { margin-bottom: 14px; }
+        .cc-rfield label { display:block; font-size: 11.5px; font-weight: 700; color: #334155; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.03em; }
+        .cc-rfield input, .cc-rfield textarea {
+            width: 100%; border: 1.5px solid #e2e8f0; border-radius: 10px; padding: 10px 12px;
+            font-family: inherit; font-size: 13.5px; outline: none; box-sizing: border-box; resize: vertical;
+        }
+        .cc-rfield input:focus, .cc-rfield textarea:focus { border-color: ${themeColor}; }
+        .cc-rfield textarea[readonly] { background: #f8fafc; color: #64748b; }
+        .cc-rphone-row { display: flex; gap: 8px; }
+        .cc-rphone-row input:first-child { width: 78px; flex-shrink: 0; }
+        .cc-rstars { display: flex; gap: 6px; }
+        .cc-rstar { font-size: 24px; cursor: pointer; color: #e2e8f0; user-select: none; transition: color 0.15s, transform 0.1s; }
+        .cc-rstar.active { color: #f59e0b; }
+        .cc-rstar:hover { transform: scale(1.15); }
+        .cc-report-actions { display: flex; gap: 10px; margin-top: 20px; }
+        .cc-report-actions button {
+            flex: 1; padding: 12px; border-radius: 100px; font-weight: 700; font-size: 13.5px;
+            cursor: pointer; border: none; font-family: inherit;
+        }
+        .cc-rcancel { background: #f1f5f9; color: #475569; }
+        .cc-rsubmit { background: ${themeColor}; color: #fff; }
+        .cc-rerror { color: #ef4444; font-size: 12px; font-weight: 600; margin-top: -6px; margin-bottom: 12px; display: none; }
         
         @media (max-width: 480px) {
             #cc-widget-window {
@@ -372,7 +438,31 @@
         return clean.split('\n').map(line => line.trim() ? `<p>${line}</p>` : '').join('');
     }
 
-    function appendMsg(text, isUser) {
+    function copyToClipboard(text) {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).catch(() => _fallbackCopy(text));
+        } else {
+            _fallbackCopy(text);
+        }
+    }
+    function _fallbackCopy(text) {
+        const ta = document.createElement('textarea');
+        ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+        document.body.appendChild(ta); ta.focus(); ta.select();
+        try { document.execCommand('copy'); } catch (e) {}
+        document.body.removeChild(ta);
+    }
+
+    const ICONS = {
+        copy: `<svg viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>`,
+        check: `<svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"></polyline></svg>`,
+        edit: `<svg viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>`,
+        regen: `<svg viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"></polyline><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path></svg>`,
+        flag: `<svg viewBox="0 0 24 24"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"></path><line x1="4" y1="22" x2="4" y2="15"></line></svg>`
+    };
+
+    function appendMsg(text, isUser, opts) {
+        opts = opts || {};
         const container = document.createElement('div');
         container.className = `cc-bubble-container ${isUser ? 'cc-user' : 'cc-ai'}`;
         
@@ -384,18 +474,221 @@
         } else {
             bubbleEl.innerHTML = parseMarkdown(text);
         }
-        
-        const timeEl = document.createElement('div');
-        timeEl.className = 'cc-meta';
-        const now = new Date();
-        timeEl.textContent = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-        
         container.appendChild(bubbleEl);
-        container.appendChild(timeEl);
+
+        // ── Meta row: timestamp + action buttons ──
+        const metaCfg = isUser ? userMsgCfg : botMsgCfg;
+        const metaRow = document.createElement('div');
+        metaRow.className = 'cc-meta-row';
+
+        const actionsEl = document.createElement('div');
+        actionsEl.className = 'cc-msg-actions';
+
+        if (isUser) {
+            if (userMsgCfg.copy) {
+                const btn = document.createElement('button');
+                btn.className = 'cc-action-btn'; btn.title = 'Copy';
+                btn.innerHTML = ICONS.copy;
+                btn.onclick = () => {
+                    copyToClipboard(text);
+                    btn.innerHTML = ICONS.check;
+                    setTimeout(() => btn.innerHTML = ICONS.copy, 1200);
+                };
+                actionsEl.appendChild(btn);
+            }
+            if (userMsgCfg.editMessage) {
+                const btn = document.createElement('button');
+                btn.className = 'cc-action-btn'; btn.title = 'Edit message';
+                btn.innerHTML = ICONS.edit;
+                btn.onclick = () => {
+                    inputEl.value = text;
+                    inputEl.focus();
+                };
+                actionsEl.appendChild(btn);
+            }
+        } else {
+            if (botMsgCfg.copy) {
+                const btn = document.createElement('button');
+                btn.className = 'cc-action-btn'; btn.title = 'Copy';
+                btn.innerHTML = ICONS.copy;
+                btn.onclick = () => {
+                    copyToClipboard(text);
+                    btn.innerHTML = ICONS.check;
+                    setTimeout(() => btn.innerHTML = ICONS.copy, 1200);
+                };
+                actionsEl.appendChild(btn);
+            }
+            if (botMsgCfg.regenerate && !opts.noRegenerate) {
+                const btn = document.createElement('button');
+                btn.className = 'cc-action-btn'; btn.title = 'Regenerate answer';
+                btn.innerHTML = ICONS.regen;
+                btn.onclick = () => regenerateAnswer(container, bubbleEl, metaRow);
+                actionsEl.appendChild(btn);
+            }
+            if (botMsgCfg.report && !opts.noReport) {
+                const btn = document.createElement('button');
+                btn.className = 'cc-action-btn'; btn.title = 'Report this answer';
+                btn.innerHTML = ICONS.flag;
+                btn.onclick = () => openReportModal(text, btn);
+                actionsEl.appendChild(btn);
+            }
+        }
+
+        if (isUser) metaRow.appendChild(actionsEl);
+
+        if (metaCfg.showTime) {
+            const timeEl = document.createElement('div');
+            timeEl.className = 'cc-meta';
+            const now = new Date();
+            timeEl.textContent = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            metaRow.appendChild(timeEl);
+        }
+
+        if (!isUser) metaRow.appendChild(actionsEl);
+
+        container.appendChild(metaRow);
         
         chatBox.insertBefore(container, typingEl);
         chatBox.scrollTop = chatBox.scrollHeight;
-        return container;
+        return { container, bubbleEl };
+    }
+
+    // ── Regenerate: resend the last user message, replace this bot bubble ────
+    async function regenerateAnswer(container, bubbleEl, metaRow) {
+        const idx = chatHistory.length - 1;
+        // find last user message before this bot message
+        let lastUserContent = null;
+        for (let i = chatHistory.length - 1; i >= 0; i--) {
+            if (chatHistory[i].role === 'user') { lastUserContent = chatHistory[i].content; break; }
+        }
+        if (!lastUserContent) return;
+
+        bubbleEl.innerHTML = '<p style="opacity:.6;">Regenerating…</p>';
+
+        try {
+            const historyForCall = chatHistory.slice(0, -1); // drop the old assistant reply
+            const r = await fetch('https://comex-backend.vercel.app/api/chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    businessId, message: lastUserContent, conversationId,
+                    history: historyForCall.slice(-10)
+                })
+            });
+            const data = await r.json();
+            const reply = data.answer || data.reply || "Sorry, I couldn't process that.";
+            bubbleEl.innerHTML = parseMarkdown(reply);
+            if (chatHistory.length && chatHistory[chatHistory.length - 1].role === 'assistant') {
+                chatHistory[chatHistory.length - 1].content = reply;
+            } else {
+                chatHistory.push({ role: 'assistant', content: reply });
+            }
+        } catch (err) {
+            bubbleEl.innerHTML = '<p>Could not regenerate. Please try again.</p>';
+        }
+    }
+
+    // ── Report Modal ───────────────────────────────────────────────────────
+    function openReportModal(botMessageText, triggerBtn) {
+        const overlay = document.createElement('div');
+        overlay.className = 'cc-report-overlay';
+        overlay.innerHTML = `
+            <div class="cc-report-card">
+                <h3>Report this answer</h3>
+                <p class="cc-rsub">Help us improve by letting us know what went wrong.</p>
+                <div class="cc-rerror" id="ccRErr"></div>
+                <div class="cc-rfield">
+                    <label>Email *</label>
+                    <input type="email" id="ccREmail" placeholder="you@example.com">
+                </div>
+                <div class="cc-rfield">
+                    <label>Mobile Number *</label>
+                    <div class="cc-rphone-row">
+                        <input type="text" id="ccRCode" placeholder="+1">
+                        <input type="text" id="ccRPhone" placeholder="Mobile number">
+                    </div>
+                </div>
+                <div class="cc-rfield">
+                    <label>What went wrong? *</label>
+                    <textarea id="ccRText" rows="3" placeholder="Describe the issue with this answer..."></textarea>
+                </div>
+                <div class="cc-rfield">
+                    <label>Bot's Answer (auto-filled)</label>
+                    <textarea id="ccRBotMsg" rows="3" readonly></textarea>
+                </div>
+                <div class="cc-rfield">
+                    <label>Feedback Rating (optional)</label>
+                    <div class="cc-rstars" id="ccRStars">
+                        ${[1,2,3,4,5].map(n => `<span class="cc-rstar" data-v="${n}">★</span>`).join('')}
+                    </div>
+                </div>
+                <div class="cc-report-actions">
+                    <button class="cc-rcancel" id="ccRCancel">Cancel</button>
+                    <button class="cc-rsubmit" id="ccRSubmit">Submit Report</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(overlay);
+        overlay.querySelector('#ccRBotMsg').value = botMessageText;
+
+        let rating = 0;
+        overlay.querySelectorAll('.cc-rstar').forEach(star => {
+            star.onclick = () => {
+                rating = parseInt(star.getAttribute('data-v'), 10);
+                overlay.querySelectorAll('.cc-rstar').forEach(s => {
+                    s.classList.toggle('active', parseInt(s.getAttribute('data-v'), 10) <= rating);
+                });
+            };
+        });
+
+        overlay.querySelector('#ccRCancel').onclick = () => overlay.remove();
+        overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+
+        overlay.querySelector('#ccRSubmit').onclick = async () => {
+            const email = overlay.querySelector('#ccREmail').value.trim();
+            const code  = overlay.querySelector('#ccRCode').value.trim();
+            const phone = overlay.querySelector('#ccRPhone').value.trim();
+            const rtext = overlay.querySelector('#ccRText').value.trim();
+            const errEl = overlay.querySelector('#ccRErr');
+
+            if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+                errEl.textContent = 'Please enter a valid email address.'; errEl.style.display = 'block'; return;
+            }
+            if (!phone) {
+                errEl.textContent = 'Please enter your mobile number.'; errEl.style.display = 'block'; return;
+            }
+            if (!rtext) {
+                errEl.textContent = 'Please describe the issue.'; errEl.style.display = 'block'; return;
+            }
+            errEl.style.display = 'none';
+
+            const submitBtn = overlay.querySelector('#ccRSubmit');
+            submitBtn.disabled = true; submitBtn.textContent = 'Submitting…';
+
+            try {
+                const r = await fetch('https://comex-backend.vercel.app/api/report/submit', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        businessId, conversationId,
+                        email, countryCode: code, mobileNumber: phone,
+                        writtenReport: rtext, botMessage: botMessageText,
+                        feedbackRating: rating || null
+                    })
+                });
+                const data = await r.json();
+                if (data.success) {
+                    overlay.remove();
+                    if (triggerBtn) triggerBtn.classList.add('cc-reported');
+                } else {
+                    errEl.textContent = data.message || 'Could not submit report.'; errEl.style.display = 'block';
+                    submitBtn.disabled = false; submitBtn.textContent = 'Submit Report';
+                }
+            } catch (err) {
+                errEl.textContent = 'Connection error. Please try again.'; errEl.style.display = 'block';
+                submitBtn.disabled = false; submitBtn.textContent = 'Submit Report';
+            }
+        };
     }
 
     // Initialize Global Interactive Handlers
@@ -465,7 +758,7 @@
             typingEl.classList.remove('visible');
 
             if (!r.ok) {
-                appendMsg('Sorry, something went wrong. Please try again.', false);
+                appendMsg('Sorry, something went wrong. Please try again.', false, { noRegenerate: true, noReport: true });
                 return;
             }
 
@@ -476,7 +769,7 @@
 
         } catch (err) {
             typingEl.classList.remove('visible');
-            appendMsg('Connection interrupted. Please try again.', false);
+            appendMsg('Connection interrupted. Please try again.', false, { noRegenerate: true, noReport: true });
         } finally {
             isSending    = false;
             sendBtn.disabled = false;
