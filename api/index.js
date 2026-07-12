@@ -225,6 +225,13 @@ export default async function handler(req, res) {
     if (path === '/api/integrations/list-projects')       return handleListProjects(req, res);
     if (path === '/api/integrations/disconnect-database')  return handleDisconnectDatabase(req, res);
 
+    // ── Company / Employee accounts ────────────────────────────────────────
+    if (path === '/api/employee/verify-and-connect')      return handleEmployeeVerifyAndConnect(req, res);
+    if (path === '/api/company/employees/list')           return handleCompanyEmployeesList(req, res);
+    if (path === '/api/company/employees/remove')         return handleCompanyEmployeeRemove(req, res);
+    if (path === '/api/company/employees/disable')        return handleCompanyEmployeeDisable(req, res);
+    if (path === '/api/company/employees/delete')         return handleCompanyEmployeeDelete(req, res);
+
     return res.status(404).json({ success: false, message: `Unknown route: ${path}` });
 }
 
@@ -1588,6 +1595,194 @@ async function refreshGenericGoogleToken(authObj, ownerEmail, db, key) {
         }
     }
     return accessToken;
+}
+
+/** Normalizes a company handle to its Firestore doc key: strip "@", lowercase. */
+function companyKeyFrom(raw) {
+    return String(raw || '').trim().replace(/^@/, '').toLowerCase();
+}
+
+/** Verifies a Firebase email/password pair via the Identity Toolkit REST API
+ *  without disturbing any existing client session (unlike client-side
+ *  signInWithEmailAndPassword, which would replace the caller's session). */
+async function verifyFirebasePassword(email, password) {
+    const apiKey = process.env.FIREBASE_WEB_API_KEY || 'AIzaSyD0q99R9wn-r6e5aygL2zzg7e-Gc439ssY';
+    const r = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${apiKey}`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ email, password, returnSecureToken: true }),
+    });
+    const data = await r.json();
+    if (!r.ok) return { ok: false, message: data.error?.message === 'INVALID_LOGIN_CREDENTIALS' || data.error?.message === 'INVALID_PASSWORD'
+        ? 'Incorrect company password.' : (data.error?.message || 'Verification failed.') };
+    return { ok: true };
+}
+
+/** Loads a company doc and confirms requestedBy is its owner. Throws a
+ *  { status, message } object on failure so callers can respond directly. */
+async function requireCompanyOwner(db, companyUsername, requestedBy) {
+    const key = companyKeyFrom(companyUsername);
+    const snap = await db.collection('companies').doc(key).get();
+    if (!snap.exists) throw { status: 404, message: 'Company not found.' };
+    const company = snap.data();
+    if (company.ownerEmail !== requestedBy) throw { status: 403, message: 'Only the company owner can do this.' };
+    return { key, company };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/employee/verify-and-connect  { companyUsername, password, employeeEmail }
+// ════════════════════════════════════════════════════════════════════════════
+async function handleEmployeeVerifyAndConnect(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { companyUsername, password, employeeEmail } = req.body || {};
+    if (!companyUsername || !password || !employeeEmail)
+        return res.status(400).json({ success: false, message: 'Missing companyUsername, password, or employeeEmail.' });
+
+    try {
+        const db  = getDb();
+        const key = companyKeyFrom(companyUsername);
+        const companySnap = await db.collection('companies').doc(key).get();
+        if (!companySnap.exists) return res.status(404).json({ success: false, message: 'Company not found.' });
+
+        const company = companySnap.data();
+        const verify = await verifyFirebasePassword(company.ownerEmail, password);
+        if (!verify.ok) return res.status(401).json({ success: false, message: verify.message });
+
+        await db.collection('users').doc(employeeEmail).set({
+            accountType:     'employee',
+            employeeOf:      key,
+            employeeStatus:  'active',
+            pendingSetup:    false,
+            connectedAt:     new Date().toISOString(),
+        }, { merge: true });
+
+        return res.json({ success: true, companyDisplayUsername: company.displayUsername || `@${key}` });
+    } catch (err) {
+        console.error('[Employee/VerifyConnect]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/company/employees/list?companyUsername=&requestedBy=
+// ════════════════════════════════════════════════════════════════════════════
+async function handleCompanyEmployeesList(req, res) {
+    const { companyUsername, requestedBy } = req.query;
+    if (!companyUsername || !requestedBy)
+        return res.status(400).json({ success: false, message: 'Missing companyUsername or requestedBy.' });
+
+    try {
+        const db = getDb();
+        const { key } = await requireCompanyOwner(db, companyUsername, requestedBy);
+
+        const snap = await db.collection('users').where('employeeOf', '==', key).get();
+        const employees = [];
+        snap.forEach(d => {
+            const u = d.data();
+            employees.push({
+                email:        d.id,
+                status:       u.employeeStatus || 'active',
+                connectedAt:  u.connectedAt || null,
+            });
+        });
+
+        return res.json({ success: true, employees });
+    } catch (err) {
+        if (err.status) return res.status(err.status).json({ success: false, message: err.message });
+        console.error('[Company/EmployeesList]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/company/employees/remove  { companyUsername, employeeEmail, requestedBy }
+// ════════════════════════════════════════════════════════════════════════════
+async function handleCompanyEmployeeRemove(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { companyUsername, employeeEmail, requestedBy } = req.body || {};
+    if (!companyUsername || !employeeEmail || !requestedBy)
+        return res.status(400).json({ success: false, message: 'Missing required fields.' });
+
+    try {
+        const db = getDb();
+        await requireCompanyOwner(db, companyUsername, requestedBy);
+
+        await db.collection('users').doc(employeeEmail).set({
+            employeeOf:     null,
+            employeeStatus: 'removed',
+        }, { merge: true });
+
+        return res.json({ success: true, message: 'Employee removed from company.' });
+    } catch (err) {
+        if (err.status) return res.status(err.status).json({ success: false, message: err.message });
+        console.error('[Company/EmployeeRemove]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/company/employees/disable  { companyUsername, employeeEmail, requestedBy, disable }
+// ════════════════════════════════════════════════════════════════════════════
+async function handleCompanyEmployeeDisable(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { companyUsername, employeeEmail, requestedBy, disable } = req.body || {};
+    if (!companyUsername || !employeeEmail || !requestedBy)
+        return res.status(400).json({ success: false, message: 'Missing required fields.' });
+
+    try {
+        const db = getDb();
+        await requireCompanyOwner(db, companyUsername, requestedBy);
+
+        const isDisabling = disable !== false;
+        try {
+            const authAdmin  = getAuthAdmin();
+            const userRecord = await authAdmin.getUserByEmail(employeeEmail);
+            await authAdmin.updateUser(userRecord.uid, { disabled: isDisabling });
+        } catch (e) {
+            console.warn('[Company/EmployeeDisable] Auth admin update skipped:', e.message);
+        }
+
+        await db.collection('users').doc(employeeEmail).set({
+            employeeStatus: isDisabling ? 'disabled' : 'active',
+        }, { merge: true });
+
+        return res.json({ success: true, message: isDisabling ? 'Employee account disabled.' : 'Employee account re-enabled.' });
+    } catch (err) {
+        if (err.status) return res.status(err.status).json({ success: false, message: err.message });
+        console.error('[Company/EmployeeDisable]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/company/employees/delete  { companyUsername, employeeEmail, requestedBy }
+// ════════════════════════════════════════════════════════════════════════════
+async function handleCompanyEmployeeDelete(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { companyUsername, employeeEmail, requestedBy } = req.body || {};
+    if (!companyUsername || !employeeEmail || !requestedBy)
+        return res.status(400).json({ success: false, message: 'Missing required fields.' });
+
+    try {
+        const db = getDb();
+        await requireCompanyOwner(db, companyUsername, requestedBy);
+
+        try {
+            const authAdmin  = getAuthAdmin();
+            const userRecord = await authAdmin.getUserByEmail(employeeEmail);
+            await authAdmin.deleteUser(userRecord.uid);
+        } catch (e) {
+            console.warn('[Company/EmployeeDelete] Auth admin delete skipped:', e.message);
+        }
+
+        await db.collection('users').doc(employeeEmail).delete().catch(() => {});
+
+        return res.json({ success: true, message: 'Employee account permanently deleted.' });
+    } catch (err) {
+        if (err.status) return res.status(err.status).json({ success: false, message: err.message });
+        console.error('[Company/EmployeeDelete]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
