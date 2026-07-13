@@ -225,6 +225,25 @@ export default async function handler(req, res) {
     if (path === '/api/integrations/list-projects')       return handleListProjects(req, res);
     if (path === '/api/integrations/disconnect-database')  return handleDisconnectDatabase(req, res);
 
+    // ── Company / Employee accounts ────────────────────────────────────────
+    if (path === '/api/company/check-username')           return handleCompanyCheckUsername(req, res);
+    if (path === '/api/company/setup')                     return handleCompanySetup(req, res);
+    if (path === '/api/company/join-code')                 return handleCompanyJoinCode(req, res);
+    if (path === '/api/company/join-code/regenerate')       return handleCompanyJoinCodeRegenerate(req, res);
+    if (path === '/api/employee/verify-and-connect')      return handleEmployeeVerifyAndConnect(req, res);
+    if (path === '/api/company/employees/list')           return handleCompanyEmployeesList(req, res);
+    if (path === '/api/company/employees/remove')         return handleCompanyEmployeeRemove(req, res);
+    if (path === '/api/company/employees/disable')        return handleCompanyEmployeeDisable(req, res);
+    if (path === '/api/company/employees/delete')         return handleCompanyEmployeeDelete(req, res);
+    if (path === '/api/account/update-photo')             return handleUpdateProfilePhoto(req, res);
+
+    // ── Human handoff ───────────────────────────────────────────────────────
+    if (path === '/api/human/list')            return handleHumanList(req, res);
+    if (path === '/api/human/connect')         return handleHumanConnect(req, res);
+    if (path === '/api/human/send-message')    return handleHumanSendMessage(req, res);
+    if (path === '/api/human/poll')            return handleHumanPoll(req, res);
+    if (path === '/api/human/close')           return handleHumanClose(req, res);
+
     return res.status(404).json({ success: false, message: `Unknown route: ${path}` });
 }
 
@@ -435,6 +454,15 @@ function buildReportNotification(botName, writtenReport) {
         body:  `A user reported an answer from "${botName}": ${String(writtenReport || '').substring(0, 120)}`,
         url:   '/?view=reports',
         tag:   'comex-report',
+    };
+}
+
+function buildHumanRequestNotification(botName, lastMessage) {
+    return {
+        title: '🙋 Human Requested',
+        body:  `A visitor chatting with "${botName}" asked to speak with a person: "${String(lastMessage || '').substring(0, 100)}"`,
+        url:   '/?view=human',
+        tag:   'comex-human-request',
     };
 }
 
@@ -789,6 +817,30 @@ async function handleChat(req, res) {
             sysPrompt += BOOKING_SYSTEM_SUFFIX;
         } else {
             sysPrompt += `\n\n- Appointment booking is DISABLED for this agent. If a user asks to book an appointment, politely let them know booking isn't available here and offer to help another way.`;
+        }
+
+        // ── HUMAN HANDOFF — checked before anything else. Once a customer asks
+        // for a person, subsequent messages in this conversation are expected
+        // to go through /api/human/send-message instead of this endpoint (the
+        // widget switches modes client-side), so this only needs to catch the
+        // *first* ask and kick off the request.
+        const wantsHuman = /speak to human support|connect (me )?(to )?(a )?human|talk to (a )?(human|person|someone|agent|representative)|(human|real) (agent|person)|customer service rep|talk to (someone|somebody) real/i.test(userMsg);
+        if (wantsHuman) {
+            try {
+                const { requestId } = await ensureHumanRequest(db, {
+                    businessId, botName, ownerEmail, conversationId: convId, lastMessage: userMsg,
+                });
+                if (ownerEmail) {
+                    await sendFCMToUser(ownerEmail, buildHumanRequestNotification(botName, userMsg))
+                        .catch(e => console.error('[Human/FCM]', e.message));
+                }
+                const reply = "I've let our team know you'd like to speak with a person — someone will join this chat shortly. Feel free to keep typing in the meantime and they'll see it as soon as they connect.";
+                await logChat(db, businessId, convId, userMsg, reply, false, false);
+                return res.json({ success: true, answer: reply, reply, _humanRequested: true, _requestId: requestId });
+            } catch (e) {
+                console.error('[HumanHandoff]', e.message);
+                // fall through to normal chat if the handoff itself fails
+            }
         }
 
         const msgLower = userMsg.toLowerCase().trim();
@@ -1588,6 +1640,531 @@ async function refreshGenericGoogleToken(authObj, ownerEmail, db, key) {
         }
     }
     return accessToken;
+}
+
+/** Normalizes a company handle to its Firestore doc key: strip "@", lowercase. */
+function companyKeyFrom(raw) {
+    return String(raw || '').trim().replace(/^@/, '').toLowerCase();
+}
+
+const JOIN_CODE_CHARSET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // no 0/O/1/I/L — avoids visual ambiguity
+const JOIN_CODE_TTL_MS  = 36 * 60 * 60 * 1000; // 36 hours
+
+function generateJoinCode() {
+    let code = '';
+    for (let i = 0; i < 8; i++) code += JOIN_CODE_CHARSET[Math.floor(Math.random() * JOIN_CODE_CHARSET.length)];
+    return code;
+}
+
+/** Loads the private company_secrets doc (ownerEmail + join code) and confirms
+ *  requestedBy is the owner. Throws { status, message } on failure. */
+async function requireCompanyOwner(db, companyUsername, requestedBy) {
+    const key = companyKeyFrom(companyUsername);
+    const secretSnap = await db.collection('company_secrets').doc(key).get();
+    if (!secretSnap.exists) throw { status: 404, message: 'Company not found.' };
+    const secret = secretSnap.data();
+    if (secret.ownerEmail !== requestedBy) throw { status: 403, message: 'Only the company owner can do this.' };
+    return { key, secret };
+}
+
+/** Returns a still-valid join code for the company, generating a fresh one if
+ *  missing or expired (lazy rotation — matches the "every 36h or on first
+ *  use" refresh rule without needing a background cron job). */
+async function ensureValidJoinCode(db, key, secret) {
+    const now = Date.now();
+    const expiresAt = secret.joinCodeExpiresAt ? new Date(secret.joinCodeExpiresAt).getTime() : 0;
+    if (secret.joinCode && expiresAt > now) {
+        return { code: secret.joinCode, expiresAt: secret.joinCodeExpiresAt };
+    }
+    const code = generateJoinCode();
+    const newExpiresAt = new Date(now + JOIN_CODE_TTL_MS).toISOString();
+    await db.collection('company_secrets').doc(key).set({
+        joinCode: code, joinCodeCreatedAt: new Date(now).toISOString(), joinCodeExpiresAt: newExpiresAt,
+    }, { merge: true });
+    return { code, expiresAt: newExpiresAt };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/company/check-username?username=
+// ════════════════════════════════════════════════════════════════════════════
+async function handleCompanyCheckUsername(req, res) {
+    const { username } = req.query;
+    if (!username) return res.status(400).json({ success: false, message: 'Missing username.' });
+    const key = companyKeyFrom(username);
+    if (!/^[a-z0-9_]{3,30}$/.test(key))
+        return res.json({ success: true, available: false, reason: '3-30 letters, numbers, or underscores only.' });
+    try {
+        const snap = await getDb().collection('companies').doc(key).get();
+        return res.json({ success: true, available: !snap.exists });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/company/setup  { username, ownerEmail, logoBase64 }
+// Creates the public companies/{key} doc AND the private company_secrets/{key}
+// doc (which client-side rules never allow writing to) atomically, plus an
+// initial join code so the Employee Dashboard has something to show right away.
+// ════════════════════════════════════════════════════════════════════════════
+async function handleCompanySetup(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { username, ownerEmail, logoBase64 } = req.body || {};
+    if (!username || !ownerEmail)
+        return res.status(400).json({ success: false, message: 'Missing username or ownerEmail.' });
+
+    const key = companyKeyFrom(username);
+    if (!/^[a-z0-9_]{3,30}$/.test(key))
+        return res.status(400).json({ success: false, message: 'Username must be 3-30 letters, numbers, or underscores.' });
+
+    try {
+        const db = getDb();
+        const companyRef = db.collection('companies').doc(key);
+        const secretRef   = db.collection('company_secrets').doc(key);
+
+        await db.runTransaction(async (tx) => {
+            const snap = await tx.get(companyRef);
+            if (snap.exists) throw new Error('That username was just taken — please pick another.');
+
+            const now = Date.now();
+            tx.set(companyRef, {
+                displayUsername: '@' + username.replace(/^@/, ''),
+                logoBase64: logoBase64 || null,
+                createdAt: new Date(now).toISOString(),
+            });
+            tx.set(secretRef, {
+                ownerEmail,
+                joinCode: generateJoinCode(),
+                joinCodeCreatedAt: new Date(now).toISOString(),
+                joinCodeExpiresAt: new Date(now + JOIN_CODE_TTL_MS).toISOString(),
+            });
+        });
+
+        await db.collection('users').doc(ownerEmail).set({
+            accountType: 'company',
+            companyUsername: key,
+            logoBase64: logoBase64 || null,
+            pendingSetup: false,
+        }, { merge: true });
+
+        return res.json({ success: true, key });
+    } catch (err) {
+        console.error('[Company/Setup]', err.message);
+        return res.status(400).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/company/join-code?companyUsername=&requestedBy=
+// Owner-only — views (and lazily rotates, if expired) the current join code.
+// ════════════════════════════════════════════════════════════════════════════
+async function handleCompanyJoinCode(req, res) {
+    const { companyUsername, requestedBy } = req.query;
+    if (!companyUsername || !requestedBy)
+        return res.status(400).json({ success: false, message: 'Missing companyUsername or requestedBy.' });
+    try {
+        const db = getDb();
+        const { key, secret } = await requireCompanyOwner(db, companyUsername, requestedBy);
+        const { code, expiresAt } = await ensureValidJoinCode(db, key, secret);
+        return res.json({ success: true, joinCode: code, expiresAt });
+    } catch (err) {
+        if (err.status) return res.status(err.status).json({ success: false, message: err.message });
+        console.error('[Company/JoinCode]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/company/join-code/regenerate  { companyUsername, requestedBy }
+// Owner-only — manual "refresh code now" button.
+// ════════════════════════════════════════════════════════════════════════════
+async function handleCompanyJoinCodeRegenerate(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { companyUsername, requestedBy } = req.body || {};
+    if (!companyUsername || !requestedBy)
+        return res.status(400).json({ success: false, message: 'Missing companyUsername or requestedBy.' });
+    try {
+        const db = getDb();
+        const { key } = await requireCompanyOwner(db, companyUsername, requestedBy);
+        const now = Date.now();
+        const code = generateJoinCode();
+        const expiresAt = new Date(now + JOIN_CODE_TTL_MS).toISOString();
+        await db.collection('company_secrets').doc(key).set({
+            joinCode: code, joinCodeCreatedAt: new Date(now).toISOString(), joinCodeExpiresAt: expiresAt,
+        }, { merge: true });
+        return res.json({ success: true, joinCode: code, expiresAt });
+    } catch (err) {
+        if (err.status) return res.status(err.status).json({ success: false, message: err.message });
+        console.error('[Company/JoinCodeRegenerate]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/employee/verify-and-connect  { companyUsername, joinCode, employeeEmail }
+// ════════════════════════════════════════════════════════════════════════════
+async function handleEmployeeVerifyAndConnect(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { companyUsername, joinCode, employeeEmail } = req.body || {};
+    if (!companyUsername || !joinCode || !employeeEmail)
+        return res.status(400).json({ success: false, message: 'Missing companyUsername, joinCode, or employeeEmail.' });
+
+    try {
+        const db  = getDb();
+        const key = companyKeyFrom(companyUsername);
+        const [companySnap, secretSnap] = await Promise.all([
+            db.collection('companies').doc(key).get(),
+            db.collection('company_secrets').doc(key).get(),
+        ]);
+        if (!companySnap.exists || !secretSnap.exists)
+            return res.status(404).json({ success: false, message: 'Company not found.' });
+
+        const secret = secretSnap.data();
+        const submitted = String(joinCode).trim().toUpperCase();
+        const expiresAt = secret.joinCodeExpiresAt ? new Date(secret.joinCodeExpiresAt).getTime() : 0;
+
+        if (!secret.joinCode || submitted !== secret.joinCode) {
+            return res.status(401).json({ success: false, message: 'Incorrect join code.' });
+        }
+        if (expiresAt <= Date.now()) {
+            return res.status(401).json({ success: false, message: 'This join code has expired. Ask the company owner for a fresh one.' });
+        }
+
+        // Single-use: rotate immediately so this code can't be reused.
+        const now = Date.now();
+        await db.collection('company_secrets').doc(key).set({
+            joinCode: generateJoinCode(),
+            joinCodeCreatedAt: new Date(now).toISOString(),
+            joinCodeExpiresAt: new Date(now + JOIN_CODE_TTL_MS).toISOString(),
+        }, { merge: true });
+
+        await db.collection('users').doc(employeeEmail).set({
+            accountType:     'employee',
+            employeeOf:      key,
+            employeeStatus:  'active',
+            pendingSetup:    false,
+            connectedAt:     new Date().toISOString(),
+            employerOwnerEmail: secret.ownerEmail,
+        }, { merge: true });
+
+        return res.json({ success: true, companyDisplayUsername: companySnap.data().displayUsername || `@${key}` });
+    } catch (err) {
+        console.error('[Employee/VerifyConnect]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/company/employees/list?companyUsername=&requestedBy=
+// ════════════════════════════════════════════════════════════════════════════
+async function handleCompanyEmployeesList(req, res) {
+    const { companyUsername, requestedBy } = req.query;
+    if (!companyUsername || !requestedBy)
+        return res.status(400).json({ success: false, message: 'Missing companyUsername or requestedBy.' });
+
+    try {
+        const db = getDb();
+        const { key } = await requireCompanyOwner(db, companyUsername, requestedBy);
+
+        const snap = await db.collection('users').where('employeeOf', '==', key).get();
+        const employees = [];
+        snap.forEach(d => {
+            const u = d.data();
+            employees.push({
+                email:        d.id,
+                status:       u.employeeStatus || 'active',
+                connectedAt:  u.connectedAt || null,
+            });
+        });
+
+        return res.json({ success: true, employees });
+    } catch (err) {
+        if (err.status) return res.status(err.status).json({ success: false, message: err.message });
+        console.error('[Company/EmployeesList]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/company/employees/remove  { companyUsername, employeeEmail, requestedBy }
+// ════════════════════════════════════════════════════════════════════════════
+async function handleCompanyEmployeeRemove(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { companyUsername, employeeEmail, requestedBy } = req.body || {};
+    if (!companyUsername || !employeeEmail || !requestedBy)
+        return res.status(400).json({ success: false, message: 'Missing required fields.' });
+
+    try {
+        const db = getDb();
+        await requireCompanyOwner(db, companyUsername, requestedBy);
+
+        await db.collection('users').doc(employeeEmail).set({
+            employeeOf:     null,
+            employeeStatus: 'removed',
+        }, { merge: true });
+
+        return res.json({ success: true, message: 'Employee removed from company.' });
+    } catch (err) {
+        if (err.status) return res.status(err.status).json({ success: false, message: err.message });
+        console.error('[Company/EmployeeRemove]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/company/employees/disable  { companyUsername, employeeEmail, requestedBy, disable }
+// ════════════════════════════════════════════════════════════════════════════
+async function handleCompanyEmployeeDisable(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { companyUsername, employeeEmail, requestedBy, disable } = req.body || {};
+    if (!companyUsername || !employeeEmail || !requestedBy)
+        return res.status(400).json({ success: false, message: 'Missing required fields.' });
+
+    try {
+        const db = getDb();
+        await requireCompanyOwner(db, companyUsername, requestedBy);
+
+        const isDisabling = disable !== false;
+        try {
+            const authAdmin  = getAuthAdmin();
+            const userRecord = await authAdmin.getUserByEmail(employeeEmail);
+            await authAdmin.updateUser(userRecord.uid, { disabled: isDisabling });
+        } catch (e) {
+            console.warn('[Company/EmployeeDisable] Auth admin update skipped:', e.message);
+        }
+
+        await db.collection('users').doc(employeeEmail).set({
+            employeeStatus: isDisabling ? 'disabled' : 'active',
+        }, { merge: true });
+
+        return res.json({ success: true, message: isDisabling ? 'Employee account disabled.' : 'Employee account re-enabled.' });
+    } catch (err) {
+        if (err.status) return res.status(err.status).json({ success: false, message: err.message });
+        console.error('[Company/EmployeeDisable]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/company/employees/delete  { companyUsername, employeeEmail, requestedBy }
+// ════════════════════════════════════════════════════════════════════════════
+async function handleCompanyEmployeeDelete(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { companyUsername, employeeEmail, requestedBy } = req.body || {};
+    if (!companyUsername || !employeeEmail || !requestedBy)
+        return res.status(400).json({ success: false, message: 'Missing required fields.' });
+
+    try {
+        const db = getDb();
+        await requireCompanyOwner(db, companyUsername, requestedBy);
+
+        try {
+            const authAdmin  = getAuthAdmin();
+            const userRecord = await authAdmin.getUserByEmail(employeeEmail);
+            await authAdmin.deleteUser(userRecord.uid);
+        } catch (e) {
+            console.warn('[Company/EmployeeDelete] Auth admin delete skipped:', e.message);
+        }
+
+        await db.collection('users').doc(employeeEmail).delete().catch(() => {});
+
+        return res.json({ success: true, message: 'Employee account permanently deleted.' });
+    } catch (err) {
+        if (err.status) return res.status(err.status).json({ success: false, message: err.message });
+        console.error('[Company/EmployeeDelete]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// HUMAN HANDOFF
+// ════════════════════════════════════════════════════════════════════════════
+
+/** Firestore doc IDs can't contain "/", but conversationId values in this app
+ *  are always plain alnum/hyphen strings (e.g. "conv-172..." or
+ *  "test-session-172..."), so a simple join is safe here. */
+function humanRequestId(businessId, conversationId) {
+    return `${businessId}__${conversationId}`;
+}
+
+async function ensureHumanRequest(db, { businessId, botName, ownerEmail, conversationId, lastMessage }) {
+    const requestId = humanRequestId(businessId, conversationId);
+    const ref = db.collection('human_requests').doc(requestId);
+    const snap = await ref.get();
+    const now = new Date().toISOString();
+
+    if (!snap.exists) {
+        await ref.set({
+            businessId, botName, ownerEmail, conversationId,
+            status: 'pending', agentEmail: null,
+            lastMessage: lastMessage || '', createdAt: now, updatedAt: now,
+        });
+    } else {
+        const existing = snap.data();
+        await ref.set({
+            lastMessage: lastMessage || existing.lastMessage || '',
+            updatedAt: now,
+            // Reopen a closed thread if the visitor asks again.
+            status: existing.status === 'closed' ? 'pending' : existing.status,
+        }, { merge: true });
+    }
+
+    return { requestId };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/human/list?ownerEmail=
+// ════════════════════════════════════════════════════════════════════════════
+async function handleHumanList(req, res) {
+    const { ownerEmail } = req.query;
+    if (!ownerEmail) return res.status(400).json({ success: false, message: 'Missing ownerEmail.' });
+    try {
+        const db = getDb();
+        const snap = await db.collection('human_requests')
+            .where('ownerEmail', '==', ownerEmail)
+            .where('status', 'in', ['pending', 'active'])
+            .get();
+
+        const requests = [];
+        snap.forEach(d => requests.push({ id: d.id, ...d.data() }));
+        requests.sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0));
+
+        return res.json({ success: true, requests });
+    } catch (err) {
+        console.error('[Human/List]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/human/connect  { requestId, agentEmail }
+// ════════════════════════════════════════════════════════════════════════════
+async function handleHumanConnect(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { requestId, agentEmail } = req.body || {};
+    if (!requestId || !agentEmail) return res.status(400).json({ success: false, message: 'Missing requestId or agentEmail.' });
+    try {
+        const db = getDb();
+        const ref = db.collection('human_requests').doc(requestId);
+        const snap = await ref.get();
+        if (!snap.exists) return res.status(404).json({ success: false, message: 'Request not found.' });
+
+        await ref.set({ status: 'active', agentEmail, updatedAt: new Date().toISOString() }, { merge: true });
+        return res.json({ success: true });
+    } catch (err) {
+        console.error('[Human/Connect]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/human/send-message  { requestId, sender: 'user'|'agent', text, agentEmail? }
+// ════════════════════════════════════════════════════════════════════════════
+async function handleHumanSendMessage(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { requestId, sender, text, agentEmail } = req.body || {};
+    if (!requestId || !sender || !text)
+        return res.status(400).json({ success: false, message: 'Missing requestId, sender, or text.' });
+    if (!['user', 'agent'].includes(sender))
+        return res.status(400).json({ success: false, message: 'sender must be "user" or "agent".' });
+
+    try {
+        const db  = getDb();
+        const ref = db.collection('human_requests').doc(requestId);
+        const snap = await ref.get();
+        if (!snap.exists) return res.status(404).json({ success: false, message: 'Request not found.' });
+
+        const now = new Date().toISOString();
+        await ref.collection('messages').add({ sender, text: String(text), agentEmail: agentEmail || null, createdAt: now });
+
+        const update = { lastMessage: text, updatedAt: now };
+        // A visitor messaging into a previously-closed thread reopens it.
+        if (sender === 'user' && snap.data().status === 'closed') update.status = 'pending';
+        await ref.set(update, { merge: true });
+
+        return res.json({ success: true });
+    } catch (err) {
+        console.error('[Human/SendMessage]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/human/poll?requestId=&sinceTs=
+// ════════════════════════════════════════════════════════════════════════════
+async function handleHumanPoll(req, res) {
+    const { requestId, sinceTs } = req.query;
+    if (!requestId) return res.status(400).json({ success: false, message: 'Missing requestId.' });
+    try {
+        const db  = getDb();
+        const ref = db.collection('human_requests').doc(requestId);
+        const snap = await ref.get();
+        if (!snap.exists) return res.status(404).json({ success: false, message: 'Request not found.' });
+
+        let msgQuery = ref.collection('messages').orderBy('createdAt', 'asc').limit(100);
+        if (sinceTs) msgQuery = ref.collection('messages').where('createdAt', '>', sinceTs).orderBy('createdAt', 'asc').limit(100);
+
+        const msgSnap = await msgQuery.get();
+        const messages = [];
+        msgSnap.forEach(d => messages.push({ id: d.id, ...d.data() }));
+
+        const data = snap.data();
+        return res.json({ success: true, status: data.status, agentEmail: data.agentEmail || null, messages });
+    } catch (err) {
+        console.error('[Human/Poll]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/human/close  { requestId, agentEmail }
+// ════════════════════════════════════════════════════════════════════════════
+async function handleHumanClose(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { requestId, agentEmail } = req.body || {};
+    if (!requestId) return res.status(400).json({ success: false, message: 'Missing requestId.' });
+    try {
+        const db  = getDb();
+        const ref = db.collection('human_requests').doc(requestId);
+        const now = new Date().toISOString();
+        await ref.set({ status: 'closed', updatedAt: now }, { merge: true });
+        await ref.collection('messages').add({
+            sender: 'agent', text: 'The conversation has been closed by our team. Feel free to keep chatting with the assistant.',
+            agentEmail: agentEmail || null, createdAt: now, isSystem: true,
+        });
+        return res.json({ success: true });
+    } catch (err) {
+        console.error('[Human/Close]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/account/update-photo  { email, logoBase64 }
+// Updates the profile photo for any account at any time (not just at signup).
+// For company accounts this also updates the public companies/{key} doc so
+// the new photo shows up anywhere the company badge/logo is rendered.
+// ════════════════════════════════════════════════════════════════════════════
+async function handleUpdateProfilePhoto(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { email, logoBase64 } = req.body || {};
+    if (!email || !logoBase64) return res.status(400).json({ success: false, message: 'Missing email or logoBase64.' });
+
+    try {
+        const db = getDb();
+        await db.collection('users').doc(email).set({ logoBase64 }, { merge: true });
+
+        const userSnap = await db.collection('users').doc(email).get();
+        const companyUsername = userSnap.data()?.companyUsername;
+        if (companyUsername) {
+            await db.collection('companies').doc(companyUsername).set({ logoBase64 }, { merge: true });
+        }
+
+        return res.json({ success: true });
+    } catch (err) {
+        console.error('[Account/UpdatePhoto]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
