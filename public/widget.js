@@ -17,6 +17,12 @@
     let isSending      = false;
     const conversationId = `conv-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
+    // ── Human handoff session state ──────────────────────────────────────────
+    let humanSessionActive = false;   // true once a "connect to human" request exists (pending or active)
+    let humanRequestId     = null;    // matches the id returned by the backend's human_requests doc
+    let humanPollTimer     = null;
+    let humanLastPollISO   = null;
+
     // ── Default Configuration ────────────────────────────────────────────────
     let config = {
         name: 'AI Assistant',
@@ -192,6 +198,14 @@
             background: #ffffff; color: #1e293b; border-bottom-left-radius: 4px;
             border: 1px solid rgba(226,232,240,0.8); box-shadow: 0 8px 20px -4px rgba(15,23,42,0.04);
         }
+        .cc-agent .cc-bubble {
+            background: #ecfdf5; color: #065f46; border-bottom-left-radius: 4px;
+            border: 1px solid #a7f3d0; box-shadow: 0 8px 20px -4px rgba(15,23,42,0.04);
+        }
+        .cc-system-note {
+            text-align: center; font-size: 12px; color: #94a3b8; font-weight: 600;
+            padding: 4px 0; margin: 2px 0;
+        }
         .cc-meta-row { display: flex; align-items: center; gap: 10px; margin-top: 6px; padding: 0 6px; }
         .cc-user .cc-meta-row { flex-direction: row-reverse; }
         .cc-meta { font-size: 11px; color: #94a3b8; font-weight: 500; }
@@ -338,9 +352,11 @@
     const headerInfo = document.createElement('div');
     const botNameEl = document.createElement('div');
     botNameEl.className = 'cc-bot-title';
+    botNameEl.id = 'ccBotTitle';
     botNameEl.textContent = config.name;
     const statusEl = document.createElement('div');
     statusEl.className = 'cc-bot-status';
+    statusEl.id = 'ccBotStatusLine';
     statusEl.textContent = 'Replies instantly';
     headerInfo.appendChild(botNameEl);
     headerInfo.appendChild(statusEl);
@@ -464,7 +480,7 @@
     function appendMsg(text, isUser, opts) {
         opts = opts || {};
         const container = document.createElement('div');
-        container.className = `cc-bubble-container ${isUser ? 'cc-user' : 'cc-ai'}`;
+        container.className = `cc-bubble-container ${isUser ? 'cc-user' : (opts.isAgent ? 'cc-agent' : 'cc-ai')}`;
         
         const bubbleEl = document.createElement('div');
         bubbleEl.className = 'cc-bubble';
@@ -472,7 +488,7 @@
         if (isUser) {
             bubbleEl.textContent = text;
         } else {
-            bubbleEl.innerHTML = parseMarkdown(text);
+            bubbleEl.innerHTML = (opts.isAgent ? '<strong>🧑‍💻 Human Agent:</strong> ' : '') + parseMarkdown(text);
         }
         container.appendChild(bubbleEl);
 
@@ -518,14 +534,14 @@
                 };
                 actionsEl.appendChild(btn);
             }
-            if (botMsgCfg.regenerate && !opts.noRegenerate) {
+            if (botMsgCfg.regenerate && !opts.noRegenerate && !opts.isAgent) {
                 const btn = document.createElement('button');
                 btn.className = 'cc-action-btn'; btn.title = 'Regenerate answer';
                 btn.innerHTML = ICONS.regen;
                 btn.onclick = () => regenerateAnswer(container, bubbleEl, metaRow);
                 actionsEl.appendChild(btn);
             }
-            if (botMsgCfg.report && !opts.noReport) {
+            if (botMsgCfg.report && !opts.noReport && !opts.isAgent) {
                 const btn = document.createElement('button');
                 btn.className = 'cc-action-btn'; btn.title = 'Report this answer';
                 btn.innerHTML = ICONS.flag;
@@ -551,6 +567,60 @@
         chatBox.insertBefore(container, typingEl);
         chatBox.scrollTop = chatBox.scrollHeight;
         return { container, bubbleEl };
+    }
+
+    function appendSystemNote(text) {
+        const note = document.createElement('div');
+        note.className = 'cc-system-note';
+        note.textContent = text;
+        chatBox.insertBefore(note, typingEl);
+        chatBox.scrollTop = chatBox.scrollHeight;
+    }
+
+    // ── Human handoff: poll for agent replies while a request is open ────────
+    function startHumanPolling() {
+        if (humanPollTimer) return;
+        humanSessionActive = true;
+        statusEl.textContent = 'Waiting for a team member…';
+        humanPollTimer = setInterval(pollHumanMessages, 4000);
+        pollHumanMessages();
+    }
+
+    function stopHumanPolling(reason) {
+        humanSessionActive = false;
+        humanRequestId = null;
+        humanLastPollISO = null;
+        if (humanPollTimer) { clearInterval(humanPollTimer); humanPollTimer = null; }
+        statusEl.textContent = 'Replies instantly';
+        if (reason) appendSystemNote(reason);
+    }
+
+    async function pollHumanMessages() {
+        if (!humanRequestId) return;
+        try {
+            const url = `https://comex-backend.vercel.app/api/human/poll?requestId=${encodeURIComponent(humanRequestId)}` +
+                        (humanLastPollISO ? `&sinceTs=${encodeURIComponent(humanLastPollISO)}` : '');
+            const r = await fetch(url);
+            const data = await r.json();
+            if (!data.success) return;
+
+            if (data.status === 'active') {
+                statusEl.textContent = 'A team member has joined';
+            } else if (data.status === 'pending') {
+                statusEl.textContent = 'Waiting for a team member…';
+            }
+
+            (data.messages || []).forEach(m => {
+                if (m.sender === 'agent') {
+                    appendMsg(m.text, false, { isAgent: true, noRegenerate: true, noReport: true });
+                }
+                humanLastPollISO = m.createdAt;
+            });
+
+            if (data.status === 'closed') {
+                stopHumanPolling("This conversation was closed by our team — you're chatting with the AI assistant again.");
+            }
+        } catch (err) { /* silent — will retry next tick */ }
     }
 
     // ── Regenerate: resend the last user message, replace this bot bubble ────
@@ -739,6 +809,24 @@
         
         appendMsg(text, true);
         chatHistory.push({ role: 'user', content: text });
+        chatBox.scrollTop = chatBox.scrollHeight;
+
+        // Once a human has been requested/connected, messages go straight into
+        // that thread instead of back through the LLM — the agent (or the
+        // polling loop once one connects) is who responds from here on.
+        if (humanSessionActive && humanRequestId) {
+            try {
+                await fetch('https://comex-backend.vercel.app/api/human/send-message', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ requestId: humanRequestId, sender: 'user', text })
+                });
+            } catch (err) { /* the next poll cycle will still pick up any agent replies */ }
+            isSending = false;
+            sendBtn.disabled = false;
+            inputEl.focus();
+            return;
+        }
 
         typingEl.classList.add('visible');
         chatBox.scrollTop = chatBox.scrollHeight;
@@ -763,6 +851,17 @@
             }
 
             const data  = await r.json();
+
+            // ── Human handoff signal — kicked off by this message ──
+            if (data._humanRequested) {
+                const reply = data.answer || data.reply || "I've flagged this for our team — someone will join shortly.";
+                appendMsg(reply, false, { noRegenerate: true, noReport: true });
+                chatHistory.push({ role: 'assistant', content: reply });
+                humanRequestId = data._requestId || humanRequestId;
+                startHumanPolling();
+                return;
+            }
+
             const reply = data.answer || data.reply || "Sorry, I couldn't process that.";
             appendMsg(reply, false);
             chatHistory.push({ role: 'assistant', content: reply });
