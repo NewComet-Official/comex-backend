@@ -15,13 +15,38 @@
     // ── Session State ────────────────────────────────────────────────────────
     let chatHistory    = [];
     let isSending      = false;
-    const conversationId = `conv-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+    // ── Persistence: survive a page refresh mid human-conversation ───────────
+    const SESSION_KEY = `comex_widget_session_${businessId}`;
+    function loadSession() {
+        try {
+            const raw = localStorage.getItem(SESSION_KEY);
+            if (!raw) return null;
+            return JSON.parse(raw);
+        } catch (e) { return null; }
+    }
+    function saveSession() {
+        try {
+            localStorage.setItem(SESSION_KEY, JSON.stringify({
+                conversationId, chatHistory: chatHistory.slice(-30),
+                humanSessionActive, humanRequestId, humanLastPollISO,
+            }));
+        } catch (e) { /* storage may be unavailable — degrade gracefully */ }
+    }
+    function clearHumanFromSession() {
+        humanSessionActive = false; humanRequestId = null; humanLastPollISO = null;
+        saveSession();
+    }
+
+    const existingSession = loadSession();
+    const conversationId = existingSession?.conversationId || `conv-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
     // ── Human handoff session state ──────────────────────────────────────────
-    let humanSessionActive = false;   // true once a "connect to human" request exists (pending or active)
-    let humanRequestId     = null;    // matches the id returned by the backend's human_requests doc
+    let humanSessionActive = !!(existingSession?.humanSessionActive && existingSession?.humanRequestId);
+    let humanRequestId     = existingSession?.humanRequestId || null;
     let humanPollTimer     = null;
-    let humanLastPollISO   = null;
+    let humanLastPollISO   = existingSession?.humanLastPollISO || null;
+    if (existingSession?.chatHistory?.length) chatHistory = existingSession.chatHistory;
 
     // ── Default Configuration ────────────────────────────────────────────────
     let config = {
@@ -146,14 +171,30 @@
         .cc-bot-title { font-weight: 700; font-size: 16px; letter-spacing: -0.02em; margin-bottom: 2px; }
         .cc-bot-status { font-size: 12px; opacity: 0.85; font-weight: 500; display: flex; align-items: center; gap: 4px; }
         
-        .cc-close-btn {
+        .cc-header-actions { display: flex; align-items: center; gap: 4px; position: relative; z-index: 1; }
+        .cc-close-btn, .cc-endchat-btn {
             background: transparent; border: none; color: #fff; opacity: 0.8;
             transition: all 0.2s; cursor: pointer; width: 34px; height: 34px; border-radius: 50%;
-            display: flex; align-items: center; justify-content: center; position: relative; z-index: 1;
+            display: flex; align-items: center; justify-content: center;
         }
         .cc-close-btn:hover { opacity: 1; background: rgba(255,255,255,0.15); transform: rotate(90deg); }
         .cc-close-btn svg { width: 18px; height: 18px; stroke: currentColor; }
-        
+        .cc-endchat-btn:hover { opacity: 1; background: rgba(239,68,68,0.35); }
+        .cc-endchat-btn svg { width: 17px; height: 17px; stroke: currentColor; }
+
+        /* ── END CHAT CONFIRM ── */
+        .cc-confirm-overlay {
+            position: fixed; inset: 0; background: rgba(2,6,23,0.55); z-index: 1000001;
+            display: flex; align-items: center; justify-content: center; padding: 20px;
+            font-family: 'Plus Jakarta Sans', -apple-system, sans-serif;
+        }
+        .cc-confirm-card { background: #fff; border-radius: 18px; width: 100%; max-width: 320px; padding: 24px; box-shadow: 0 20px 50px rgba(0,0,0,0.3); text-align: center; }
+        .cc-confirm-card p { font-size: 14px; font-weight: 600; color: #0f172a; margin-bottom: 18px; line-height: 1.5; }
+        .cc-confirm-actions { display: flex; gap: 10px; }
+        .cc-confirm-actions button { flex: 1; padding: 11px; border-radius: 100px; font-weight: 700; font-size: 13px; cursor: pointer; border: none; font-family: inherit; }
+        .cc-confirm-cancel { background: #f1f5f9; color: #475569; }
+        .cc-confirm-ok { background: #ef4444; color: #fff; }
+
         .cc-chatbox {
             flex: 1; padding: 24px; overflow-y: auto; display: flex;
             flex-direction: column; gap: 18px; background: #f8fafc; scroll-behavior: smooth;
@@ -363,13 +404,26 @@
     
     headerLeft.appendChild(avatarContainer);
     headerLeft.appendChild(headerInfo);
-    
+
+    const headerActions = document.createElement('div');
+    headerActions.className = 'cc-header-actions';
+
+    const endChatBtn = document.createElement('button');
+    endChatBtn.className = 'cc-endchat-btn';
+    endChatBtn.id = 'ccEndChatBtn';
+    endChatBtn.setAttribute('aria-label', 'End conversation with human agent');
+    endChatBtn.title = 'End conversation';
+    endChatBtn.style.display = 'none';
+    endChatBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.127.96.362 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.338 1.85.573 2.81.7A2 2 0 0 1 22 16.92z" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><line x1="2" y1="2" x2="22" y2="22" stroke-width="2" stroke-linecap="round"/></svg>`;
+
     const closeBtn = document.createElement('button');
     closeBtn.className = 'cc-close-btn';
     closeBtn.setAttribute('aria-label', 'Close chat');
     closeBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none"><path d="M18 6L6 18M6 6l12 12" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+    headerActions.appendChild(endChatBtn);
+    headerActions.appendChild(closeBtn);
     header.appendChild(headerLeft);
-    header.appendChild(closeBtn);
+    header.appendChild(headerActions);
     win.appendChild(header);
 
     // Chat Scroller Compartment
@@ -469,6 +523,26 @@
         document.body.removeChild(ta);
     }
 
+    // ── Custom confirm dialog (replaces window.confirm for consistent UX) ────
+    function ccConfirm(message) {
+        return new Promise(resolve => {
+            const overlay = document.createElement('div');
+            overlay.className = 'cc-confirm-overlay';
+            overlay.innerHTML = `
+                <div class="cc-confirm-card">
+                    <p>${message.replace(/</g, '&lt;')}</p>
+                    <div class="cc-confirm-actions">
+                        <button class="cc-confirm-cancel">Cancel</button>
+                        <button class="cc-confirm-ok">End Chat</button>
+                    </div>
+                </div>`;
+            document.body.appendChild(overlay);
+            overlay.querySelector('.cc-confirm-cancel').onclick = () => { overlay.remove(); resolve(false); };
+            overlay.querySelector('.cc-confirm-ok').onclick = () => { overlay.remove(); resolve(true); };
+            overlay.addEventListener('click', (e) => { if (e.target === overlay) { overlay.remove(); resolve(false); } });
+        });
+    }
+
     const ICONS = {
         copy: `<svg viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>`,
         check: `<svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"></polyline></svg>`,
@@ -512,7 +586,7 @@
                 };
                 actionsEl.appendChild(btn);
             }
-            if (userMsgCfg.editMessage) {
+            if (userMsgCfg.editMessage && !opts.isHuman) {
                 const btn = document.createElement('button');
                 btn.className = 'cc-action-btn'; btn.title = 'Edit message';
                 btn.innerHTML = ICONS.edit;
@@ -579,23 +653,24 @@
 
     // ── Human handoff: poll for agent replies while a request is open ────────
     function startHumanPolling() {
+        endChatBtn.style.display = 'flex';
         if (humanPollTimer) return;
         humanSessionActive = true;
         statusEl.textContent = 'Waiting for a team member…';
+        saveSession();
         humanPollTimer = setInterval(pollHumanMessages, 4000);
         pollHumanMessages();
     }
 
     function stopHumanPolling(reason) {
-        humanSessionActive = false;
-        humanRequestId = null;
-        humanLastPollISO = null;
+        clearHumanFromSession();
         if (humanPollTimer) { clearInterval(humanPollTimer); humanPollTimer = null; }
         statusEl.textContent = 'Replies instantly';
+        endChatBtn.style.display = 'none';
         if (reason) appendSystemNote(reason);
     }
 
-    async function pollHumanMessages() {
+    async function pollHumanMessages(isInitialReplay) {
         if (!humanRequestId) return;
         try {
             const url = `https://comex-backend.vercel.app/api/human/poll?requestId=${encodeURIComponent(humanRequestId)}` +
@@ -611,14 +686,20 @@
             }
 
             (data.messages || []).forEach(m => {
-                if (m.sender === 'agent') {
+                if (m.sender === 'agent' && !m.isSystem) {
                     appendMsg(m.text, false, { isAgent: true, noRegenerate: true, noReport: true });
+                } else if (m.sender === 'agent' && m.isSystem) {
+                    appendSystemNote(m.text);
+                } else if (m.sender === 'user' && isInitialReplay) {
+                    // Replaying history after a refresh — show the visitor's own prior messages too.
+                    appendMsg(m.text, true, { isHuman: true });
                 }
                 humanLastPollISO = m.createdAt;
             });
+            saveSession();
 
             if (data.status === 'closed') {
-                stopHumanPolling("This conversation was closed by our team — you're chatting with the AI assistant again.");
+                stopHumanPolling("This conversation was closed — you're chatting with the AI assistant again.");
             }
         } catch (err) { /* silent — will retry next tick */ }
     }
@@ -653,6 +734,7 @@
             } else {
                 chatHistory.push({ role: 'assistant', content: reply });
             }
+            saveSession();
         } catch (err) {
             bubbleEl.innerHTML = '<p>Could not regenerate. Please try again.</p>';
         }
@@ -788,6 +870,21 @@
         closeWidget();
     });
 
+    endChatBtn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        if (!humanRequestId) return;
+        const ok = await ccConfirm('End this conversation with the human agent? This cannot be undone.');
+        if (!ok) return;
+        try {
+            await fetch('https://comex-backend.vercel.app/api/human/close', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ requestId: humanRequestId, closedBy: 'user' })
+            });
+        } catch (err) { /* the poll loop / stopHumanPolling below still cleans up locally */ }
+        stopHumanPolling('You ended this conversation.');
+    });
+
     // ── Onboarding Suggestion Setup ──────────────────────────────────────────
     win.querySelectorAll('.cc-suggested-chip').forEach(chip => {
         chip.addEventListener('click', () => {
@@ -810,6 +907,7 @@
         appendMsg(text, true);
         chatHistory.push({ role: 'user', content: text });
         chatBox.scrollTop = chatBox.scrollHeight;
+        saveSession();
 
         // Once a human has been requested/connected, messages go straight into
         // that thread instead of back through the LLM — the agent (or the
@@ -865,6 +963,7 @@
             const reply = data.answer || data.reply || "Sorry, I couldn't process that.";
             appendMsg(reply, false);
             chatHistory.push({ role: 'assistant', content: reply });
+            saveSession();
 
         } catch (err) {
             typingEl.classList.remove('visible');
@@ -908,5 +1007,19 @@
                 isRecording = false;
             };
         }
+    }
+
+    // ── Restore an in-progress human conversation after a page refresh ───────
+    if (humanSessionActive && humanRequestId) {
+        // Replay any prior chat history bubbles (AI ones) already restored from
+        // localStorage into memory — re-render them so the window looks the same.
+        welcomeCard.style.display = 'none';
+        chatHistory.forEach(m => {
+            if (m.role === 'user') appendMsg(m.content, true);
+            else if (m.role === 'assistant') appendMsg(m.content, false, { noRegenerate: true, noReport: true });
+        });
+        humanLastPollISO = null; // force a full replay of the human thread from the server
+        startHumanPolling();
+        pollHumanMessages(true);
     }
 })();
