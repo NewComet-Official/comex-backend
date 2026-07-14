@@ -413,6 +413,27 @@ async function sendFCMToUser(ownerEmail, { title, body, url, tag }) {
     return { sent: result.successCount, failed: result.failureCount };
 }
 
+/** Sends a push notification to the bot owner AND every active employee of
+ *  their company (if the owner runs a company workspace). Used for alerts
+ *  that employees also need to act on, like a customer requesting a human. */
+async function notifyOwnerAndEmployees(db, ownerEmail, notification) {
+    if (!ownerEmail) return;
+    const targets = [ownerEmail];
+    try {
+        const ownerSnap = await db.collection('users').doc(ownerEmail).get();
+        const companyUsername = ownerSnap.exists ? ownerSnap.data()?.companyUsername : null;
+        if (companyUsername) {
+            const empSnap = await db.collection('users')
+                .where('employeeOf', '==', companyUsername)
+                .where('employeeStatus', '==', 'active')
+                .get();
+            empSnap.forEach(d => targets.push(d.id));
+        }
+    } catch (e) { console.warn('[NotifyOwnerAndEmployees]', e.message); }
+
+    await Promise.all(targets.map(email => sendFCMToUser(email, notification).catch(() => {})));
+}
+
 function buildBookingNotification(appt) {
     return {
         title: '📅 New Appointment Booked!',
@@ -830,10 +851,8 @@ async function handleChat(req, res) {
                 const { requestId } = await ensureHumanRequest(db, {
                     businessId, botName, ownerEmail, conversationId: convId, lastMessage: userMsg,
                 });
-                if (ownerEmail) {
-                    await sendFCMToUser(ownerEmail, buildHumanRequestNotification(botName, userMsg))
-                        .catch(e => console.error('[Human/FCM]', e.message));
-                }
+                await notifyOwnerAndEmployees(db, ownerEmail, buildHumanRequestNotification(botName, userMsg))
+                    .catch(e => console.error('[Human/FCM]', e.message));
                 const reply = "I've let our team know you'd like to speak with a person — someone will join this chat shortly. Feel free to keep typing in the meantime and they'll see it as soon as they connect.";
                 await logChat(db, businessId, convId, userMsg, reply, false, false);
                 return res.json({ success: true, answer: reply, reply, _humanRequested: true, _requestId: requestId });
@@ -1801,11 +1820,11 @@ async function handleCompanyJoinCodeRegenerate(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// POST /api/employee/verify-and-connect  { companyUsername, joinCode, employeeEmail }
+// POST /api/employee/verify-and-connect  { companyUsername, joinCode, employeeEmail, logoBase64? }
 // ════════════════════════════════════════════════════════════════════════════
 async function handleEmployeeVerifyAndConnect(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
-    const { companyUsername, joinCode, employeeEmail } = req.body || {};
+    const { companyUsername, joinCode, employeeEmail, logoBase64 } = req.body || {};
     if (!companyUsername || !joinCode || !employeeEmail)
         return res.status(400).json({ success: false, message: 'Missing companyUsername, joinCode, or employeeEmail.' });
 
@@ -1845,6 +1864,7 @@ async function handleEmployeeVerifyAndConnect(req, res) {
             pendingSetup:    false,
             connectedAt:     new Date().toISOString(),
             employerOwnerEmail: secret.ownerEmail,
+            ...(logoBase64 ? { logoBase64 } : {}),
         }, { merge: true });
 
         return res.json({ success: true, companyDisplayUsername: companySnap.data().displayUsername || `@${key}` });
@@ -1982,14 +2002,15 @@ async function handleCompanyEmployeeDelete(req, res) {
 
 /** Firestore doc IDs can't contain "/", but conversationId values in this app
  *  are always plain alnum/hyphen strings (e.g. "conv-172..." or
- *  "test-session-172..."), so a simple join is safe here. */
-function humanRequestId(businessId, conversationId) {
-    return `${businessId}__${conversationId}`;
+ *  "test-session-172..."), so a simple join is safe here. An optional suffix
+ *  is used to mint a brand-new thread once a previous one has been closed. */
+function humanRequestId(businessId, conversationId, suffix) {
+    return suffix ? `${businessId}__${conversationId}__${suffix}` : `${businessId}__${conversationId}`;
 }
 
 async function ensureHumanRequest(db, { businessId, botName, ownerEmail, conversationId, lastMessage }) {
-    const requestId = humanRequestId(businessId, conversationId);
-    const ref = db.collection('human_requests').doc(requestId);
+    const baseId = humanRequestId(businessId, conversationId);
+    const ref = db.collection('human_requests').doc(baseId);
     const snap = await ref.get();
     const now = new Date().toISOString();
 
@@ -1999,17 +2020,30 @@ async function ensureHumanRequest(db, { businessId, botName, ownerEmail, convers
             status: 'pending', agentEmail: null,
             lastMessage: lastMessage || '', createdAt: now, updatedAt: now,
         });
-    } else {
-        const existing = snap.data();
-        await ref.set({
-            lastMessage: lastMessage || existing.lastMessage || '',
-            updatedAt: now,
-            // Reopen a closed thread if the visitor asks again.
-            status: existing.status === 'closed' ? 'pending' : existing.status,
-        }, { merge: true });
+        return { requestId: baseId };
     }
 
-    return { requestId };
+    const existing = snap.data();
+
+    // Each human connection is treated as a brand-new conversation once the
+    // previous one has been closed — start a fresh doc rather than reopening
+    // the old thread (and its old message history).
+    if (existing.status === 'closed') {
+        const newId  = humanRequestId(businessId, conversationId, Date.now());
+        const newRef = db.collection('human_requests').doc(newId);
+        await newRef.set({
+            businessId, botName, ownerEmail, conversationId,
+            status: 'pending', agentEmail: null,
+            lastMessage: lastMessage || '', createdAt: now, updatedAt: now,
+        });
+        return { requestId: newId };
+    }
+
+    await ref.set({
+        lastMessage: lastMessage || existing.lastMessage || '',
+        updatedAt: now,
+    }, { merge: true });
+    return { requestId: baseId };
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -2038,6 +2072,8 @@ async function handleHumanList(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // POST /api/human/connect  { requestId, agentEmail }
+// Rejects the connect if another agent is already actively handling this
+// thread, so two employees can't both jump onto the same conversation.
 // ════════════════════════════════════════════════════════════════════════════
 async function handleHumanConnect(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -2048,6 +2084,11 @@ async function handleHumanConnect(req, res) {
         const ref = db.collection('human_requests').doc(requestId);
         const snap = await ref.get();
         if (!snap.exists) return res.status(404).json({ success: false, message: 'Request not found.' });
+
+        const existing = snap.data();
+        if (existing.status === 'active' && existing.agentEmail && existing.agentEmail !== agentEmail) {
+            return res.status(409).json({ success: false, message: `Already being handled by ${existing.agentEmail}.` });
+        }
 
         await ref.set({ status: 'active', agentEmail, updatedAt: new Date().toISOString() }, { merge: true });
         return res.json({ success: true });
@@ -2101,8 +2142,8 @@ async function handleHumanPoll(req, res) {
         const snap = await ref.get();
         if (!snap.exists) return res.status(404).json({ success: false, message: 'Request not found.' });
 
-        let msgQuery = ref.collection('messages').orderBy('createdAt', 'asc').limit(100);
-        if (sinceTs) msgQuery = ref.collection('messages').where('createdAt', '>', sinceTs).orderBy('createdAt', 'asc').limit(100);
+        let msgQuery = ref.collection('messages').orderBy('createdAt', 'asc').limit(200);
+        if (sinceTs) msgQuery = ref.collection('messages').where('createdAt', '>', sinceTs).orderBy('createdAt', 'asc').limit(200);
 
         const msgSnap = await msgQuery.get();
         const messages = [];
@@ -2117,19 +2158,26 @@ async function handleHumanPoll(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// POST /api/human/close  { requestId, agentEmail }
+// POST /api/human/close  { requestId, agentEmail?, closedBy? }
+// closedBy: 'agent' (default) or 'user' — customizes the system message so
+// both sides of the chat see who ended the conversation.
 // ════════════════════════════════════════════════════════════════════════════
 async function handleHumanClose(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
-    const { requestId, agentEmail } = req.body || {};
+    const { requestId, agentEmail, closedBy } = req.body || {};
     if (!requestId) return res.status(400).json({ success: false, message: 'Missing requestId.' });
     try {
         const db  = getDb();
         const ref = db.collection('human_requests').doc(requestId);
         const now = new Date().toISOString();
         await ref.set({ status: 'closed', updatedAt: now }, { merge: true });
+
+        const message = closedBy === 'user'
+            ? 'The visitor ended this conversation.'
+            : 'The conversation has been closed by our team. Feel free to keep chatting with the assistant.';
+
         await ref.collection('messages').add({
-            sender: 'agent', text: 'The conversation has been closed by our team. Feel free to keep chatting with the assistant.',
+            sender: 'agent', text: message,
             agentEmail: agentEmail || null, createdAt: now, isSystem: true,
         });
         return res.json({ success: true });
@@ -2142,6 +2190,8 @@ async function handleHumanClose(req, res) {
 // ════════════════════════════════════════════════════════════════════════════
 // POST /api/account/update-photo  { email, logoBase64 }
 // Updates the profile photo for any account at any time (not just at signup).
+// logoBase64 may be an uploaded data-URL OR the relative path of one of the
+// built-in default avatars (e.g. "1.png").
 // For company accounts this also updates the public companies/{key} doc so
 // the new photo shows up anywhere the company badge/logo is rendered.
 // ════════════════════════════════════════════════════════════════════════════
