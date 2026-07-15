@@ -30,11 +30,13 @@
             localStorage.setItem(SESSION_KEY, JSON.stringify({
                 conversationId, chatHistory: chatHistory.slice(-30),
                 humanSessionActive, humanRequestId, humanLastPollISO,
+                humanRenderedIds: Array.from(humanRenderedIds),
             }));
         } catch (e) { /* storage may be unavailable — degrade gracefully */ }
     }
     function clearHumanFromSession() {
         humanSessionActive = false; humanRequestId = null; humanLastPollISO = null;
+        humanRenderedIds = new Set();
         saveSession();
     }
 
@@ -46,6 +48,13 @@
     let humanRequestId     = existingSession?.humanRequestId || null;
     let humanPollTimer     = null;
     let humanLastPollISO   = existingSession?.humanLastPollISO || null;
+    // Tracks message doc IDs already rendered so a slow/overlapping poll
+    // cycle can never render the same message twice.
+    let humanRenderedIds   = new Set(existingSession?.humanRenderedIds || []);
+    // Prevents two poll cycles from running concurrently (e.g. a slow
+    // network response still in flight when the next interval tick fires),
+    // which was the root cause of messages appearing doubled/tripled.
+    let humanPollInFlight  = false;
     if (existingSession?.chatHistory?.length) chatHistory = existingSession.chatHistory;
 
     // ── Default Configuration ────────────────────────────────────────────────
@@ -671,7 +680,12 @@
     }
 
     async function pollHumanMessages(isInitialReplay) {
-        if (!humanRequestId) return;
+        // Guard against overlapping poll cycles — if a prior fetch is still
+        // in flight when the next interval tick fires (e.g. slow network),
+        // letting both run concurrently is what caused messages to render
+        // more than once.
+        if (!humanRequestId || humanPollInFlight) return;
+        humanPollInFlight = true;
         try {
             const url = `https://comex-backend.vercel.app/api/human/poll?requestId=${encodeURIComponent(humanRequestId)}` +
                         (humanLastPollISO ? `&sinceTs=${encodeURIComponent(humanLastPollISO)}` : '');
@@ -686,6 +700,13 @@
             }
 
             (data.messages || []).forEach(m => {
+                humanLastPollISO = m.createdAt;
+                // Dedup by message id — belt-and-suspenders alongside the
+                // in-flight guard above, in case of any timestamp-boundary
+                // overlap between consecutive poll windows.
+                if (humanRenderedIds.has(m.id)) return;
+                humanRenderedIds.add(m.id);
+
                 if (m.sender === 'agent' && !m.isSystem) {
                     appendMsg(m.text, false, { isAgent: true, noRegenerate: true, noReport: true });
                 } else if (m.sender === 'agent' && m.isSystem) {
@@ -694,7 +715,6 @@
                     // Replaying history after a refresh — show the visitor's own prior messages too.
                     appendMsg(m.text, true, { isHuman: true });
                 }
-                humanLastPollISO = m.createdAt;
             });
             saveSession();
 
@@ -702,6 +722,9 @@
                 stopHumanPolling("This conversation was closed — you're chatting with the AI assistant again.");
             }
         } catch (err) { /* silent — will retry next tick */ }
+        finally {
+            humanPollInFlight = false;
+        }
     }
 
     // ── Regenerate: resend the last user message, replace this bot bubble ────
@@ -956,6 +979,10 @@
                 appendMsg(reply, false, { noRegenerate: true, noReport: true });
                 chatHistory.push({ role: 'assistant', content: reply });
                 humanRequestId = data._requestId || humanRequestId;
+                // Fresh thread — reset dedup state so nothing bleeds over
+                // from a previous (now-closed) human conversation.
+                humanRenderedIds = new Set();
+                humanLastPollISO = null;
                 startHumanPolling();
                 return;
             }
