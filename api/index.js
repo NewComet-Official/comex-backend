@@ -2061,6 +2061,25 @@ async function handleHumanList(req, res) {
 
         const requests = [];
         snap.forEach(d => requests.push({ id: d.id, ...d.data() }));
+
+        // ── Disambiguate simultaneous requests from the same bot ───────────
+        // If a single bot has more than one open human request at once (two
+        // different visitors both asked for a human at the same time), label
+        // them "BotName", "BotName-01", "BotName-02"... in the order they
+        // came in, so the dashboard doesn't show identical-looking rows with
+        // no way to tell them apart.
+        const byBotOldestFirst = [...requests].sort(
+            (a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0)
+        );
+        const seenCount = {};
+        byBotOldestFirst.forEach(r => {
+            const key = r.businessId;
+            const n = seenCount[key] || 0;
+            const base = r.botName || r.businessId;
+            r.displayLabel = n === 0 ? base : `${base}-${String(n).padStart(2, '0')}`;
+            seenCount[key] = n + 1;
+        });
+
         requests.sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0));
 
         return res.json({ success: true, requests });
@@ -2118,12 +2137,19 @@ async function handleHumanSendMessage(req, res) {
         const now = new Date().toISOString();
         await ref.collection('messages').add({ sender, text: String(text), agentEmail: agentEmail || null, createdAt: now });
 
+        // NOTE: a closed thread stays closed. Every human connection is
+        // treated as a brand-new conversation once closed (see
+        // ensureHumanRequest's suffix logic, which mints a new doc ID) — we
+        // intentionally do NOT flip status back to 'pending' here just
+        // because a straggling message came in on the old, already-closed
+        // thread. (Under normal operation this shouldn't happen at all: the
+        // widget clears its human session state the moment it sees
+        // status === 'closed' and falls back to the AI, so it stops calling
+        // this endpoint for that thread.)
         const update = { lastMessage: text, updatedAt: now };
-        // A visitor messaging into a previously-closed thread reopens it.
-        if (sender === 'user' && snap.data().status === 'closed') update.status = 'pending';
         await ref.set(update, { merge: true });
 
-        return res.json({ success: true });
+        return res.json({ success: true, wasClosed: snap.data().status === 'closed' });
     } catch (err) {
         console.error('[Human/SendMessage]', err.message);
         return res.status(500).json({ success: false, message: err.message });
