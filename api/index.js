@@ -2331,7 +2331,7 @@ function parseTime(timeStr) {
     return null;
 }
 
-if (path === '/api/account/update-email') return handleAccountChangeEmail(req, res);
+
 
 // POST /api/account/update-email  { oldEmail, newEmail }
 // Firestore docs are keyed/filtered by email (users doc id, user_bots.owner,
