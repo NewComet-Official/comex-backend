@@ -6,7 +6,11 @@
     },
     {
       "source": "/api/(.*)",
-      "dest": "/api/index.js" 
+      "dest": "/api/index.js"
+    },
+    {
+      "source": "/(dashboard|new-deployment|third-party-integrations|analytics|reports|human-dashboard|employee-dashboard|settings)",
+      "dest": "/index.html"
     }
   ]
 }
