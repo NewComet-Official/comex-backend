@@ -2331,6 +2331,55 @@ function parseTime(timeStr) {
     return null;
 }
 
+if (path === '/api/account/update-email') return handleAccountChangeEmail(req, res);
+
+// POST /api/account/update-email  { oldEmail, newEmail }
+// Firestore docs are keyed/filtered by email (users doc id, user_bots.owner,
+// appointments/reports/leads.owner, company_secrets.ownerEmail, employees'
+// employerOwnerEmail) — this migrates all of it after Firebase Auth's email
+// itself has already been changed client-side.
+async function handleAccountChangeEmail(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { oldEmail, newEmail } = req.body || {};
+    if (!oldEmail || !newEmail) return res.status(400).json({ success: false, message: 'Missing oldEmail or newEmail.' });
+
+    try {
+        const db = getDb();
+        const oldSnap = await db.collection('users').doc(oldEmail).get();
+        const profile = oldSnap.exists ? oldSnap.data() : {};
+        await db.collection('users').doc(newEmail).set(profile, { merge: true });
+        await db.collection('users').doc(oldEmail).delete().catch(() => {});
+
+        const ownerCollections = ['user_bots', 'appointments', 'reports', 'leads'];
+        for (const col of ownerCollections) {
+            const snap = await db.collection(col).where('owner', '==', oldEmail).get();
+            if (snap.empty) continue;
+            const batch = db.batch();
+            snap.docs.forEach(d => batch.update(d.ref, { owner: newEmail }));
+            await batch.commit();
+        }
+
+        const empSnap = await db.collection('users').where('employerOwnerEmail', '==', oldEmail).get();
+        if (!empSnap.empty) {
+            const batch = db.batch();
+            empSnap.docs.forEach(d => batch.update(d.ref, { employerOwnerEmail: newEmail }));
+            await batch.commit();
+        }
+
+        const secretsSnap = await db.collection('company_secrets').where('ownerEmail', '==', oldEmail).get();
+        if (!secretsSnap.empty) {
+            const batch = db.batch();
+            secretsSnap.docs.forEach(d => batch.update(d.ref, { ownerEmail: newEmail }));
+            await batch.commit();
+        }
+
+        return res.json({ success: true });
+    } catch (err) {
+        console.error('[Account/ChangeEmail]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
 async function getCalendarTimezone(accessToken) {
     try {
         const r = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary',
