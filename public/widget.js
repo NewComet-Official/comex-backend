@@ -447,8 +447,24 @@
     welcomeCard.innerHTML = `
         <p>Hello! Welcome to our automated support helper. Choose a quick question below or type your inquiry natively.</p>
         <div class="cc-suggested-grid">
-            <div class="cc-suggested-chip" data-msg="What services do you offer?"><span>💡 What services do you offer?</span> ➔</div>
-            <div class="cc-suggested-chip" data-msg="Speak to human support"><span>🧑‍💻 Connect to human agent</span> ➔</div>
+<!-- Services Chip -->
+<div class="cc-suggested-chip" data-msg="What services do you offer?">
+  <span>
+    <svg xmlns="http://w3.org" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display: inline-block; vertical-align: text-bottom; margin-right: 6px;"><path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .6 2.2 1.5 3.1.7.7 1.3 1.5 1.5 2.5"/><path d="M9 18h6"/><path d="M10 22h4"/></svg>
+    What services do you offer?
+  </span> 
+  ➔
+</div> 
+
+<!-- Human Support Chip -->
+<div class="cc-suggested-chip" data-msg="Speak to human support">
+  <span>
+    <svg xmlns="http://w3.org" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display: inline-block; vertical-align: text-bottom; margin-right: 6px;"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+    Connect to human agent
+  </span> 
+  ➔
+</div>
+
         </div>
     `;
     chatBox.appendChild(welcomeCard);
