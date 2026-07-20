@@ -73,7 +73,8 @@
             allowOutOfTopic: true,
             allowWebSearch: true,
             allowHallucination: false,
-            allowAppointmentBooking: false
+            allowAppointmentBooking: false,
+            allowHumanHandoff: true
         },
         messageConfig: {
             user: { showTime: true, editMessage: true, copy: true },
@@ -106,6 +107,7 @@
     const { themeColor, typebarSize, sendButtonStyle, loadingAnim, voiceEnabled } = config.designConfig;
     const userMsgCfg = config.messageConfig.user;
     const botMsgCfg  = config.messageConfig.bot;
+    const humanHandoffEnabled = config.behaviorConfig.allowHumanHandoff !== false;
 
     // ── Position Computations ────────────────────────────────────────────────
     const positions = {
@@ -455,7 +457,7 @@
   </span> 
   ➔
 </div> 
-
+${humanHandoffEnabled ? `
 <!-- Human Support Chip -->
 <div class="cc-suggested-chip" data-msg="Speak to human support">
   <span>
@@ -463,7 +465,7 @@
     Connect to human agent
   </span> 
   ➔
-</div>
+</div>` : ''}
 
         </div>
     `;
@@ -678,6 +680,7 @@
 
     // ── Human handoff: poll for agent replies while a request is open ────────
     function startHumanPolling() {
+        if (!humanHandoffEnabled) return;
         endChatBtn.style.display = 'flex';
         if (humanPollTimer) return;
         humanSessionActive = true;
@@ -700,7 +703,7 @@
         // in flight when the next interval tick fires (e.g. slow network),
         // letting both run concurrently is what caused messages to render
         // more than once.
-        if (!humanRequestId || humanPollInFlight) return;
+        if (!humanHandoffEnabled || !humanRequestId || humanPollInFlight) return;
         humanPollInFlight = true;
         try {
             const url = `https://comex-backend.vercel.app/api/human/poll?requestId=${encodeURIComponent(humanRequestId)}` +
@@ -951,7 +954,7 @@
         // Once a human has been requested/connected, messages go straight into
         // that thread instead of back through the LLM — the agent (or the
         // polling loop once one connects) is who responds from here on.
-        if (humanSessionActive && humanRequestId) {
+        if (humanHandoffEnabled && humanSessionActive && humanRequestId) {
             try {
                 await fetch('https://comex-backend.vercel.app/api/human/send-message', {
                     method: 'POST',
@@ -990,7 +993,7 @@
             const data  = await r.json();
 
             // ── Human handoff signal — kicked off by this message ──
-            if (data._humanRequested) {
+            if (humanHandoffEnabled && data._humanRequested) {
                 const reply = data.answer || data.reply || "I've flagged this for our team — someone will join shortly.";
                 appendMsg(reply, false, { noRegenerate: true, noReport: true });
                 chatHistory.push({ role: 'assistant', content: reply });
@@ -1053,7 +1056,7 @@
     }
 
     // ── Restore an in-progress human conversation after a page refresh ───────
-    if (humanSessionActive && humanRequestId) {
+    if (humanHandoffEnabled && humanSessionActive && humanRequestId) {
         // Replay any prior chat history bubbles (AI ones) already restored from
         // localStorage into memory — re-render them so the window looks the same.
         welcomeCard.style.display = 'none';
@@ -1064,5 +1067,8 @@
         humanLastPollISO = null; // force a full replay of the human thread from the server
         startHumanPolling();
         pollHumanMessages(true);
+    } else if (humanSessionActive) {
+        // Handoff was disabled after this session's state was saved — clear stale state.
+        clearHumanFromSession();
     }
 })();
