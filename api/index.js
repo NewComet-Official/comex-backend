@@ -752,6 +752,7 @@ async function handleConfig(req, res) {
                 allowWebSearch:       true,
                 allowHallucination:   false,
                 allowAppointmentBooking: false,
+                allowHumanHandoff:    true,
             }, b.behaviorConfig || {}),
             messageConfig:   Object.assign({
                 user: { showTime: true, editMessage: true, copy: true },
@@ -789,6 +790,7 @@ async function handleChat(req, res) {
             allowWebSearch: true,
             allowHallucination: false,
             allowAppointmentBooking: false,
+            allowHumanHandoff: true,
         };
 
         if (botSnap.exists) {
@@ -808,12 +810,6 @@ async function handleChat(req, res) {
             }
 
             // ── Database sources (Firebase Project / Supabase) ──────────────
-            // NOTE — PHASE 1 STUB: we only tell the model *that* a database is
-            // connected, we do not read its live contents yet. Doing that for
-            // real (potentially huge Postgres/Firestore projects) requires the
-            // RAG pipeline (chunk → embed → vector search) described in
-            // knowledgeContext.databaseSources — this is intentionally left as
-            // a follow-up so we don't silently pretend to read data we aren't.
             const dbSources = kc.databaseSources || [];
             if (dbSources.length) {
                 const list = dbSources.map(s => `- ${s.service} project "${s.projectName || s.projectId}"`).join('\n');
@@ -840,12 +836,17 @@ async function handleChat(req, res) {
             sysPrompt += `\n\n- Appointment booking is DISABLED for this agent. If a user asks to book an appointment, politely let them know booking isn't available here and offer to help another way.`;
         }
 
-        // ── HUMAN HANDOFF — checked before anything else. Once a customer asks
-        // for a person, subsequent messages in this conversation are expected
-        // to go through /api/human/send-message instead of this endpoint (the
-        // widget switches modes client-side), so this only needs to catch the
-        // *first* ask and kick off the request.
-        const wantsHuman = /speak to human support|connect (me )?(to )?(a )?human|talk to (a )?(human|person|someone|agent|representative)|(human|real) (agent|person)|customer service rep|talk to (someone|somebody) real/i.test(userMsg);
+        const humanHandoffEnabled = behaviorConfig.allowHumanHandoff !== false;
+        sysPrompt += humanHandoffEnabled
+            ? `\n\n- If the user asks to speak with a human/person/agent, that request will be routed automatically by the system — you don't need to say anything special about it yourself.`
+            : `\n\n- Human agent handoff is DISABLED for this agent. If the user asks to speak with a human, a real person, or a live agent, politely explain that live handoff isn't available here right now, and offer to keep helping them yourself.`;
+
+        // ── HUMAN HANDOFF — checked before anything else (only when enabled).
+        // Once a customer asks for a person, subsequent messages in this
+        // conversation are expected to go through /api/human/send-message
+        // instead of this endpoint (the widget switches modes client-side),
+        // so this only needs to catch the *first* ask and kick off the request.
+        const wantsHuman = humanHandoffEnabled && /speak to human support|connect (me )?(to )?(a )?human|talk to (a )?(human|person|someone|agent|representative)|(human|real) (agent|person)|customer service rep|talk to (someone|somebody) real/i.test(userMsg);
         if (wantsHuman) {
             try {
                 const { requestId } = await ensureHumanRequest(db, {
@@ -1314,9 +1315,6 @@ async function handleGoogleCallback(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // POST /api/disconnect-calendar  { userEmail, calendarId? , all? }
-// Frontend already called this route; it never existed on the backend, so
-// clicking "Disconnect" on the calendar card was silently failing. Fixing
-// that here since it's part of the same connections page.
 // ════════════════════════════════════════════════════════════════════════════
 async function handleDisconnectCalendar(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -1341,8 +1339,6 @@ async function handleDisconnectCalendar(req, res) {
         const existing = snap.exists ? (snap.data()?.integrations?.google_calendar_accounts || []) : [];
         const remaining = existing.filter(a => a.email !== calendarId);
 
-        // Keep the flattened `google_calendar` field (used for booking/availability
-        // checks) pointed at whichever account is left, or clear it if none remain.
         const newPrimary = remaining[0] || null;
 
         await userRef.set({
@@ -1366,10 +1362,6 @@ async function handleDisconnectCalendar(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // FIREBASE PROJECT OAUTH (data source, NOT the calendar flow above)
-// Uses standard Google OAuth with Firebase Management + Cloud Platform
-// read-only scopes so we can list & later read a client's Firebase projects.
-// Requires the SAME Google OAuth client as Calendar (GOOGLE_CLIENT_ID/SECRET)
-// registered with these extra scopes enabled on the consent screen.
 // ════════════════════════════════════════════════════════════════════════════
 async function handleFirebaseProjectOAuth(req, res) {
     const { email, origin } = req.query;
@@ -1385,12 +1377,6 @@ async function handleFirebaseProjectOAuth(req, res) {
     url.searchParams.set('client_id',     clientId);
     url.searchParams.set('redirect_uri',  redirectUri);
     url.searchParams.set('response_type', 'code');
-    // Phase 1 only lists projects — no data-read scope requested yet.
-    // (There is no "datastore.readonly" scope; reading Firestore/RTDB data
-    // for real in a later phase will require the broader
-    // 'https://www.googleapis.com/auth/cloud-platform' or
-    // 'https://www.googleapis.com/auth/datastore' scope, which needs a
-    // fresh consent + re-connect once that phase is built.)
     url.searchParams.set('scope', [
         'https://www.googleapis.com/auth/firebase.readonly',
         'https://www.googleapis.com/auth/cloud-platform.read-only',
@@ -1468,8 +1454,6 @@ async function handleFirebaseProjectCallback(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // SUPABASE OAUTH (data source)
-// Requires a Supabase OAuth app registered at https://supabase.com/dashboard/org/_/apps
-// with SUPABASE_CLIENT_ID / SUPABASE_CLIENT_SECRET env vars.
 // ════════════════════════════════════════════════════════════════════════════
 async function handleSupabaseOAuth(req, res) {
     const { email, origin } = req.query;
@@ -1548,8 +1532,6 @@ async function handleSupabaseCallback(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // GET /api/integrations/list-projects?service=firebase|supabase&ownerEmail=...
-// Lists the projects available under the connected account so the "Configure
-// New Agent" flow can offer a project picker.
 // ════════════════════════════════════════════════════════════════════════════
 async function handleListProjects(req, res) {
     const { service, ownerEmail } = req.query;
@@ -1631,7 +1613,6 @@ async function handleDisconnectDatabase(req, res) {
     }
 }
 
-/** Generic Google token refresh, shared by any integration stored under integrations.<key> with the same token shape. */
 async function refreshGenericGoogleToken(authObj, ownerEmail, db, key) {
     let accessToken = authObj.access_token;
     if (authObj.refresh_token && authObj.expiry_date) {
@@ -1661,13 +1642,12 @@ async function refreshGenericGoogleToken(authObj, ownerEmail, db, key) {
     return accessToken;
 }
 
-/** Normalizes a company handle to its Firestore doc key: strip "@", lowercase. */
 function companyKeyFrom(raw) {
     return String(raw || '').trim().replace(/^@/, '').toLowerCase();
 }
 
-const JOIN_CODE_CHARSET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // no 0/O/1/I/L — avoids visual ambiguity
-const JOIN_CODE_TTL_MS  = 36 * 60 * 60 * 1000; // 36 hours
+const JOIN_CODE_CHARSET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+const JOIN_CODE_TTL_MS  = 36 * 60 * 60 * 1000;
 
 function generateJoinCode() {
     let code = '';
@@ -1675,8 +1655,6 @@ function generateJoinCode() {
     return code;
 }
 
-/** Loads the private company_secrets doc (ownerEmail + join code) and confirms
- *  requestedBy is the owner. Throws { status, message } on failure. */
 async function requireCompanyOwner(db, companyUsername, requestedBy) {
     const key = companyKeyFrom(companyUsername);
     const secretSnap = await db.collection('company_secrets').doc(key).get();
@@ -1686,9 +1664,6 @@ async function requireCompanyOwner(db, companyUsername, requestedBy) {
     return { key, secret };
 }
 
-/** Returns a still-valid join code for the company, generating a fresh one if
- *  missing or expired (lazy rotation — matches the "every 36h or on first
- *  use" refresh rule without needing a background cron job). */
 async function ensureValidJoinCode(db, key, secret) {
     const now = Date.now();
     const expiresAt = secret.joinCodeExpiresAt ? new Date(secret.joinCodeExpiresAt).getTime() : 0;
@@ -1722,9 +1697,6 @@ async function handleCompanyCheckUsername(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // POST /api/company/setup  { username, ownerEmail, logoBase64 }
-// Creates the public companies/{key} doc AND the private company_secrets/{key}
-// doc (which client-side rules never allow writing to) atomically, plus an
-// initial join code so the Employee Dashboard has something to show right away.
 // ════════════════════════════════════════════════════════════════════════════
 async function handleCompanySetup(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -1775,7 +1747,6 @@ async function handleCompanySetup(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // GET /api/company/join-code?companyUsername=&requestedBy=
-// Owner-only — views (and lazily rotates, if expired) the current join code.
 // ════════════════════════════════════════════════════════════════════════════
 async function handleCompanyJoinCode(req, res) {
     const { companyUsername, requestedBy } = req.query;
@@ -1795,7 +1766,6 @@ async function handleCompanyJoinCode(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // POST /api/company/join-code/regenerate  { companyUsername, requestedBy }
-// Owner-only — manual "refresh code now" button.
 // ════════════════════════════════════════════════════════════════════════════
 async function handleCompanyJoinCodeRegenerate(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -1849,7 +1819,6 @@ async function handleEmployeeVerifyAndConnect(req, res) {
             return res.status(401).json({ success: false, message: 'This join code has expired. Ask the company owner for a fresh one.' });
         }
 
-        // Single-use: rotate immediately so this code can't be reused.
         const now = Date.now();
         await db.collection('company_secrets').doc(key).set({
             joinCode: generateJoinCode(),
@@ -2000,10 +1969,6 @@ async function handleCompanyEmployeeDelete(req, res) {
 // HUMAN HANDOFF
 // ════════════════════════════════════════════════════════════════════════════
 
-/** Firestore doc IDs can't contain "/", but conversationId values in this app
- *  are always plain alnum/hyphen strings (e.g. "conv-172..." or
- *  "test-session-172..."), so a simple join is safe here. An optional suffix
- *  is used to mint a brand-new thread once a previous one has been closed. */
 function humanRequestId(businessId, conversationId, suffix) {
     return suffix ? `${businessId}__${conversationId}__${suffix}` : `${businessId}__${conversationId}`;
 }
@@ -2025,9 +1990,6 @@ async function ensureHumanRequest(db, { businessId, botName, ownerEmail, convers
 
     const existing = snap.data();
 
-    // Each human connection is treated as a brand-new conversation once the
-    // previous one has been closed — start a fresh doc rather than reopening
-    // the old thread (and its old message history).
     if (existing.status === 'closed') {
         const newId  = humanRequestId(businessId, conversationId, Date.now());
         const newRef = db.collection('human_requests').doc(newId);
@@ -2062,12 +2024,6 @@ async function handleHumanList(req, res) {
         const requests = [];
         snap.forEach(d => requests.push({ id: d.id, ...d.data() }));
 
-        // ── Disambiguate simultaneous requests from the same bot ───────────
-        // If a single bot has more than one open human request at once (two
-        // different visitors both asked for a human at the same time), label
-        // them "BotName", "BotName-01", "BotName-02"... in the order they
-        // came in, so the dashboard doesn't show identical-looking rows with
-        // no way to tell them apart.
         const byBotOldestFirst = [...requests].sort(
             (a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0)
         );
@@ -2091,8 +2047,6 @@ async function handleHumanList(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // POST /api/human/connect  { requestId, agentEmail }
-// Rejects the connect if another agent is already actively handling this
-// thread, so two employees can't both jump onto the same conversation.
 // ════════════════════════════════════════════════════════════════════════════
 async function handleHumanConnect(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -2137,15 +2091,6 @@ async function handleHumanSendMessage(req, res) {
         const now = new Date().toISOString();
         await ref.collection('messages').add({ sender, text: String(text), agentEmail: agentEmail || null, createdAt: now });
 
-        // NOTE: a closed thread stays closed. Every human connection is
-        // treated as a brand-new conversation once closed (see
-        // ensureHumanRequest's suffix logic, which mints a new doc ID) — we
-        // intentionally do NOT flip status back to 'pending' here just
-        // because a straggling message came in on the old, already-closed
-        // thread. (Under normal operation this shouldn't happen at all: the
-        // widget clears its human session state the moment it sees
-        // status === 'closed' and falls back to the AI, so it stops calling
-        // this endpoint for that thread.)
         const update = { lastMessage: text, updatedAt: now };
         await ref.set(update, { merge: true });
 
@@ -2185,8 +2130,6 @@ async function handleHumanPoll(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // POST /api/human/close  { requestId, agentEmail?, closedBy? }
-// closedBy: 'agent' (default) or 'user' — customizes the system message so
-// both sides of the chat see who ended the conversation.
 // ════════════════════════════════════════════════════════════════════════════
 async function handleHumanClose(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -2215,11 +2158,6 @@ async function handleHumanClose(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // POST /api/account/update-photo  { email, logoBase64 }
-// Updates the profile photo for any account at any time (not just at signup).
-// logoBase64 may be an uploaded data-URL OR the relative path of one of the
-// built-in default avatars (e.g. "1.png").
-// For company accounts this also updates the public companies/{key} doc so
-// the new photo shows up anywhere the company badge/logo is rendered.
 // ════════════════════════════════════════════════════════════════════════════
 async function handleUpdateProfilePhoto(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -2331,13 +2269,6 @@ function parseTime(timeStr) {
     return null;
 }
 
-
-
-// POST /api/account/update-email  { oldEmail, newEmail }
-// Firestore docs are keyed/filtered by email (users doc id, user_bots.owner,
-// appointments/reports/leads.owner, company_secrets.ownerEmail, employees'
-// employerOwnerEmail) — this migrates all of it after Firebase Auth's email
-// itself has already been changed client-side.
 async function handleAccountChangeEmail(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
     const { oldEmail, newEmail } = req.body || {};
