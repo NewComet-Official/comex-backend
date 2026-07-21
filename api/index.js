@@ -413,9 +413,6 @@ async function sendFCMToUser(ownerEmail, { title, body, url, tag }) {
     return { sent: result.successCount, failed: result.failureCount };
 }
 
-/** Sends a push notification to the bot owner AND every active employee of
- *  their company (if the owner runs a company workspace). Used for alerts
- *  that employees also need to act on, like a customer requesting a human. */
 async function notifyOwnerAndEmployees(db, ownerEmail, notification) {
     if (!ownerEmail) return;
     const targets = [ownerEmail];
@@ -687,6 +684,7 @@ async function handleDeploy(req, res) {
     try {
         botData.owner     = ownerEmail;
         botData.deletedAt = null;
+        botData.displayName = botData.displayName || botData.name;
         botData.createdAt = botData.createdAt || new Date().toISOString();
         await getDb().collection('user_bots').doc(botData.id).set(botData, { merge: true });
         return res.status(200).json({ success: true, botId: botData.id });
@@ -741,7 +739,8 @@ async function handleConfig(req, res) {
         const b = snap.data();
         return res.status(200).json({
             success:         true,
-            name:            b.name                     || 'AI Assistant',
+            name:            b.displayName || b.name    || 'AI Assistant',
+            internalName:    b.name                     || null,
             position:        b.position                 || 'bottom-right',
             logoBase64:      b.logoBase64               || null,
             themeColor:      b.designConfig?.themeColor || '#0f172a',
@@ -796,7 +795,7 @@ async function handleChat(req, res) {
         if (botSnap.exists) {
             const b  = botSnap.data();
             ownerEmail = b.owner    || '';
-            botName    = b.name     || 'Assistant';
+            botName    = b.displayName || b.name || 'Assistant';
             modelKey   = b.modelKey || DEFAULT_MODEL_KEY;
             behaviorConfig = Object.assign(behaviorConfig, b.behaviorConfig || {});
             const kc   = b.knowledgeContext || {};
@@ -842,10 +841,6 @@ async function handleChat(req, res) {
             : `\n\n- Human agent handoff is DISABLED for this agent. If the user asks to speak with a human, a real person, or a live agent, politely explain that live handoff isn't available here right now, and offer to keep helping them yourself.`;
 
         // ── HUMAN HANDOFF — checked before anything else (only when enabled).
-        // Once a customer asks for a person, subsequent messages in this
-        // conversation are expected to go through /api/human/send-message
-        // instead of this endpoint (the widget switches modes client-side),
-        // so this only needs to catch the *first* ask and kick off the request.
         const wantsHuman = humanHandoffEnabled && /speak to human support|connect (me )?(to )?(a )?human|talk to (a )?(human|person|someone|agent|representative)|(human|real) (agent|person)|customer service rep|talk to (someone|somebody) real/i.test(userMsg);
         if (wantsHuman) {
             try {
@@ -859,7 +854,6 @@ async function handleChat(req, res) {
                 return res.json({ success: true, answer: reply, reply, _humanRequested: true, _requestId: requestId });
             } catch (e) {
                 console.error('[HumanHandoff]', e.message);
-                // fall through to normal chat if the handoff itself fails
             }
         }
 
