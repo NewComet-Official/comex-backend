@@ -1,5 +1,6 @@
 import admin from 'firebase-admin';
 import Groq from 'groq-sdk';
+import crypto from 'crypto';
 
 // ════════════════════════════════════════════════════════════════════════════
 // FIREBASE
@@ -224,6 +225,13 @@ export default async function handler(req, res) {
     if (path === '/api/oauth/supabase/callback')          return handleSupabaseCallback(req, res);
     if (path === '/api/integrations/list-projects')       return handleListProjects(req, res);
     if (path === '/api/integrations/disconnect-database')  return handleDisconnectDatabase(req, res);
+
+    // ── Design source integrations (Canva / Figma) ─────────────────────────
+    if (path === '/api/oauth/figma')               return handleFigmaOAuth(req, res);
+    if (path === '/api/oauth/figma/callback')      return handleFigmaCallback(req, res);
+    if (path === '/api/oauth/canva')               return handleCanvaOAuth(req, res);
+    if (path === '/api/oauth/canva/callback')      return handleCanvaCallback(req, res);
+    if (path === '/api/design/import')             return handleDesignImport(req, res);
 
     // ── Company / Employee accounts ────────────────────────────────────────
     if (path === '/api/company/check-username')           return handleCompanyCheckUsername(req, res);
@@ -1525,6 +1533,266 @@ async function handleSupabaseCallback(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// FIGMA OAUTH (design source — standard authorization-code flow)
+// ════════════════════════════════════════════════════════════════════════════
+async function handleFigmaOAuth(req, res) {
+    const { email, origin } = req.query;
+    if (!email) return res.status(400).send('Missing email.');
+
+    const clientId    = process.env.FIGMA_CLIENT_ID;
+    const redirectUri = process.env.FIGMA_REDIRECT_URI || `https://${req.headers.host}/api/oauth/figma/callback`;
+    if (!clientId) return res.status(500).send('Missing FIGMA_CLIENT_ID env var.');
+
+    const state = Buffer.from(JSON.stringify({ email, origin: origin || null })).toString('base64');
+    const url = new URL('https://www.figma.com/oauth');
+    url.searchParams.set('client_id',     clientId);
+    url.searchParams.set('redirect_uri',  redirectUri);
+    url.searchParams.set('scope',         'files:read');
+    url.searchParams.set('state',         state);
+    url.searchParams.set('response_type', 'code');
+
+    return res.redirect(302, url.toString());
+}
+
+async function handleFigmaCallback(req, res) {
+    const { code, state, error } = req.query;
+    if (error) return res.status(400).send(`OAuth error: ${error}`);
+    if (!code || !state) return res.status(400).send('Missing code or state.');
+
+    let email = '', origin = null;
+    try {
+        const parsed = JSON.parse(Buffer.from(state, 'base64').toString('utf-8'));
+        email  = parsed.email;
+        origin = parsed.origin;
+    } catch { return res.status(400).send('Invalid state parameter.'); }
+
+    const clientId     = process.env.FIGMA_CLIENT_ID;
+    const clientSecret = process.env.FIGMA_CLIENT_SECRET;
+    const redirectUri  = process.env.FIGMA_REDIRECT_URI || `https://${req.headers.host}/api/oauth/figma/callback`;
+    if (!clientId || !clientSecret) return res.status(500).send('Missing Figma OAuth env vars.');
+
+    try {
+        const tokenRes = await fetch('https://www.figma.com/api/oauth/token', {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body:    new URLSearchParams({
+                client_id: clientId, client_secret: clientSecret,
+                redirect_uri: redirectUri, code, grant_type: 'authorization_code',
+            }),
+        });
+        const tokens = await tokenRes.json();
+        if (tokens.error) return res.status(400).send(`Token error: ${tokens.error_description || tokens.error}`);
+
+        const db = getDb();
+        await db.collection('users').doc(email).set({
+            integrations: {
+                figma: {
+                    connected:     true,
+                    access_token:  tokens.access_token,
+                    refresh_token: tokens.refresh_token || null,
+                    expiry_date:   tokens.expires_in
+                        ? new Date(Date.now() + tokens.expires_in * 1000).toISOString()
+                        : null,
+                    connectedAt: new Date().toISOString(),
+                },
+            },
+        }, { merge: true });
+
+        const appUrl = origin || process.env.APP_URL ||
+                       `https://${req.headers.host.replace('comex-backend', 'cometchat-ai-platform').replace('.vercel.app', '.web.app')}`;
+        return res.redirect(302, `${appUrl}?figma_connected=1`);
+    } catch (err) {
+        console.error('[OAuth/Figma]', err.message);
+        return res.status(500).send(`Server error: ${err.message}`);
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// CANVA OAUTH (design source — Connect API, REQUIRES PKCE)
+// The code_verifier can't survive in memory across the redirect on a
+// serverless function, so it's parked in a short-lived Firestore doc keyed
+// by a random state id, then deleted once the callback consumes it.
+// ════════════════════════════════════════════════════════════════════════════
+function base64url(buffer) {
+    return buffer.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+async function handleCanvaOAuth(req, res) {
+    const { email, origin } = req.query;
+    if (!email) return res.status(400).send('Missing email.');
+
+    const clientId    = process.env.CANVA_CLIENT_ID;
+    const redirectUri = process.env.CANVA_REDIRECT_URI || `https://${req.headers.host}/api/oauth/canva/callback`;
+    if (!clientId) return res.status(500).send('Missing CANVA_CLIENT_ID env var.');
+
+    const codeVerifier  = base64url(crypto.randomBytes(64));
+    const codeChallenge = base64url(crypto.createHash('sha256').update(codeVerifier).digest());
+    const stateId        = base64url(crypto.randomBytes(16));
+
+    const db = getDb();
+    await db.collection('oauth_pkce').doc(stateId).set({
+        email, origin: origin || null, codeVerifier, createdAt: new Date().toISOString(),
+    });
+
+    const url = new URL('https://www.canva.com/api/oauth/authorize');
+    url.searchParams.set('client_id',             clientId);
+    url.searchParams.set('redirect_uri',          redirectUri);
+    url.searchParams.set('response_type',         'code');
+    url.searchParams.set('code_challenge',        codeChallenge);
+    url.searchParams.set('code_challenge_method', 's256');
+    url.searchParams.set('scope',                 'design:content:read design:meta:read asset:read');
+    url.searchParams.set('state',                 stateId);
+
+    return res.redirect(302, url.toString());
+}
+
+async function handleCanvaCallback(req, res) {
+    const { code, state, error } = req.query;
+    if (error) return res.status(400).send(`OAuth error: ${error}`);
+    if (!code || !state) return res.status(400).send('Missing code or state.');
+
+    const db = getDb();
+    const pkceRef  = db.collection('oauth_pkce').doc(state);
+    const pkceSnap = await pkceRef.get();
+    if (!pkceSnap.exists) return res.status(400).send('Invalid or expired state parameter. Please try connecting again.');
+
+    const { email, origin, codeVerifier } = pkceSnap.data();
+    await pkceRef.delete().catch(() => {});
+
+    const clientId     = process.env.CANVA_CLIENT_ID;
+    const clientSecret = process.env.CANVA_CLIENT_SECRET;
+    const redirectUri  = process.env.CANVA_REDIRECT_URI || `https://${req.headers.host}/api/oauth/canva/callback`;
+    if (!clientId || !clientSecret) return res.status(500).send('Missing Canva OAuth env vars.');
+
+    try {
+        const tokenRes = await fetch('https://api.canva.com/rest/v1/oauth/token', {
+            method:  'POST',
+            headers: {
+                'Content-Type':  'application/x-www-form-urlencoded',
+                'Authorization': 'Basic ' + Buffer.from(`${clientId}:${clientSecret}`).toString('base64'),
+            },
+            body: new URLSearchParams({
+                grant_type: 'authorization_code', code,
+                code_verifier: codeVerifier, redirect_uri: redirectUri,
+            }),
+        });
+        const tokens = await tokenRes.json();
+        if (tokens.error) return res.status(400).send(`Token error: ${tokens.error_description || tokens.error}`);
+
+        await db.collection('users').doc(email).set({
+            integrations: {
+                canva: {
+                    connected:     true,
+                    access_token:  tokens.access_token,
+                    refresh_token: tokens.refresh_token || null,
+                    expiry_date:   tokens.expires_in
+                        ? new Date(Date.now() + tokens.expires_in * 1000).toISOString()
+                        : null,
+                    connectedAt: new Date().toISOString(),
+                },
+            },
+        }, { merge: true });
+
+        const appUrl = origin || process.env.APP_URL ||
+                       `https://${req.headers.host.replace('comex-backend', 'cometchat-ai-platform').replace('.vercel.app', '.web.app')}`;
+        return res.redirect(302, `${appUrl}?canva_connected=1`);
+    } catch (err) {
+        console.error('[OAuth/Canva]', err.message);
+        return res.status(500).send(`Server error: ${err.message}`);
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// DESIGN IMPORT + VALIDATION (Canva / Figma)
+// Checklist mirrors the widget's own configurable elements: whatever the
+// person already configured earlier in the agent wizard (Header/Bot Name,
+// Avatar/Logo, Chat Bubble → theme color, Send Button) must exist as a
+// named layer/frame in the imported design.
+// ════════════════════════════════════════════════════════════════════════════
+function rgbToHex(r, g, b) {
+    const toHex = (v) => Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16).padStart(2, '0');
+    return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+}
+
+const REQUIRED_DESIGN_ELEMENTS = [
+    { key: 'header',  label: 'Header / Bot Name',         match: /header|bot[\s_-]?name|title/i },
+    { key: 'avatar',  label: 'Avatar / Logo',             match: /avatar|logo|icon/i },
+    { key: 'bubble',  label: 'Chat Bubble (theme color)', match: /bubble|chat[\s_-]?bg|background/i },
+    { key: 'sendbtn', label: 'Send Button',               match: /send[\s_-]?button|send[\s_-]?btn/i },
+];
+
+async function handleDesignImport(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { ownerEmail, service, fileKeyOrDesignId } = req.body || {};
+    if (!ownerEmail || !service || !fileKeyOrDesignId)
+        return res.status(400).json({ success: false, message: 'Missing ownerEmail, service, or fileKeyOrDesignId.' });
+    if (!['figma', 'canva'].includes(service))
+        return res.status(400).json({ success: false, message: `Unknown service: ${service}` });
+
+    try {
+        const db = getDb();
+        const userSnap = await db.collection('users').doc(ownerEmail).get();
+        const integrations = userSnap.exists ? (userSnap.data()?.integrations || {}) : {};
+
+        let layerNames = [];
+        const extracted = { themeColor: null, logoUrl: null };
+
+        if (service === 'figma') {
+            const figma = integrations.figma;
+            if (!figma?.connected) return res.status(400).json({ success: false, message: 'Figma not connected.' });
+
+            const r = await fetch(`https://api.figma.com/v1/files/${encodeURIComponent(fileKeyOrDesignId)}`, {
+                headers: { Authorization: `Bearer ${figma.access_token}` },
+            });
+            if (!r.ok) return res.status(502).json({ success: false, message: `Figma API error: ${await r.text()}` });
+            const data = await r.json();
+
+            const walk = (node) => {
+                if (!node) return;
+                const name = node.name || '';
+                layerNames.push(name);
+                if (/bubble|background/i.test(name) && node.fills?.[0]?.color) {
+                    const c = node.fills[0].color;
+                    extracted.themeColor = rgbToHex(c.r, c.g, c.b);
+                }
+                if (/avatar|logo/i.test(name) && node.type === 'IMAGE') {
+                    extracted.logoUrl = 'figma-image-ref'; // to fully resolve: call POST /v1/images/:key with node id
+                }
+                (node.children || []).forEach(walk);
+            };
+            walk(data.document);
+        }
+
+        if (service === 'canva') {
+            const canva = integrations.canva;
+            if (!canva?.connected) return res.status(400).json({ success: false, message: 'Canva not connected.' });
+
+            const r = await fetch(`https://api.canva.com/rest/v1/designs/${encodeURIComponent(fileKeyOrDesignId)}`, {
+                headers: { Authorization: `Bearer ${canva.access_token}` },
+            });
+            if (!r.ok) return res.status(502).json({ success: false, message: `Canva API error: ${await r.text()}` });
+            const data = await r.json();
+            // NOTE: Canva's Connect API design-metadata endpoint doesn't expose a
+            // full layer tree the way Figma's file API does — only page/title
+            // metadata is available today, so matching is shallower for Canva.
+            layerNames = [data.design?.title || ''];
+        }
+
+        const results = REQUIRED_DESIGN_ELEMENTS.map(req => ({
+            key: req.key,
+            label: req.label,
+            found: layerNames.some(n => req.match.test(n)),
+        }));
+        const allFound = results.every(r => r.found);
+
+        return res.json({ success: true, allFound, results, extracted });
+    } catch (err) {
+        console.error('[DesignImport]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // GET /api/integrations/list-projects?service=firebase|supabase&ownerEmail=...
 // ════════════════════════════════════════════════════════════════════════════
 async function handleListProjects(req, res) {
@@ -1585,6 +1853,8 @@ async function handleListProjects(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // POST /api/integrations/disconnect-database  { ownerEmail, service }
+// (Also handles design-tool disconnects — 'canva' and 'figma' — since both
+// just need their integrations.<field> wiped, same shape as the DB sources.)
 // ════════════════════════════════════════════════════════════════════════════
 async function handleDisconnectDatabase(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -1592,7 +1862,12 @@ async function handleDisconnectDatabase(req, res) {
     if (!ownerEmail || !service)
         return res.status(400).json({ success: false, message: 'Missing ownerEmail or service.' });
 
-    const fieldMap = { firebase: 'firebase_project', supabase: 'supabase' };
+    const fieldMap = {
+        firebase: 'firebase_project',
+        supabase: 'supabase',
+        canva:    'canva',
+        figma:    'figma',
+    };
     const field = fieldMap[service];
     if (!field) return res.status(400).json({ success: false, message: `Unknown service: ${service}` });
 
