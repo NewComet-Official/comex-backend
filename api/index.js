@@ -1547,7 +1547,7 @@ async function handleFigmaOAuth(req, res) {
     const url = new URL('https://www.figma.com/oauth');
     url.searchParams.set('client_id',     clientId);
     url.searchParams.set('redirect_uri',  redirectUri);
-    url.searchParams.set('scope',         'files:read');
+    url.searchParams.set('scope',         'file_content:read,file_metadata:read');
     url.searchParams.set('state',         state);
     url.searchParams.set('response_type', 'code');
 
