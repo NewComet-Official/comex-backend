@@ -1572,7 +1572,7 @@ async function handleFigmaCallback(req, res) {
     if (!clientId || !clientSecret) return res.status(500).send('Missing Figma OAuth env vars.');
 
     try {
-        const tokenRes = await fetch('https://www.figma.com/api/oauth/token', {
+        const tokenRes = await fetch('https://api.figma.com/v1/oauth/token', {
             method:  'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
             body:    new URLSearchParams({
@@ -1580,6 +1580,10 @@ async function handleFigmaCallback(req, res) {
                 redirect_uri: redirectUri, code, grant_type: 'authorization_code',
             }),
         });
+        if (!tokenRes.ok) {
+            const errText = await tokenRes.text();
+            return res.status(400).send(`Figma token exchange failed (HTTP ${tokenRes.status}): ${errText}`);
+        }
         const tokens = await tokenRes.json();
         if (tokens.error) return res.status(400).send(`Token error: ${tokens.error_description || tokens.error}`);
 
