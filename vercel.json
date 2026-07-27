@@ -9,7 +9,23 @@
       "dest": "/api/index.js"
     },
     {
+      "source": "/dashboard/testing/(.*)",
+      "dest": "/index.html"
+    },
+    {
+      "source": "/dashboard/(.*)",
+      "dest": "/index.html"
+    },
+    {
+      "source": "/recycle-bin",
+      "dest": "/index.html"
+    },
+    {
       "source": "/(dashboard|new-deployment|third-party-integrations|analytics|reports|human-dashboard|employee-dashboard|settings)",
+      "dest": "/index.html"
+    },
+    {
+      "source": "/(.*)",
       "dest": "/index.html"
     }
   ]
