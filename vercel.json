@@ -1,6 +1,11 @@
 {
   "version": 2,
   "routes": [
+    {
+      "source": "/",
+      "headers": { "Location": "/home" },
+      "status": 301
+    },
     { "source": "/widget.js",
     "dest": "/public/widget.js"
     },
@@ -21,7 +26,7 @@
       "dest": "/index.html"
     },
     {
-      "source": "/(dashboard|new-deployment|third-party-integrations|analytics|reports|human-dashboard|employee-dashboard|settings)",
+      "source": "/(dashboard|new-deployment|third-party-integrations|analytics|reports|human-dashboard|employee-dashboard|settings|home)",
       "dest": "/index.html"
     },
     {
