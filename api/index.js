@@ -214,9 +214,11 @@ export default async function handler(req, res) {
     if (path === '/api/oauth/google')             return handleGoogleOAuth(req, res);
     if (path === '/api/oauth/google/callback')    return handleGoogleCallback(req, res);
     if (path === '/api/disconnect-calendar')      return handleDisconnectCalendar(req, res);
+    if (path === '/api/integrations/toggle-calendar-account') return handleToggleCalendarAccount(req, res);
     if (path === '/api/report/submit')            return handleReportSubmit(req, res);
     if (path === '/api/bot/delete-cascade')       return handleBotDeleteCascade(req, res);
     if (path === '/api/account/delete-cascade')   return handleAccountDeleteCascade(req, res);
+    if (path === '/api/account/update-email')     return handleAccountChangeEmail(req, res);
 
     // ── Database source integrations (Firebase Project / Supabase) ────────
     if (path === '/api/oauth/firebase-project')          return handleFirebaseProjectOAuth(req, res);
@@ -697,19 +699,7 @@ async function handleAppointmentCancel(req, res) {
         const q = await botApptsRef.where('conversationId', '==', appt.conversationId).get();
         q.forEach(d => d.ref.update({ status: 'cancelled', cancelledAt: new Date().toISOString() }));
 
-        if (appt.googleCalendarEventId && ownerEmail) {
-            try {
-                const userSnap   = await db.collection('users').doc(ownerEmail).get();
-                const googleAuth = userSnap.data()?.integrations?.google_calendar;
-                if (googleAuth?.connected) {
-                    const token = await refreshTokenIfNeeded(googleAuth, ownerEmail, db);
-                    await fetch(
-                        `https://www.googleapis.com/calendar/v3/calendars/primary/events/${appt.googleCalendarEventId}`,
-                        { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } }
-                    );
-                }
-            } catch (e) { console.error('[Cancel/Calendar]', e.message); }
-        }
+        await deleteCalendarEventsForAppt(db, ownerEmail || appt.owner, appt);
 
         const notifyEmail = ownerEmail || appt.owner;
         if (notifyEmail) await sendFCMToUser(notifyEmail, buildCancellationNotification(appt));
@@ -759,18 +749,12 @@ async function handleAppointmentEdit(req, res) {
             q.forEach(d => d.ref.update({ [field]: resolvedValue, updatedAt: new Date().toISOString() }));
         }
 
-        if ((field === 'appointmentDay' || field === 'appointmentTime') && appt.googleCalendarEventId) {
+        if ((field === 'appointmentDay' || field === 'appointmentTime') && (appt.googleCalendarEvents?.length || appt.googleCalendarEventId)) {
             const notifyEmail = ownerEmail || appt.owner;
             if (notifyEmail) {
-                try {
-                    const userSnap   = await db.collection('users').doc(notifyEmail).get();
-                    const googleAuth = userSnap.data()?.integrations?.google_calendar;
-                    if (googleAuth?.connected) {
-                        const updatedAppt = { ...appt, [field]: resolvedValue };
-                        if (field === 'appointmentDay') updatedAppt.scheduledDate = resolveDay(resolvedValue);
-                        await updateCalendarEvent(googleAuth, appt.googleCalendarEventId, updatedAppt, notifyEmail, db);
-                    }
-                } catch (e) { console.error('[Edit/Calendar]', e.message); }
+                const updatedAppt = { ...appt, [field]: resolvedValue };
+                if (field === 'appointmentDay') updatedAppt.scheduledDate = resolveDay(resolvedValue);
+                await updateCalendarEventsForAppt(db, notifyEmail, updatedAppt);
             }
         }
 
@@ -1108,22 +1092,10 @@ async function handleChat(req, res) {
                 const q = await botApptsRef.where('conversationId', '==', convId).get();
                 q.forEach(d => d.ref.update({ status: 'cancelled', cancelledAt: new Date().toISOString() }));
 
-                if (appt.googleCalendarEventId && ownerEmail) {
-                    try {
-                        const userSnap   = await db.collection('users').doc(ownerEmail).get();
-                        const googleAuth = userSnap.data()?.integrations?.google_calendar;
-                        if (googleAuth?.connected) {
-                            const token = await refreshTokenIfNeeded(googleAuth, ownerEmail, db);
-                            await fetch(
-                                `https://www.googleapis.com/calendar/v3/calendars/primary/events/${appt.googleCalendarEventId}`,
-                                { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } }
-                            );
-                        }
-                    } catch (e) { console.error('[Cancel/Calendar]', e.message); }
-                }
-
-                if (ownerEmail)
+                if (ownerEmail) {
+                    await deleteCalendarEventsForAppt(db, ownerEmail, appt);
                     await sendFCMToUser(ownerEmail, buildCancellationNotification(appt)).catch(e => console.error('[Cancel/FCM]', e.message));
+                }
 
                 const reply = `✅ Your appointment has been successfully cancelled.\n\n📅 Cancelled: ${appt.scheduledDate} at ${appt.appointmentTime}\n👤 Name: ${appt.customerName}\n\nIf you'd like to rebook, just say "I want to book an appointment".`;
                 await logChat(db, businessId, convId, userMsg, reply, false, false);
@@ -1251,11 +1223,11 @@ async function handleChat(req, res) {
 
             const dateISO = resolveDay(appointmentDay);
 
+            let bookingAccounts = [];
             if (ownerEmail) {
-                const userSnap     = await db.collection('users').doc(ownerEmail).get();
-                const integrations = userSnap.exists ? (userSnap.data()?.integrations || {}) : {};
-                if (integrations.google_calendar?.connected) {
-                    const avail = await checkCalendarAvailability(integrations.google_calendar, dateISO, appointmentTime, ownerEmail, db);
+                bookingAccounts = bookingEnabledAccounts(await getGoogleCalendarAccounts(db, ownerEmail));
+                if (bookingAccounts.length) {
+                    const avail = await checkCalendarAvailability(bookingAccounts[0], dateISO, appointmentTime, ownerEmail, db);
                     if (!avail.available) {
                         const alts    = avail.suggestedTimes || [];
                         const altText = alts.length > 0
@@ -1271,21 +1243,22 @@ async function handleChat(req, res) {
                 customerName: userName, contactInfo,
                 appointmentDay, appointmentTime, scheduledDate: dateISO,
                 status: 'confirmed', createdAt: new Date().toISOString(),
-                googleCalendarEventId: null,
+                googleCalendarEvents: [],
             };
 
             const apptDocRef = await db.collection('appointments').add(appt);
             await db.collection('user_bots').doc(businessId).collection('appointments').add({ ...appt, globalId: apptDocRef.id });
 
             if (ownerEmail) {
-                const userSnap     = await db.collection('users').doc(ownerEmail).get();
-                const integrations = userSnap.exists ? (userSnap.data()?.integrations || {}) : {};
-                if (integrations.google_calendar?.connected) {
+                const createdEvents = [];
+                for (const acct of bookingAccounts) {
                     try {
-                        const calResult = await addCalendarEvent(integrations.google_calendar, appt, ownerEmail, db);
-                        if (calResult?.eventId) await apptDocRef.update({ googleCalendarEventId: calResult.eventId });
-                    } catch (e) { console.error('[Chat/Calendar]', e.message); }
+                        const calResult = await addCalendarEvent(acct, appt, ownerEmail, db);
+                        if (calResult?.eventId) createdEvents.push({ accountEmail: acct.email, eventId: calResult.eventId });
+                    } catch (e) { console.error('[Chat/Calendar]', acct.email, e.message); }
                 }
+                if (createdEvents.length) await apptDocRef.update({ googleCalendarEvents: createdEvents });
+
                 try { await sendFCMToUser(ownerEmail, buildBookingNotification(appt)); }
                 catch (e) { console.error('[FCM] Booking notify error:', e.message); }
             }
@@ -1472,6 +1445,7 @@ async function handleGoogleCallback(req, res) {
         const newAccount = {
             email:         calendarLabel,
             connected:     true,
+            enabledForBooking: true,
             access_token:  tokens.access_token,
             refresh_token: tokens.refresh_token || null,
             expiry_date:   tokens.expires_in
@@ -1481,7 +1455,7 @@ async function handleGoogleCallback(req, res) {
         };
 
         const idx = existing.findIndex(a => a.email === calendarLabel);
-        if (idx >= 0) existing[idx] = newAccount; else existing.push(newAccount);
+        if (idx >= 0) existing[idx] = { ...newAccount, enabledForBooking: existing[idx].enabledForBooking !== false }; else existing.push(newAccount);
 
         await db.collection('users').doc(email).set({
             integrations: {
@@ -1549,6 +1523,34 @@ async function handleDisconnectCalendar(req, res) {
         return res.json({ success: true, message: 'Calendar disconnected.' });
     } catch (err) {
         console.error('[DisconnectCalendar]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/integrations/toggle-calendar-account  { userEmail, calendarId, enabled }
+// Turns booking on/off for one connected Google account, without disconnecting it.
+// ════════════════════════════════════════════════════════════════════════════
+async function handleToggleCalendarAccount(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { userEmail, calendarId, enabled } = req.body || {};
+    if (!userEmail || !calendarId)
+        return res.status(400).json({ success: false, message: 'Missing userEmail or calendarId.' });
+
+    try {
+        const db = getDb();
+        const userRef = db.collection('users').doc(userEmail);
+        const snap = await userRef.get();
+        const accounts = snap.exists ? (snap.data()?.integrations?.google_calendar_accounts || []) : [];
+        const idx = accounts.findIndex(a => a.email === calendarId);
+        if (idx === -1) return res.status(404).json({ success: false, message: 'Calendar account not found.' });
+
+        accounts[idx] = { ...accounts[idx], enabledForBooking: enabled !== false };
+        await userRef.set({ integrations: { google_calendar_accounts: accounts } }, { merge: true });
+
+        return res.json({ success: true });
+    } catch (err) {
+        console.error('[ToggleCalendarAccount]', err.message);
         return res.status(500).json({ success: false, message: err.message });
     }
 }
@@ -1899,10 +1901,6 @@ async function handleCanvaCallback(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // DESIGN IMPORT + VALIDATION (Canva / Figma)
-// Checklist mirrors the widget's own configurable elements: whatever the
-// person already configured earlier in the agent wizard (Header/Bot Name,
-// Avatar/Logo, Chat Bubble → theme color, Send Button) must exist as a
-// named layer/frame in the imported design.
 // ════════════════════════════════════════════════════════════════════════════
 function rgbToHex(r, g, b) {
     const toHex = (v) => Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16).padStart(2, '0');
@@ -1967,9 +1965,6 @@ async function handleDesignImport(req, res) {
             });
             if (!r.ok) return res.status(502).json({ success: false, message: `Canva API error: ${await r.text()}` });
             const data = await r.json();
-            // NOTE: Canva's Connect API design-metadata endpoint doesn't expose a
-            // full layer tree the way Figma's file API does — only page/title
-            // metadata is available today, so matching is shallower for Canva.
             layerNames = [data.design?.title || ''];
         }
 
@@ -2048,8 +2043,6 @@ async function handleListProjects(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // POST /api/integrations/disconnect-database  { ownerEmail, service }
-// (Also handles design-tool disconnects — 'canva' and 'figma' — since both
-// just need their integrations.<field> wiped, same shape as the DB sources.)
 // ════════════════════════════════════════════════════════════════════════════
 async function handleDisconnectDatabase(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -2784,10 +2777,21 @@ async function getCalendarTimezone(accessToken) {
     } catch { return 'UTC'; }
 }
 
-async function refreshTokenIfNeeded(googleAuth, ownerEmail, db) {
-    let accessToken = googleAuth.access_token;
-    if (googleAuth.refresh_token && googleAuth.expiry_date) {
-        const expiryMs = new Date(googleAuth.expiry_date).getTime();
+// ── Multi-account Google Calendar helpers ──────────────────────────────────
+async function getGoogleCalendarAccounts(db, ownerEmail) {
+    if (!ownerEmail) return [];
+    const snap = await db.collection('users').doc(ownerEmail).get();
+    return snap.exists ? (snap.data()?.integrations?.google_calendar_accounts || []) : [];
+}
+
+function bookingEnabledAccounts(accounts) {
+    return (accounts || []).filter(a => a?.connected && a.enabledForBooking !== false);
+}
+
+async function refreshAccountToken(account, ownerEmail, db) {
+    let accessToken = account.access_token;
+    if (account.refresh_token && account.expiry_date) {
+        const expiryMs = new Date(account.expiry_date).getTime();
         if (!isNaN(expiryMs) && expiryMs < Date.now() + 60000) {
             const r = await fetch('https://oauth2.googleapis.com/token', {
                 method:  'POST',
@@ -2795,27 +2799,67 @@ async function refreshTokenIfNeeded(googleAuth, ownerEmail, db) {
                 body:    new URLSearchParams({
                     client_id:     process.env.GOOGLE_CLIENT_ID,
                     client_secret: process.env.GOOGLE_CLIENT_SECRET,
-                    refresh_token: googleAuth.refresh_token,
+                    refresh_token: account.refresh_token,
                     grant_type:    'refresh_token',
                 }),
             });
             const t = await r.json();
             if (t.access_token) {
                 accessToken = t.access_token;
-                await db.collection('users').doc(ownerEmail).update({
-                    'integrations.google_calendar.access_token': t.access_token,
-                    'integrations.google_calendar.expiry_date':
-                        new Date(Date.now() + (t.expires_in || 3500) * 1000).toISOString(),
-                });
+                const newExpiry = new Date(Date.now() + (t.expires_in || 3500) * 1000).toISOString();
+                account.access_token = t.access_token;
+                account.expiry_date  = newExpiry;
+                try {
+                    const userRef = db.collection('users').doc(ownerEmail);
+                    const snap = await userRef.get();
+                    const accounts = snap.exists ? (snap.data()?.integrations?.google_calendar_accounts || []) : [];
+                    const idx = accounts.findIndex(a => a.email === account.email);
+                    if (idx >= 0) {
+                        accounts[idx] = { ...accounts[idx], access_token: t.access_token, expiry_date: newExpiry };
+                        await userRef.update({ 'integrations.google_calendar_accounts': accounts });
+                    }
+                } catch (e) { /* best-effort */ }
             }
         }
     }
     return accessToken;
 }
 
-async function checkCalendarAvailability(googleAuth, dateISO, timeStr, ownerEmail, db) {
+async function deleteCalendarEventsForAppt(db, ownerEmail, appt) {
+    if (!ownerEmail) return;
+    const accounts = await getGoogleCalendarAccounts(db, ownerEmail);
+    const events = (appt.googleCalendarEvents && appt.googleCalendarEvents.length)
+        ? appt.googleCalendarEvents
+        : (appt.googleCalendarEventId ? [{ accountEmail: accounts[0]?.email || null, eventId: appt.googleCalendarEventId }] : []);
+    for (const ev of events) {
+        try {
+            const acct = accounts.find(a => a.email === ev.accountEmail) || accounts[0];
+            if (!acct?.connected) continue;
+            const token = await refreshAccountToken(acct, ownerEmail, db);
+            await fetch(`https://www.googleapis.com/calendar/v3/calendars/primary/events/${ev.eventId}`,
+                { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
+        } catch (e) { console.error('[Calendar/Delete]', e.message); }
+    }
+}
+
+async function updateCalendarEventsForAppt(db, ownerEmail, appt) {
+    if (!ownerEmail) return;
+    const accounts = await getGoogleCalendarAccounts(db, ownerEmail);
+    const events = (appt.googleCalendarEvents && appt.googleCalendarEvents.length)
+        ? appt.googleCalendarEvents
+        : (appt.googleCalendarEventId ? [{ accountEmail: accounts[0]?.email || null, eventId: appt.googleCalendarEventId }] : []);
+    for (const ev of events) {
+        try {
+            const acct = accounts.find(a => a.email === ev.accountEmail) || accounts[0];
+            if (!acct?.connected) continue;
+            await updateCalendarEvent(acct, ev.eventId, appt, ownerEmail, db);
+        } catch (e) { console.error('[Calendar/Update]', e.message); }
+    }
+}
+
+async function checkCalendarAvailability(account, dateISO, timeStr, ownerEmail, db) {
     try {
-        const accessToken = await refreshTokenIfNeeded(googleAuth, ownerEmail, db);
+        const accessToken = await refreshAccountToken(account, ownerEmail, db);
         const timeZone    = await getCalendarTimezone(accessToken);
         const parsed      = parseTime(timeStr);
         if (!parsed) return { available: true };
@@ -2882,8 +2926,8 @@ async function checkCalendarAvailability(googleAuth, dateISO, timeStr, ownerEmai
     }
 }
 
-async function addCalendarEvent(googleAuth, appt, ownerEmail, db) {
-    const accessToken = await refreshTokenIfNeeded(googleAuth, ownerEmail, db);
+async function addCalendarEvent(account, appt, ownerEmail, db) {
+    const accessToken = await refreshAccountToken(account, ownerEmail, db);
     const parsed = parseTime(appt.appointmentTime);
     if (!parsed) { console.error(`[Calendar] Cannot parse time "${appt.appointmentTime}"`); return null; }
 
@@ -2908,8 +2952,8 @@ async function addCalendarEvent(googleAuth, appt, ownerEmail, db) {
     return { eventId: data.id, eventLink: data.htmlLink };
 }
 
-async function updateCalendarEvent(googleAuth, eventId, appt, ownerEmail, db) {
-    const accessToken = await refreshTokenIfNeeded(googleAuth, ownerEmail, db);
+async function updateCalendarEvent(account, eventId, appt, ownerEmail, db) {
+    const accessToken = await refreshAccountToken(account, ownerEmail, db);
     const parsed = parseTime(appt.appointmentTime);
     if (!parsed) return;
 
