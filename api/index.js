@@ -286,6 +286,187 @@ async function deleteQueryBatch(db, queryRef, batchSize = 400) {
     return deleted;
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// LIVE DATABASE QUERYING (Firebase Project / Supabase)
+// ════════════════════════════════════════════════════════════════════════════
+const DB_SOURCE_CACHE_TTL_MS = 5 * 60 * 1000;
+const DB_SOURCE_FETCH_TIMEOUT_MS = 7000;
+const DB_SOURCE_MAX_COLLECTIONS = 6;
+const DB_SOURCE_MAX_DOCS_PER_COLLECTION = 8;
+const DB_SOURCE_MAX_TABLES = 6;
+const DB_SOURCE_MAX_ROWS_PER_TABLE = 8;
+
+function withTimeout(promise, ms) {
+    return Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Timed out')), ms)),
+    ]);
+}
+
+function firestoreValueToPlain(v) {
+    if (v == null) return null;
+    if ('stringValue' in v) return v.stringValue;
+    if ('integerValue' in v) return Number(v.integerValue);
+    if ('doubleValue' in v) return v.doubleValue;
+    if ('booleanValue' in v) return v.booleanValue;
+    if ('timestampValue' in v) return v.timestampValue;
+    if ('nullValue' in v) return null;
+    if ('mapValue' in v) {
+        const out = {};
+        const fields = v.mapValue.fields || {};
+        for (const k of Object.keys(fields)) out[k] = firestoreValueToPlain(fields[k]);
+        return out;
+    }
+    if ('arrayValue' in v) return (v.arrayValue.values || []).map(firestoreValueToPlain);
+    if ('geoPointValue' in v) return v.geoPointValue;
+    if ('referenceValue' in v) return v.referenceValue;
+    return null;
+}
+
+function firestoreDocToPlain(doc) {
+    const fields = doc.fields || {};
+    const out = {};
+    for (const k of Object.keys(fields)) out[k] = firestoreValueToPlain(fields[k]);
+    return out;
+}
+
+async function fetchFirebaseProjectSnapshot(ownerEmail, db, projectId) {
+    const userSnap = await db.collection('users').doc(ownerEmail).get();
+    const fb = userSnap.data()?.integrations?.firebase_project;
+    if (!fb?.connected) throw new Error('Firebase Project not connected.');
+    const accessToken = await refreshGenericGoogleToken(fb, ownerEmail, db, 'firebase_project');
+
+    const base = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/databases/(default)/documents`;
+
+    const listRes = await withTimeout(fetch(`${base}:listCollectionIds`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pageSize: DB_SOURCE_MAX_COLLECTIONS }),
+    }), DB_SOURCE_FETCH_TIMEOUT_MS);
+
+    if (!listRes.ok) {
+        const errText = await listRes.text();
+        throw new Error(`Firestore list collections failed (HTTP ${listRes.status}): ${errText.substring(0, 300)}`);
+    }
+    const listData = await listRes.json();
+    const collectionIds = (listData.collectionIds || []).slice(0, DB_SOURCE_MAX_COLLECTIONS);
+    if (!collectionIds.length) return 'No readable top-level collections found in this Firestore project.';
+
+    const sections = [];
+    for (const colId of collectionIds) {
+        try {
+            const docsRes = await withTimeout(fetch(
+                `${base}/${encodeURIComponent(colId)}?pageSize=${DB_SOURCE_MAX_DOCS_PER_COLLECTION}`,
+                { headers: { Authorization: `Bearer ${accessToken}` } }
+            ), DB_SOURCE_FETCH_TIMEOUT_MS);
+            if (!docsRes.ok) continue;
+            const docsData = await docsRes.json();
+            const docs = (docsData.documents || []).map(d => ({
+                id: (d.name || '').split('/').pop(),
+                ...firestoreDocToPlain(d),
+            }));
+            if (docs.length) {
+                sections.push(`Collection "${colId}" (up to ${DB_SOURCE_MAX_DOCS_PER_COLLECTION} docs):\n` +
+                    docs.map(d => JSON.stringify(d)).join('\n'));
+            }
+        } catch (e) { /* skip this collection */ }
+    }
+    return sections.length ? sections.join('\n\n') : 'Collections exist, but no readable documents were found.';
+}
+
+async function refreshSupabaseToken(sb, ownerEmail, db) {
+    let accessToken = sb.access_token;
+    if (sb.refresh_token && sb.expiry_date) {
+        const expiryMs = new Date(sb.expiry_date).getTime();
+        if (!isNaN(expiryMs) && expiryMs < Date.now() + 60000) {
+            const r = await fetch('https://api.supabase.com/v1/oauth/token', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'Authorization': 'Basic ' + Buffer.from(`${process.env.SUPABASE_CLIENT_ID}:${process.env.SUPABASE_CLIENT_SECRET}`).toString('base64'),
+                },
+                body: new URLSearchParams({ refresh_token: sb.refresh_token, grant_type: 'refresh_token' }),
+            });
+            const t = await r.json();
+            if (t.access_token) {
+                accessToken = t.access_token;
+                await db.collection('users').doc(ownerEmail).update({
+                    'integrations.supabase.access_token': t.access_token,
+                    'integrations.supabase.refresh_token': t.refresh_token || sb.refresh_token,
+                    'integrations.supabase.expiry_date': new Date(Date.now() + (t.expires_in || 3500) * 1000).toISOString(),
+                });
+            }
+        }
+    }
+    return accessToken;
+}
+
+async function runSupabaseSql(accessToken, projectRef, query) {
+    const r = await withTimeout(fetch(`https://api.supabase.com/v1/projects/${encodeURIComponent(projectRef)}/database/query`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query }),
+    }), DB_SOURCE_FETCH_TIMEOUT_MS);
+    if (!r.ok) {
+        const errText = await r.text();
+        throw new Error(`Supabase query failed (HTTP ${r.status}): ${errText.substring(0, 300)}`);
+    }
+    return r.json();
+}
+
+async function fetchSupabaseProjectSnapshot(ownerEmail, db, projectRef) {
+    const userSnap = await db.collection('users').doc(ownerEmail).get();
+    const sb = userSnap.data()?.integrations?.supabase;
+    if (!sb?.connected) throw new Error('Supabase not connected.');
+    const accessToken = await refreshSupabaseToken(sb, ownerEmail, db);
+
+    const tablesData = await runSupabaseSql(accessToken, projectRef,
+        `SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name LIMIT ${DB_SOURCE_MAX_TABLES};`);
+    const tables = (Array.isArray(tablesData) ? tablesData : []).map(r => r.table_name).filter(Boolean);
+    if (!tables.length) return 'No readable tables found in the public schema of this Supabase project.';
+
+    const sections = [];
+    for (const table of tables) {
+        try {
+            const rows = await runSupabaseSql(accessToken, projectRef, `SELECT * FROM "${table}" LIMIT ${DB_SOURCE_MAX_ROWS_PER_TABLE};`);
+            sections.push(Array.isArray(rows) && rows.length
+                ? `Table "${table}" (up to ${DB_SOURCE_MAX_ROWS_PER_TABLE} rows):\n${rows.map(r => JSON.stringify(r)).join('\n')}`
+                : `Table "${table}": (empty or no readable rows)`);
+        } catch (e) { /* skip this table */ }
+    }
+    return sections.join('\n\n');
+}
+
+// Cached on the bot doc so every chat message doesn't re-hit the live backend.
+async function getDbSourceSnapshot(db, businessId, source, ownerEmail) {
+    const cacheKey = `${source.service}:${source.projectId}`;
+    const botRef = db.collection('user_bots').doc(businessId);
+    const botSnap = await botRef.get();
+    const cache = botSnap.data()?.dbSourcesCache || {};
+    const cached = cache[cacheKey];
+
+    if (cached?.fetchedAt && (Date.now() - new Date(cached.fetchedAt).getTime() < DB_SOURCE_CACHE_TTL_MS)) {
+        return cached.text;
+    }
+
+    let text;
+    try {
+        if (source.service === 'firebase') text = await fetchFirebaseProjectSnapshot(ownerEmail, db, source.projectId);
+        else if (source.service === 'supabase') text = await fetchSupabaseProjectSnapshot(ownerEmail, db, source.projectId);
+        else return null;
+    } catch (err) {
+        console.error(`[DbSource:${cacheKey}]`, err.message);
+        if (cached?.text) return cached.text; // serve stale data over nothing
+        return `(Could not read live data from this ${source.service} project right now: ${err.message})`;
+    }
+
+    try {
+        await botRef.set({ dbSourcesCache: { ...cache, [cacheKey]: { text, fetchedAt: new Date().toISOString() } } }, { merge: true });
+    } catch (e) { /* best-effort */ }
+
+    return text;
+}
+
 async function deleteSubcollection(db, parentRef, subName) {
     return deleteQueryBatch(db, parentRef.collection(subName));
 }
@@ -819,8 +1000,18 @@ async function handleChat(req, res) {
             // ── Database sources (Firebase Project / Supabase) ──────────────
             const dbSources = kc.databaseSources || [];
             if (dbSources.length) {
-                const list = dbSources.map(s => `- ${s.service} project "${s.projectName || s.projectId}"`).join('\n');
-                sysPrompt += `\n\n[CONNECTED DATABASES]:\nThe following databases are linked to this agent, but live querying is not yet wired up:\n${list}\nIf asked about live data in these databases, say that live database lookups are coming soon rather than guessing.`;
+                const limitedSources = dbSources.slice(0, 3); // cap latency/cost
+                const snapshots = await Promise.all(limitedSources.map(async s => {
+                    try {
+                        return { s, text: await getDbSourceSnapshot(db, businessId, s, ownerEmail) };
+                    } catch (e) {
+                        return { s, text: `(Error reading live data: ${e.message})` };
+                    }
+                }));
+                const list = snapshots
+                    .map(({ s, text }) => `--- ${s.service.toUpperCase()} project "${s.projectName || s.projectId}" ---\n${text}`)
+                    .join('\n\n');
+                sysPrompt += `\n\n[CONNECTED DATABASES — LIVE DATA SNAPSHOT]:\nBelow is a read-only, cached-up-to-5-min sample of data from the databases linked to this agent (limited number of collections/tables and rows). Use it to answer questions accurately. If something isn't shown in the sample, say you don't have visibility into it instead of guessing.\n\n${list}`;
             }
         }
 
@@ -1380,9 +1571,9 @@ async function handleFirebaseProjectOAuth(req, res) {
     url.searchParams.set('redirect_uri',  redirectUri);
     url.searchParams.set('response_type', 'code');
     url.searchParams.set('scope', [
-        'https://www.googleapis.com/auth/firebase.readonly',
-        'https://www.googleapis.com/auth/cloud-platform.read-only',
-    ].join(' '));
+    'https://www.googleapis.com/auth/firebase.readonly',
+    'https://www.googleapis.com/auth/datastore',
+].join(' '));
     url.searchParams.set('access_type',   'offline');
     url.searchParams.set('prompt',        'consent');
     url.searchParams.set('state',         state);
