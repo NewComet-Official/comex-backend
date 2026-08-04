@@ -48,6 +48,26 @@ const MODEL_REGISTRY = {
 
 const DEFAULT_MODEL_KEY = 'llama-3.3-70b';
 
+// ═══ MULTI-AGENT ROUTER ═══
+async function routeToSubAgent(modelKey, userMsg, subAgents) {
+    if (!subAgents?.length) return null;
+    const listText = subAgents.map(a => `${a.id}: ${a.description || a.name}`).join('\n');
+    try {
+        const choice = await callLLM({
+            modelKey,
+            messages: [
+                { role: 'system', content: `You are a routing classifier. Pick the ID of the single best-matching specialized agent for the user's message below. Reply with ONLY the agent ID and nothing else.\n\nAgents:\n${listText}` },
+                { role: 'user', content: userMsg },
+            ],
+        });
+        const picked = (choice?.content || '').trim().toLowerCase().replace(/[^a-z0-9_\-]/g, '');
+        return subAgents.find(a => a.id.toLowerCase() === picked) || null;
+    } catch (e) {
+        console.error('[SubAgentRouter]', e.message);
+        return null;
+    }
+}
+
 const BOOKING_SYSTEM_SUFFIX = `
 
 PERSONALITY & BEHAVIOR:
@@ -938,7 +958,7 @@ async function handleConfig(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// CHAT — with CANCEL / EDIT / multi-model support
+// CHAT — with CANCEL / EDIT / multi-model / multi-agent support
 // ════════════════════════════════════════════════════════════════════════════
 async function handleChat(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -957,6 +977,7 @@ async function handleChat(req, res) {
         let sysPrompt  = 'You are a helpful, friendly customer service assistant.';
         let ownerEmail = '', botName = 'Assistant';
         let modelKey   = DEFAULT_MODEL_KEY;
+        let subAgents  = [];
         let behaviorConfig = {
             allowOutOfTopic: true,
             allowWebSearch: true,
@@ -970,6 +991,7 @@ async function handleChat(req, res) {
             ownerEmail = b.owner    || '';
             botName    = b.displayName || b.name || 'Assistant';
             modelKey   = b.modelKey || DEFAULT_MODEL_KEY;
+            subAgents  = Array.isArray(b.subAgents) ? b.subAgents.filter(a => a?.id && a?.systemPrompt) : [];
             behaviorConfig = Object.assign(behaviorConfig, b.behaviorConfig || {});
             const kc   = b.knowledgeContext || {};
             if (kc.systemPrompt) {
@@ -1177,6 +1199,15 @@ async function handleChat(req, res) {
         const isBookingConversation = bookingEnabled && /\b(book|schedule|appointment|slot|reserve|set up|fix a)\b/i.test(allTextLow);
         const allFieldsPresent      = isBookingConversation && hasName && hasContact && hasDay && hasTime;
 
+        // ── MULTI-AGENT ROUTING — classify + hand off to a specialized sub-agent, if any are configured ──
+        let routedAgent = null;
+        if (subAgents.length) {
+            routedAgent = await routeToSubAgent(modelKey, userMsg, subAgents);
+            if (routedAgent) {
+                sysPrompt += `\n\n[ACTIVE SPECIALIZED AGENT: ${routedAgent.name}]\nYou are now acting as this specialized agent. Follow its instructions closely while still respecting the behavior settings above.\n${routedAgent.systemPrompt}`;
+            }
+        }
+
         const choice = await callLLM({
             modelKey,
             messages: [
@@ -1281,7 +1312,7 @@ async function handleChat(req, res) {
 
         const answer = choice?.content?.trim() || 'How can I help you?';
         await logChat(db, businessId, convId, userMsg, answer, true, false);
-        return res.json({ success: true, answer, reply: answer });
+        return res.json({ success: true, answer, reply: answer, _agent: routedAgent?.name || null });
 
     } catch (err) {
         console.error('[Chat]', err.message);
