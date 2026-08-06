@@ -225,6 +225,7 @@ export default async function handler(req, res) {
     if (path === '/api/scrape')                   return handleScrape(req, res);
     if (path === '/api/deploy')                   return handleDeploy(req, res);
     if (path === '/api/calculate-roi')            return handleROI(req, res);
+    if (path === '/api/analytics/advanced')       return handleAdvancedAnalytics(req, res);
     if (path === '/api/models')                   return handleModels(req, res);
     if (path === '/api/fcm-register-token')       return handleFCMRegisterToken(req, res);
     if (path === '/api/fcm-remove-token')         return handleFCMRemoveToken(req, res);
@@ -287,6 +288,155 @@ async function handleModels(req, res) {
         provider: val.provider,
     }));
     return res.json({ success: true, models });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// ADVANCED ANALYTICS — fallback rate, sentiment, drop-off, topic clustering
+// ════════════════════════════════════════════════════════════════════════════
+
+const PERIOD_MS = {
+    week:         7   * 24 * 60 * 60 * 1000,
+    last15days:   15  * 24 * 60 * 60 * 1000,
+    month:        30  * 24 * 60 * 60 * 1000,
+    last6months:  182 * 24 * 60 * 60 * 1000,
+    year:         365 * 24 * 60 * 60 * 1000,
+    last5years:   5 * 365 * 24 * 60 * 60 * 1000,
+};
+
+function getPeriodStart(period) {
+    const now = new Date();
+    if (period === 'today') {
+        const d = new Date(now);
+        d.setHours(0, 0, 0, 0);
+        return d;
+    }
+    const ms = PERIOD_MS[period] || PERIOD_MS.week;
+    return new Date(now.getTime() - ms);
+}
+
+const FALLBACK_PATTERNS = /don't have (that|this) information|do not have (that|this) information|can only help with questions about this business|i'?m not sure|i am not sure|couldn't find|could not find|don't know the answer|flagged this for our team|speak with a person|connect (you )?(with|to) (a )?(human|team|agent)|live handoff isn't available|isn't available here right now/i;
+
+function detectFallback(answer) {
+    return FALLBACK_PATTERNS.test(String(answer || ''));
+}
+
+// Lightweight lexicon-based sentiment scorer (no extra LLM call per message —
+// keeps chat logging fast/cheap). Score range: -1 (negative) .. 1 (positive).
+const SENTIMENT_NEG = ['angry','frustrat','terrible','worst','hate','awful','useless','broken','disappoint','annoyed','not working',"doesn't work","isn't working",'bad experience','waste of time','horrible','stupid','ridiculous','unacceptable','confusing','complicated','slow','never works','give up','done with this','so bad','no help','not helpful','ridiculous','scam','rude'];
+const SENTIMENT_POS = ['thank','thanks','great','awesome','perfect','love','excellent','helpful','amazing','good job','appreciate','wonderful','fantastic','nice','cool','works great','exactly what','solved','sorted','happy','glad'];
+
+function computeSentiment(text) {
+    const t = String(text || '').toLowerCase();
+    let score = 0;
+    SENTIMENT_NEG.forEach(w => { if (t.includes(w)) score -= 1; });
+    SENTIMENT_POS.forEach(w => { if (t.includes(w)) score += 1; });
+    if (t.includes('!') && score < 0) score -= 0.5; // exclamation amplifies frustration
+    const clamped = Math.max(-1, Math.min(1, score / 3));
+    let label = 'neutral';
+    if (clamped > 0.12) label = 'positive';
+    else if (clamped < -0.12) label = 'negative';
+    return { label, score: Math.round(clamped * 100) / 100 };
+}
+
+const CLUSTER_STOPWORDS = new Set(['the','a','an','is','are','do','does','did','how','what','can','i','you','your','my','to','of','for','in','on','with','and','or','it','this','that','me','about','please','would','like','need','want','have','has','had','be','was','were','will','if','when','where','why','who','which','there','their','they','we','us','our','am','tell','know','get','got','just','also','some','any','one','not','from','at','as','so','but','than','then','out']);
+
+function clusterByKeyword(questions) {
+    const clusters = {};
+    (questions || []).forEach(q => {
+        const words = String(q || '').toLowerCase()
+            .replace(/[^a-z0-9\s]/g, ' ')
+            .split(/\s+/)
+            .filter(w => w.length > 2 && !CLUSTER_STOPWORDS.has(w));
+        if (!words.length) return;
+        const key = [...words].sort((a, b) => b.length - a.length)[0];
+        if (!clusters[key]) clusters[key] = { topic: key, count: 0, samples: [] };
+        clusters[key].count++;
+        if (clusters[key].samples.length < 3) clusters[key].samples.push(q);
+    });
+    return Object.values(clusters).sort((a, b) => b.count - a.count);
+}
+
+async function handleAdvancedAnalytics(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { businessId, period } = req.body || {};
+    if (!businessId) return res.status(400).json({ success: false, message: 'Missing businessId.' });
+
+    try {
+        const db = getDb();
+        const startISO = getPeriodStart(period || 'week').toISOString();
+
+        const chatsSnap = await db.collection('user_bots').doc(businessId).collection('chats')
+            .where('createdAt', '>=', startISO)
+            .orderBy('createdAt', 'asc')
+            .get();
+
+        const chats = [];
+        chatsSnap.forEach(d => chats.push({ id: d.id, ...d.data() }));
+
+        if (!chats.length) {
+            return res.json({
+                success: true, period: period || 'week', totalMessages: 0, totalConversations: 0,
+                fallback: { rate: 0, count: 0, total: 0 },
+                sentiment: { buckets: [], overallAvg: 0, positive: 0, neutral: 0, negative: 0 },
+                dropOff: { points: [], totalConversations: 0 },
+                topics: { clusters: [] },
+            });
+        }
+
+        // ── Fallback rate ──
+        const fallbackCount = chats.filter(c => c.fallback === true || (c.fallback === undefined && detectFallback(c.answer))).length;
+        const fallbackRate = Math.round((fallbackCount / chats.length) * 1000) / 10;
+
+        // ── Sentiment (day-bucketed trend) ──
+        const bucketMap = {};
+        let posCount = 0, negCount = 0, neuCount = 0, sentSum = 0;
+        chats.forEach(c => {
+            const day = String(c.createdAt || '').slice(0, 10) || 'unknown';
+            if (!bucketMap[day]) bucketMap[day] = { day, sum: 0, count: 0 };
+            const s = typeof c.sentimentScore === 'number' ? c.sentimentScore : computeSentiment(c.question).score;
+            bucketMap[day].sum += s;
+            bucketMap[day].count++;
+            sentSum += s;
+            const label = c.sentimentLabel || computeSentiment(c.question).label;
+            if (label === 'positive') posCount++;
+            else if (label === 'negative') negCount++;
+            else neuCount++;
+        });
+        const sentimentBuckets = Object.values(bucketMap)
+            .sort((a, b) => a.day.localeCompare(b.day))
+            .map(b => ({ day: b.day, avgSentiment: Math.round((b.sum / b.count) * 100) / 100, count: b.count }));
+
+        // ── Drop-off funnel: last message of each conversation ──
+        const convMap = {};
+        chats.forEach(c => {
+            if (!convMap[c.conversationId]) convMap[c.conversationId] = [];
+            convMap[c.conversationId].push(c);
+        });
+        const dropOffMessages = Object.values(convMap)
+            .map(msgs => msgs[msgs.length - 1]?.question)
+            .filter(Boolean);
+        const dropOffClusters = clusterByKeyword(dropOffMessages);
+
+        // ── Topic clustering across all questions in period ──
+        const allQuestions = chats.map(c => c.question).filter(Boolean);
+        const topicClusters = clusterByKeyword(allQuestions);
+
+        return res.json({
+            success: true, period: period || 'week',
+            totalMessages: chats.length, totalConversations: Object.keys(convMap).length,
+            fallback: { rate: fallbackRate, count: fallbackCount, total: chats.length },
+            sentiment: {
+                buckets: sentimentBuckets,
+                overallAvg: Math.round((sentSum / chats.length) * 100) / 100,
+                positive: posCount, neutral: neuCount, negative: negCount,
+            },
+            dropOff: { points: dropOffClusters.slice(0, 8), totalConversations: Object.keys(convMap).length },
+            topics: { clusters: topicClusters.slice(0, 10) },
+        });
+    } catch (err) {
+        console.error('[AdvancedAnalytics]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1055,7 +1205,7 @@ async function handleChat(req, res) {
                 await notifyOwnerAndEmployees(db, ownerEmail, buildHumanRequestNotification(botName, userMsg))
                     .catch(e => console.error('[Human/FCM]', e.message));
                 const reply = "I've let our team know you'd like to speak with a person — someone will join this chat shortly. Feel free to keep typing in the meantime and they'll see it as soon as they connect.";
-                await logChat(db, businessId, convId, userMsg, reply, false, false);
+                await logChat(db, businessId, convId, userMsg, reply, false, false, { humanRequested: true });
                 return res.json({ success: true, answer: reply, reply, _humanRequested: true, _requestId: requestId });
             } catch (e) {
                 console.error('[HumanHandoff]', e.message);
@@ -2673,10 +2823,16 @@ async function handleUpdateProfilePhoto(req, res) {
 // HELPERS
 // ════════════════════════════════════════════════════════════════════════════
 
-async function logChat(db, businessId, convId, question, answer, isGenuineQuery, isLeadCaptured) {
+async function logChat(db, businessId, convId, question, answer, isGenuineQuery, isLeadCaptured, opts = {}) {
     try {
+        const sentiment = computeSentiment(question);
+        const fallback = opts.fallback !== undefined ? opts.fallback : detectFallback(answer);
         await db.collection('user_bots').doc(businessId).collection('chats').add({
             conversationId: convId, question, answer, isGenuineQuery, isLeadCaptured,
+            fallback: !!fallback,
+            humanRequested: !!opts.humanRequested,
+            sentimentLabel: sentiment.label,
+            sentimentScore: sentiment.score,
             createdAt: new Date().toISOString(),
         });
     } catch (e) { console.warn('[Chat] Log error:', e.message); }
