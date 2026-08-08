@@ -114,12 +114,182 @@ const BOOKING_TOOL_DEF = {
     },
 };
 
-async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent, enableBookingTool }) {
+// ════════════════════════════════════════════════════════════════════════════
+// AUTONOMOUS ACTIONS — TOOL CALLING & WEBHOOK EXECUTION
+// ════════════════════════════════════════════════════════════════════════════
+
+// Sanitizes a user-configured action name into a safe function-calling identifier.
+function sanitizeActionFunctionName(name) {
+    return String(name || '')
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9_]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .substring(0, 64) || 'action';
+}
+
+// Resolves the callable function name for a configured agent action, preferring
+// the stored id (set client-side from the action name) and falling back to a
+// freshly sanitized version of the name if the id is missing/stale.
+function actionFunctionName(action) {
+    return action.id ? sanitizeActionFunctionName(action.id) : sanitizeActionFunctionName(action.name);
+}
+
+// Converts the user-configured `agentActions` array (stored on the bot doc)
+// into standard OpenAI/Groq/Mistral/Gemini-compatible `tools` function
+// definitions the LLM can choose to call.
+function buildAgentActionToolDefs(agentActions) {
+    return (Array.isArray(agentActions) ? agentActions : [])
+        .filter(a => a && a.name && a.url)
+        .map(a => {
+            const properties = {};
+            const required = [];
+            (Array.isArray(a.parameters) ? a.parameters : []).forEach(p => {
+                if (!p || !p.name) return;
+                const jsonType = p.type === 'number' ? 'number' : (p.type === 'boolean' ? 'boolean' : 'string');
+                properties[p.name] = {
+                    type: jsonType,
+                    description: p.description || `The ${p.name} parameter.`,
+                };
+                if (p.required) required.push(p.name);
+            });
+
+            return {
+                type: 'function',
+                function: {
+                    name: actionFunctionName(a),
+                    description: a.description || `Executes the "${a.name}" action against an external system.`,
+                    parameters: {
+                        type: 'object',
+                        properties,
+                        required,
+                    },
+                },
+            };
+        });
+}
+
+// Replaces `:param_name` path segments in a URL template with real values
+// extracted by the LLM (e.g. "https://api.site.com/orders/:order_id" with
+// { order_id: "1234" } becomes "https://api.site.com/orders/1234").
+function formatActionUrl(urlTemplate, params) {
+    let url = String(urlTemplate || '');
+    const usedKeys = new Set();
+    Object.keys(params || {}).forEach(key => {
+        const token = `:${key}`;
+        if (url.includes(token)) {
+            url = url.split(token).join(encodeURIComponent(String(params[key])));
+            usedKeys.add(key);
+        }
+    });
+    return { url, usedKeys };
+}
+
+// Executes a single configured autonomous action (webhook/API call) using the
+// parameters the LLM extracted from the conversation. Supports GET, POST,
+// PUT, DELETE, custom headers (e.g. Authorization / Bearer tokens), dynamic
+// URL path substitution, and query-string / JSON-body param placement.
+async function executeAgentAction(action, extractedParams) {
+    const params = extractedParams && typeof extractedParams === 'object' ? extractedParams : {};
+    const method = String(action.method || 'GET').toUpperCase();
+    const actionLabel = action.name || 'action';
+
+    try {
+        const { url: pathFormattedUrl, usedKeys } = formatActionUrl(action.url, params);
+
+        // Any parameters NOT consumed by the URL path template are sent either
+        // as query-string params (GET/DELETE) or as a JSON body (POST/PUT).
+        const remainingParams = {};
+        Object.keys(params).forEach(key => {
+            if (!usedKeys.has(key)) remainingParams[key] = params[key];
+        });
+
+        const headers = { 'Content-Type': 'application/json', 'Accept': 'application/json' };
+        (Array.isArray(action.headers) ? action.headers : []).forEach(h => {
+            if (h && h.key) headers[h.key] = h.value !== undefined ? h.value : '';
+        });
+
+        let finalUrl = pathFormattedUrl;
+        const fetchOptions = { method, headers, signal: AbortSignal.timeout(12000) };
+
+        if (method === 'GET' || method === 'DELETE') {
+            const qs = new URLSearchParams();
+            Object.entries(remainingParams).forEach(([k, v]) => {
+                if (v !== undefined && v !== null) qs.append(k, String(v));
+            });
+            const qsStr = qs.toString();
+            if (qsStr) finalUrl += (finalUrl.includes('?') ? '&' : '?') + qsStr;
+        } else {
+            fetchOptions.body = JSON.stringify(remainingParams);
+        }
+
+        const r = await fetch(finalUrl, fetchOptions);
+        const rawText = await r.text();
+        let parsedBody = rawText;
+        try { parsedBody = rawText ? JSON.parse(rawText) : null; } catch { /* leave as raw text */ }
+
+        if (!r.ok) {
+            return {
+                success: false,
+                status: r.status,
+                error: `Action "${actionLabel}" failed with HTTP ${r.status}.`,
+                data: parsedBody,
+            };
+        }
+
+        return { success: true, status: r.status, data: parsedBody };
+    } catch (err) {
+        const isTimeout = err.name === 'TimeoutError' || err.name === 'AbortError';
+        return {
+            success: false,
+            error: isTimeout
+                ? `Action "${actionLabel}" timed out while contacting the external system.`
+                : `Action "${actionLabel}" could not be completed: ${err.message}`,
+        };
+    }
+}
+
+// Runs every requested tool call for a batch of configured agent actions and
+// returns { toolCallId, functionName, result } entries ready to be appended
+// back into the conversation as `tool` role messages.
+async function runAgentActionToolCalls(toolCalls, agentActions) {
+    const results = [];
+    for (const tc of toolCalls) {
+        const fnName = tc.function?.name;
+        const actionDef = (agentActions || []).find(a => actionFunctionName(a) === fnName);
+
+        let args = {};
+        try { args = JSON.parse(tc.function?.arguments || '{}'); } catch { args = {}; }
+
+        let result;
+        if (actionDef) {
+            result = await executeAgentAction(actionDef, args);
+        } else {
+            result = { success: false, error: `No configured action matches "${fnName}".` };
+        }
+
+        results.push({ toolCallId: tc.id, functionName: fnName, result });
+    }
+    return results;
+}
+
+async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent, enableBookingTool, extraTools }) {
     const entry = MODEL_REGISTRY[modelKey] || MODEL_REGISTRY[DEFAULT_MODEL_KEY];
-    const tools = enableBookingTool ? [BOOKING_TOOL_DEF] : undefined;
-    const toolChoiceValue = enableBookingTool
-        ? (allFieldsPresent ? { type: 'function', function: { name: 'appointmentBooking' } } : 'auto')
-        : undefined;
+
+    const tools = [
+        ...(enableBookingTool ? [BOOKING_TOOL_DEF] : []),
+        ...(Array.isArray(extraTools) ? extraTools : []),
+    ];
+    const hasTools = tools.length > 0;
+
+    let toolChoiceValue;
+    if (toolChoice) {
+        toolChoiceValue = toolChoice;
+    } else if (enableBookingTool && allFieldsPresent) {
+        toolChoiceValue = { type: 'function', function: { name: 'appointmentBooking' } };
+    } else if (hasTools) {
+        toolChoiceValue = 'auto';
+    }
 
     if (entry.provider === 'groq') {
         if (!process.env.GROQ_API_KEY) throw new Error('GROQ_API_KEY not set.');
@@ -127,7 +297,7 @@ async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent, enabl
         const completion = await groq.chat.completions.create({
             model:       entry.id,
             messages,
-            ...(tools ? { tools, tool_choice: toolChoiceValue } : {}),
+            ...(hasTools ? { tools, tool_choice: toolChoiceValue } : {}),
             temperature: 0.3,
             max_tokens:  600,
         });
@@ -141,7 +311,7 @@ async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent, enabl
         const body = {
             model:       entry.id,
             messages,
-            ...(tools ? { tools, tool_choice: toolChoiceValue } : {}),
+            ...(hasTools ? { tools, tool_choice: toolChoiceValue } : {}),
             temperature: 0.3,
             max_tokens:  600,
         };
@@ -184,7 +354,7 @@ async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent, enabl
         const body = {
             model:       entry.id,
             messages,
-            ...(tools ? { tools, tool_choice: toolChoiceValue } : {}),
+            ...(hasTools ? { tools, tool_choice: toolChoiceValue } : {}),
             temperature: 0.3,
             max_tokens:  600,
         };
@@ -1108,7 +1278,7 @@ async function handleConfig(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// CHAT — with CANCEL / EDIT / multi-model / multi-agent support
+// CHAT — with CANCEL / EDIT / multi-model / multi-agent / autonomous actions support
 // ════════════════════════════════════════════════════════════════════════════
 async function handleChat(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -1128,6 +1298,7 @@ async function handleChat(req, res) {
         let ownerEmail = '', botName = 'Assistant';
         let modelKey   = DEFAULT_MODEL_KEY;
         let subAgents  = [];
+        let agentActionsList = [];
         let behaviorConfig = {
             allowOutOfTopic: true,
             allowWebSearch: true,
@@ -1142,6 +1313,7 @@ async function handleChat(req, res) {
             botName    = b.displayName || b.name || 'Assistant';
             modelKey   = b.modelKey || DEFAULT_MODEL_KEY;
             subAgents  = Array.isArray(b.subAgents) ? b.subAgents.filter(a => a?.id && a?.systemPrompt) : [];
+            agentActionsList = Array.isArray(b.agentActions) ? b.agentActions.filter(a => a?.name && a?.url) : [];
             behaviorConfig = Object.assign(behaviorConfig, b.behaviorConfig || {});
             const kc   = b.knowledgeContext || {};
             if (kc.systemPrompt) {
@@ -1194,6 +1366,11 @@ async function handleChat(req, res) {
         sysPrompt += humanHandoffEnabled
             ? `\n\n- If the user asks to speak with a human/person/agent, that request will be routed automatically by the system — you don't need to say anything special about it yourself.`
             : `\n\n- Human agent handoff is DISABLED for this agent. If the user asks to speak with a human, a real person, or a live agent, politely explain that live handoff isn't available here right now, and offer to keep helping them yourself.`;
+
+        // ── Autonomous actions — tell the model these tools exist and when to use them ──
+        if (agentActionsList.length) {
+            sysPrompt += `\n\nAUTONOMOUS ACTIONS:\n- You have access to real, live tools/actions that call external systems on this business's behalf (e.g. checking an order status, updating a record, triggering a webhook).\n- Call the matching tool whenever the user's request matches what that tool does, using the AI Description of each tool to decide when it applies.\n- Extract every required parameter directly from the conversation. If a required parameter is missing, ask the user for it before calling the tool.\n- After a tool result comes back, use it to give a clear, natural-language answer — never show the user raw JSON.\n- If a tool call fails or times out, apologize briefly and let the user know the action could not be completed right now.`;
+        }
 
         // ── HUMAN HANDOFF — checked before anything else (only when enabled).
         const wantsHuman = humanHandoffEnabled && /speak to human support|connect (me )?(to )?(a )?human|talk to (a )?(human|person|someone|agent|representative)|(human|real) (agent|person)|customer service rep|talk to (someone|somebody) real/i.test(userMsg);
@@ -1358,15 +1535,21 @@ async function handleChat(req, res) {
             }
         }
 
+        // ── Build tool definitions for any configured autonomous actions ──
+        const agentActionToolDefs = buildAgentActionToolDefs(agentActionsList);
+
+        const baseMessages = [
+            { role: 'system', content: sysPrompt },
+            ...safeHistory,
+            { role: 'user', content: userMsg },
+        ];
+
         const choice = await callLLM({
             modelKey,
-            messages: [
-                { role: 'system', content: sysPrompt },
-                ...safeHistory,
-                { role: 'user', content: userMsg },
-            ],
+            messages: baseMessages,
             allFieldsPresent,
             enableBookingTool: bookingEnabled,
+            extraTools: agentActionToolDefs,
         });
 
         if (bookingEnabled && choice?.content && !choice?.tool_calls) {
@@ -1458,6 +1641,64 @@ async function handleChat(req, res) {
             ].join('\n');
 
             return res.json({ success: true, answer, reply: answer });
+        }
+
+        // ── AUTONOMOUS ACTIONS — execute any non-booking tool calls the model requested ──
+        if (agentActionToolDefs.length && Array.isArray(choice?.tool_calls) && choice.tool_calls.length) {
+            const nonBookingCalls = choice.tool_calls.filter(tc => tc.function?.name !== 'appointmentBooking');
+
+            if (nonBookingCalls.length) {
+                const executed = await runAgentActionToolCalls(nonBookingCalls, agentActionsList);
+
+                const assistantToolCallMsg = {
+                    role: 'assistant',
+                    content: choice.content || null,
+                    tool_calls: nonBookingCalls,
+                };
+
+                const toolResultMessages = executed.map(e => ({
+                    role: 'tool',
+                    tool_call_id: e.toolCallId,
+                    name: e.functionName,
+                    content: JSON.stringify(e.result),
+                }));
+
+                const followUpMessages = [
+                    ...baseMessages,
+                    assistantToolCallMsg,
+                    ...toolResultMessages,
+                ];
+
+                let followUpChoice;
+                try {
+                    followUpChoice = await callLLM({
+                        modelKey,
+                        messages: followUpMessages,
+                        enableBookingTool: bookingEnabled,
+                        extraTools: agentActionToolDefs,
+                        toolChoice: 'none',
+                    });
+                } catch (err) {
+                    console.error('[AgentActions/FollowUp]', err.message);
+                    const fallbackAnswer = "I ran that action, but had trouble putting together a response. Could you ask again?";
+                    await logChat(db, businessId, convId, userMsg, fallbackAnswer, true, false, { fallback: true });
+                    return res.json({ success: true, answer: fallbackAnswer, reply: fallbackAnswer, _actionsExecuted: executed.map(e => e.functionName) });
+                }
+
+                const finalAnswer = followUpChoice?.content?.trim() ||
+                    (executed.every(e => e.result?.success)
+                        ? "Done — that action completed successfully."
+                        : "I wasn't able to complete that action. Please try again or contact support.");
+
+                await logChat(db, businessId, convId, userMsg, finalAnswer, true, false);
+                return res.json({
+                    success: true,
+                    answer: finalAnswer,
+                    reply: finalAnswer,
+                    _agent: routedAgent?.name || null,
+                    _actionsExecuted: executed.map(e => e.functionName),
+                });
+            }
         }
 
         const answer = choice?.content?.trim() || 'How can I help you?';
