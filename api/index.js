@@ -407,6 +407,7 @@ export default async function handler(req, res) {
     if (path === '/api/disconnect-calendar')      return handleDisconnectCalendar(req, res);
     if (path === '/api/integrations/toggle-calendar-account') return handleToggleCalendarAccount(req, res);
     if (path === '/api/report/submit')            return handleReportSubmit(req, res);
+    if (path === '/api/promo/validate')           return handlePromoValidate(req, res);
     if (path === '/api/bot/delete-cascade')       return handleBotDeleteCascade(req, res);
     if (path === '/api/account/delete-cascade')   return handleAccountDeleteCascade(req, res);
     if (path === '/api/account/update-email')     return handleAccountChangeEmail(req, res);
@@ -1736,6 +1737,88 @@ async function handleROI(req, res) {
         const resolutionRate = genuine > 0 ? Math.round(((genuine - leads) / genuine) * 100) : 100;
         return res.json({ success: true, totalConversations: total, hoursSaved, moneySaved, leadsCaptured: leads, resolutionRate });
     } catch (err) {
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// PROMO CODES — dev-phase plan unlocks
+// ════════════════════════════════════════════════════════════════════════════
+// Backs window.applyPromoCode() in index.html (POST /api/promo/validate).
+// Codes live server-side only, in the Firestore collection "promo_codes",
+// keyed by the uppercased code itself, e.g.:
+//
+//   promo_codes/TESTER100
+//     { planKey: 'teamplus', active: true, maxRedemptions: 50,
+//       redeemedCount: 0, redeemedBy: [], expiresAt: null }
+//
+// Nothing about valid codes is ever shipped to the browser — the client
+// just POSTs whatever the person typed and gets back success/failure plus
+// (on success) the planKey to unlock.
+// ════════════════════════════════════════════════════════════════════════════
+async function handlePromoValidate(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { code, email } = req.body || {};
+    if (!code || !email)
+        return res.status(400).json({ success: false, message: 'Missing code or email.' });
+
+    const normalizedCode = String(code).trim().toUpperCase();
+    if (!normalizedCode)
+        return res.status(400).json({ success: false, message: 'Please enter a promo code.' });
+
+    try {
+        const db = getDb();
+        const promoRef = db.collection('promo_codes').doc(normalizedCode);
+
+        const result = await db.runTransaction(async (tx) => {
+            const snap = await tx.get(promoRef);
+            if (!snap.exists) {
+                return { success: false, message: 'Invalid or expired promo code.' };
+            }
+
+            const promo = snap.data();
+
+            if (promo.active === false) {
+                return { success: false, message: 'This promo code is no longer active.' };
+            }
+
+            if (promo.expiresAt && new Date(promo.expiresAt).getTime() < Date.now()) {
+                return { success: false, message: 'This promo code has expired.' };
+            }
+
+            if (!promo.planKey) {
+                return { success: false, message: 'This promo code is misconfigured. Please contact support.' };
+            }
+
+            const redeemedBy = Array.isArray(promo.redeemedBy) ? promo.redeemedBy : [];
+            const alreadyRedeemedByThisUser = redeemedBy.includes(email);
+
+            if (!alreadyRedeemedByThisUser) {
+                const maxRedemptions = typeof promo.maxRedemptions === 'number' ? promo.maxRedemptions : null;
+                const redeemedCount  = typeof promo.redeemedCount === 'number' ? promo.redeemedCount : redeemedBy.length;
+
+                if (maxRedemptions !== null && redeemedCount >= maxRedemptions) {
+                    return { success: false, message: 'This promo code has reached its redemption limit.' };
+                }
+
+                tx.set(promoRef, {
+                    redeemedCount: redeemedCount + 1,
+                    redeemedBy: [...redeemedBy, email],
+                    lastRedeemedAt: new Date().toISOString(),
+                }, { merge: true });
+            }
+
+            return { success: true, planKey: promo.planKey };
+        });
+
+        if (!result.success) {
+            const isGone = /expired|no longer active|reached its redemption limit/i.test(result.message || '');
+            return res.status(isGone ? 410 : 404).json(result);
+        }
+
+        return res.json(result);
+    } catch (err) {
+        console.error('[Promo/Validate]', err.message);
         return res.status(500).json({ success: false, message: err.message });
     }
 }
