@@ -511,28 +511,30 @@ async function handleEnterpriseCreateCheckout(req, res) {
     if (!(price >= ENTERPRISE_PRICING.basePrice))
         return res.status(400).json({ success: false, message: 'Invalid plan configuration.' });
 
-    const whopApiKey = process.env.WHOP_API_KEY;
-    const whopPlanId = process.env.WHOP_ENTERPRISE_PLAN_ID;
-    if (!whopApiKey || !whopPlanId) {
+    const whopApiKey    = process.env.WHOP_API_KEY;
+    const whopCompanyId = process.env.WHOP_COMPANY_ID;          // biz_xxxxxxxxxxxxxx
+    const whopProductId = process.env.WHOP_ENTERPRISE_PRODUCT_ID; // prod_xxxxxxxxxxxxx
+    if (!whopApiKey || !whopCompanyId || !whopProductId) {
         return res.status(500).json({
             success: false,
-            message: 'Enterprise checkout is not configured yet. Set WHOP_API_KEY and WHOP_ENTERPRISE_PLAN_ID.',
+            message: 'Enterprise checkout is not configured yet. Set WHOP_API_KEY, WHOP_COMPANY_ID, and WHOP_ENTERPRISE_PRODUCT_ID.',
         });
     }
 
     try {
-        const amountCents = Math.round(price * 100);
         const appUrl = process.env.APP_URL || `https://${req.headers.host}`;
 
-        const r = await fetch('https://api.whop.com/v5/checkout/sessions', {
+        // Whop's REST API (api.whop.com/api/v1) has no "custom_amount" override
+        // for a fixed plan_id. Dynamic pricing = a checkout configuration with
+        // an inline plan whose renewal_price is the amount computed above.
+        const r = await fetch('https://api.whop.com/api/v1/checkout_configurations', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
                 'Authorization': `Bearer ${whopApiKey}`,
             },
             body: JSON.stringify({
-                plan_id: whopPlanId,
-                custom_amount: amountCents, // cents
+                mode: 'payment',
                 metadata: {
                     company_id: companyId || email,
                     owner_email: email,
@@ -542,26 +544,37 @@ async function handleEnterpriseCreateCheckout(req, res) {
                     tier: 'enterprise',
                 },
                 redirect_url: `${appUrl}/dashboard?enterprise_checkout=started`,
+                plan: {
+                    company_id: whopCompanyId,
+                    product_id: whopProductId,
+                    currency: 'usd',
+                    plan_type: 'renewal',
+                    billing_period: 30,
+                    renewal_price: price,
+                    visibility: 'hidden',
+                },
             }),
         });
 
         if (!r.ok) {
             const errText = await r.text();
-            throw new Error(`Whop checkout session failed (HTTP ${r.status}): ${errText.substring(0, 300)}`);
+            throw new Error(`Whop checkout configuration failed (HTTP ${r.status}): ${errText.substring(0, 300)}`);
         }
 
         const data = await r.json();
-        const checkoutUrl = data.checkout_url || data.url || data.purchase_url;
-        if (!checkoutUrl) throw new Error('Whop did not return a checkout URL.');
+        let checkoutUrl = data.purchase_url;
+        if (checkoutUrl && !/^https?:\/\//i.test(checkoutUrl)) {
+            checkoutUrl = `https://whop.com${checkoutUrl.startsWith('/') ? '' : '/'}${checkoutUrl}`;
+        }
+        if (!checkoutUrl) throw new Error('Whop did not return a purchase URL.');
 
-        // Record the pending request so support/debugging has a trail even
-        // before the webhook fires.
         try {
             const db = getDb();
             await db.collection('enterprise_checkout_requests').add({
                 ownerEmail: email, companyId: companyId || email,
                 creditPool: credits, agentCount: agents, seatCount: seats,
-                price, createdAt: new Date().toISOString(),
+                price, whopCheckoutConfigId: data.id || null,
+                createdAt: new Date().toISOString(),
             });
         } catch (e) { /* best-effort logging only */ }
 
