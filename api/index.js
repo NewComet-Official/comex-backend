@@ -412,6 +412,10 @@ export default async function handler(req, res) {
     if (path === '/api/account/delete-cascade')   return handleAccountDeleteCascade(req, res);
     if (path === '/api/account/update-email')     return handleAccountChangeEmail(req, res);
 
+    // ── Enterprise dynamic pricing (Whop) ──────────────────────────────────
+    if (path === '/api/enterprise/create-checkout') return handleEnterpriseCreateCheckout(req, res);
+    if (path === '/api/webhooks/whop')               return handleWhopWebhook(req, res);
+
     // ── Database source integrations (Firebase Project / Supabase) ────────
     if (path === '/api/oauth/firebase-project')          return handleFirebaseProjectOAuth(req, res);
     if (path === '/api/oauth/firebase-project/callback')  return handleFirebaseProjectCallback(req, res);
@@ -431,7 +435,7 @@ export default async function handler(req, res) {
     if (path === '/api/company/check-username')           return handleCompanyCheckUsername(req, res);
     if (path === '/api/company/setup')                     return handleCompanySetup(req, res);
     if (path === '/api/company/join-code')                 return handleCompanyJoinCode(req, res);
-    if (path === '/api/company/join-code/regenerate')       return handleCompanyJoinCodeRegenerate(req, res);
+    if (path === '/api/company/join-code/regenerate'       ) return handleCompanyJoinCodeRegenerate(req, res);
     if (path === '/api/employee/verify-and-connect')      return handleEmployeeVerifyAndConnect(req, res);
     if (path === '/api/company/employees/list')           return handleCompanyEmployeesList(req, res);
     if (path === '/api/company/employees/remove')         return handleCompanyEmployeeRemove(req, res);
@@ -459,6 +463,190 @@ async function handleModels(req, res) {
         provider: val.provider,
     }));
     return res.json({ success: true, models });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// ENTERPRISE DYNAMIC PRICING (WHOP)
+// ════════════════════════════════════════════════════════════════════════════
+
+const ENTERPRISE_PRICING = {
+    basePrice:        499,     // $499/mo base, includes baseCredits + baseAgents + baseSeats
+    baseCredits:      45000,   creditOverageRate: 0.010,  maxCredits: 2000000,
+    baseAgents:       10,      agentOverageRate:  15,     maxAgents:  5000,
+    baseSeats:        10,      seatOverageRate:   10,     maxSeats:   5000,
+};
+
+// Server-side source of truth for the price — NEVER trust a client-sent
+// dollar amount. Re-derives price from credits + agents + seats every time.
+function calculateEnterprisePrice(rawCreditPool, rawAgentCount, rawSeatCount) {
+    let credits = Math.round(Number(rawCreditPool) || 0);
+    credits = Math.max(ENTERPRISE_PRICING.baseCredits, Math.min(ENTERPRISE_PRICING.maxCredits, credits));
+
+    let agents = Math.round(Number(rawAgentCount) || ENTERPRISE_PRICING.baseAgents);
+    agents = Math.max(ENTERPRISE_PRICING.baseAgents, Math.min(ENTERPRISE_PRICING.maxAgents, agents));
+
+    let seats = Math.round(Number(rawSeatCount) || ENTERPRISE_PRICING.baseSeats);
+    seats = Math.max(ENTERPRISE_PRICING.baseSeats, Math.min(ENTERPRISE_PRICING.maxSeats, seats));
+
+    const creditsCost = Math.max(0, credits - ENTERPRISE_PRICING.baseCredits) * ENTERPRISE_PRICING.creditOverageRate;
+    const agentsCost  = Math.max(0, agents  - ENTERPRISE_PRICING.baseAgents)  * ENTERPRISE_PRICING.agentOverageRate;
+    const seatsCost   = Math.max(0, seats   - ENTERPRISE_PRICING.baseSeats)   * ENTERPRISE_PRICING.seatOverageRate;
+
+    const price = ENTERPRISE_PRICING.basePrice + creditsCost + agentsCost + seatsCost;
+    return { credits, agents, seats, price: Math.round(price * 100) / 100 };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/enterprise/create-checkout  { email, companyId, creditPool, agentCount, seatCount }
+// Server re-validates the price, then asks Whop for an exact-amount dynamic
+// checkout session and returns the URL to redirect the user to.
+// ════════════════════════════════════════════════════════════════════════════
+async function handleEnterpriseCreateCheckout(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { email, companyId, creditPool, agentCount, seatCount } = req.body || {};
+    if (!email || creditPool === undefined || creditPool === null)
+        return res.status(400).json({ success: false, message: 'Missing email or creditPool.' });
+
+    const { credits, agents, seats, price } = calculateEnterprisePrice(creditPool, agentCount, seatCount);
+    if (!(price >= ENTERPRISE_PRICING.basePrice))
+        return res.status(400).json({ success: false, message: 'Invalid plan configuration.' });
+
+    const whopApiKey = process.env.WHOP_API_KEY;
+    const whopPlanId = process.env.WHOP_ENTERPRISE_PLAN_ID;
+    if (!whopApiKey || !whopPlanId) {
+        return res.status(500).json({
+            success: false,
+            message: 'Enterprise checkout is not configured yet. Set WHOP_API_KEY and WHOP_ENTERPRISE_PLAN_ID.',
+        });
+    }
+
+    try {
+        const amountCents = Math.round(price * 100);
+        const appUrl = process.env.APP_URL || `https://${req.headers.host}`;
+
+        const r = await fetch('https://api.whop.com/v5/checkout/sessions', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${whopApiKey}`,
+            },
+            body: JSON.stringify({
+                plan_id: whopPlanId,
+                custom_amount: amountCents, // cents
+                metadata: {
+                    company_id: companyId || email,
+                    owner_email: email,
+                    credit_pool: credits,
+                    agent_count: agents,
+                    seat_count: seats,
+                    tier: 'enterprise',
+                },
+                redirect_url: `${appUrl}/dashboard?enterprise_checkout=started`,
+            }),
+        });
+
+        if (!r.ok) {
+            const errText = await r.text();
+            throw new Error(`Whop checkout session failed (HTTP ${r.status}): ${errText.substring(0, 300)}`);
+        }
+
+        const data = await r.json();
+        const checkoutUrl = data.checkout_url || data.url || data.purchase_url;
+        if (!checkoutUrl) throw new Error('Whop did not return a checkout URL.');
+
+        // Record the pending request so support/debugging has a trail even
+        // before the webhook fires.
+        try {
+            const db = getDb();
+            await db.collection('enterprise_checkout_requests').add({
+                ownerEmail: email, companyId: companyId || email,
+                creditPool: credits, agentCount: agents, seatCount: seats,
+                price, createdAt: new Date().toISOString(),
+            });
+        } catch (e) { /* best-effort logging only */ }
+
+        return res.json({ success: true, checkoutUrl, credits, agents, seats, price });
+    } catch (err) {
+        console.error('[Enterprise/CreateCheckout]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/webhooks/whop — automated provisioning / downgrade on payment events
+// ════════════════════════════════════════════════════════════════════════════
+async function handleWhopWebhook(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+
+    // Verify the webhook signature if Whop supplied one and you've set
+    // WHOP_WEBHOOK_SECRET. Adjust the header name / HMAC scheme to match
+    // whatever Whop documents for your account — this is the common pattern.
+    const signature = req.headers['x-whop-signature'];
+    const webhookSecret = process.env.WHOP_WEBHOOK_SECRET;
+    if (webhookSecret && signature) {
+        try {
+            const rawBody = JSON.stringify(req.body);
+            const expected = crypto.createHmac('sha256', webhookSecret).update(rawBody).digest('hex');
+            if (expected !== signature) {
+                console.warn('[Whop/Webhook] Signature mismatch — rejecting.');
+                return res.status(401).json({ success: false, message: 'Invalid signature.' });
+            }
+        } catch (e) {
+            console.warn('[Whop/Webhook] Signature check errored, rejecting to be safe:', e.message);
+            return res.status(401).json({ success: false, message: 'Signature verification failed.' });
+        }
+    }
+
+    const event    = req.body || {};
+    const type     = event.type || event.action;
+    const data     = event.data || {};
+    const metadata = data.metadata || {};
+
+    try {
+        const db = getDb();
+        const ownerEmail = metadata.owner_email;
+        const creditPool = parseInt(metadata.credit_pool, 10) || ENTERPRISE_PRICING.baseCredits;
+        const agentCount = parseInt(metadata.agent_count, 10) || ENTERPRISE_PRICING.baseAgents;
+        const seatCount  = parseInt(metadata.seat_count, 10)  || ENTERPRISE_PRICING.baseSeats;
+
+        if (!ownerEmail) {
+            console.warn('[Whop/Webhook] Event missing owner_email metadata, ignoring:', type);
+            return res.json({ success: true });
+        }
+
+        if (type === 'membership.went_valid' || type === 'payment.succeeded') {
+            await db.collection('users').doc(ownerEmail).set({
+                planTier: 'enterprise',
+                planUnlockedByPromo: false,
+                enterprise: {
+                    monthlyCredits: creditPool,
+                    maxAgents: agentCount, // purchased count, not unlimited — re-run checkout to scale up
+                    maxSeats: seatCount,
+                    integrations: {
+                        firebase: true, supabase: true, canva: true, figma: true,
+                        google_calendar: true, push_alerts: true,
+                    },
+                    status: 'active',
+                    whopMembershipId: data.id || null,
+                    activatedAt: new Date().toISOString(),
+                },
+            }, { merge: true });
+            console.log(`[Whop/Webhook] Enterprise activated for ${ownerEmail} — ${creditPool} credits, ${agentCount} agents, ${seatCount} seats/mo.`);
+        } else if (type === 'membership.went_invalid') {
+            await db.collection('users').doc(ownerEmail).set({
+                planTier: 'free',
+                enterprise: { status: 'cancelled', cancelledAt: new Date().toISOString() },
+            }, { merge: true });
+            console.log(`[Whop/Webhook] Enterprise cancelled for ${ownerEmail}, downgraded to free.`);
+        } else {
+            console.log(`[Whop/Webhook] Unhandled event type: ${type}`);
+        }
+
+        return res.json({ success: true });
+    } catch (err) {
+        console.error('[Whop/Webhook]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
