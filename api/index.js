@@ -524,6 +524,11 @@ async function handleEnterpriseCreateCheckout(req, res) {
     try {
         const appUrl = process.env.APP_URL || `https://${req.headers.host}`;
 
+        // DEBUG: confirm exactly which IDs are being sent to Whop (never log
+        // the API key itself). A 404 here means one of these two doesn't
+        // resolve under the account that owns WHOP_API_KEY.
+        console.log('[Enterprise/CreateCheckout] company_id=', whopCompanyId, 'product_id=', whopProductId, 'price=', price);
+
         // Whop's REST API (api.whop.com/api/v1) has no "custom_amount" override
         // for a fixed plan_id. Dynamic pricing = a checkout configuration with
         // an inline plan whose renewal_price is the amount computed above.
@@ -558,7 +563,10 @@ async function handleEnterpriseCreateCheckout(req, res) {
 
         if (!r.ok) {
             const errText = await r.text();
-            throw new Error(`Whop checkout configuration failed (HTTP ${r.status}): ${errText.substring(0, 300)}`);
+            // Surface the exact IDs in the thrown message too, so this shows
+            // up in Vercel's function log for the failed request without
+            // needing to cross-reference the earlier console.log line.
+            throw new Error(`Whop checkout configuration failed (HTTP ${r.status}) [company_id=${whopCompanyId}, product_id=${whopProductId}]: ${errText.substring(0, 300)}`);
         }
 
         const data = await r.json();
@@ -614,6 +622,8 @@ async function handleWhopWebhook(req, res) {
     const type     = event.type || event.action;
     const data     = event.data || {};
     const metadata = data.metadata || {};
+
+
 
     try {
         const db = getDb();
