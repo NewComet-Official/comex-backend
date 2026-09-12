@@ -431,6 +431,7 @@ export default async function handler(req, res) {
     if (path === '/api/bot/delete-cascade')       return handleBotDeleteCascade(req, res);
     if (path === '/api/account/delete-cascade')   return handleAccountDeleteCascade(req, res);
     if (path === '/api/account/update-email')     return handleAccountChangeEmail(req, res);
+    if (path === '/api/account/check-exists')     return handleCheckAccountExists(req, res);
 
     // ── Enterprise dynamic pricing (Whop) ──────────────────────────────────
     if (path === '/api/enterprise/create-checkout') return handleEnterpriseCreateCheckout(req, res);
@@ -3456,6 +3457,30 @@ function parseTime(timeStr) {
         if (h >= 0 && h <= 23 && min >= 0 && min <= 59) return { h, min };
     }
     return null;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/account/check-exists  { email }
+// Note: this intentionally reveals whether an email is registered, which is
+// a mild email-enumeration tradeoff — acceptable here since it's explicitly
+// part of the requested UX. Consider rate-limiting this endpoint.
+// ════════════════════════════════════════════════════════════════════════════
+async function handleCheckAccountExists(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { email } = req.body || {};
+    if (!email) return res.status(400).json({ success: false, message: 'Missing email.' });
+
+    try {
+        const authAdmin = getAuthAdmin();
+        await authAdmin.getUserByEmail(email);
+        return res.json({ success: true, exists: true });
+    } catch (err) {
+        if (err.code === 'auth/user-not-found') {
+            return res.json({ success: true, exists: false });
+        }
+        console.error('[Account/CheckExists]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
 }
 
 async function handleAccountChangeEmail(req, res) {
