@@ -273,6 +273,21 @@ async function runAgentActionToolCalls(toolCalls, agentActions) {
     return results;
 }
 
+// Some reasoning-capable open models (Qwen, DeepSeek-style, etc.) emit a
+// <think>...</think> block ahead of their real answer when called via the
+// raw chat-completions API — Groq doesn't strip this for us. Remove it
+// before the content is ever shown to a user or parsed for tool-call JSON.
+function stripThinkingTags(text) {
+    if (!text) return text;
+    return text
+        .replace(/<think>[\s\S]*?<\/think>/gi, '')
+        .replace(/<thinking>[\s\S]*?<\/thinking>/gi, '')
+        // Handles the rarer case of a closing tag with no matching opener
+        // (can happen if the model's reasoning gets truncated).
+        .replace(/^[\s\S]*?<\/think>/i, '')
+        .trim();
+}
+
 async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent, enableBookingTool, extraTools }) {
     const entry = MODEL_REGISTRY[modelKey] || MODEL_REGISTRY[DEFAULT_MODEL_KEY];
 
@@ -301,7 +316,9 @@ async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent, enabl
             temperature: 0.3,
             max_tokens:  600,
         });
-        return completion.choices[0]?.message || {};
+        const msg = completion.choices[0]?.message || {};
+        if (msg.content) msg.content = stripThinkingTags(msg.content);
+        return msg;
     }
 
     if (entry.provider === 'mistral') {
@@ -342,6 +359,7 @@ async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent, enabl
             });
         }
 
+        if (msg.content) msg.content = stripThinkingTags(msg.content);
         return msg;
     }
 
@@ -374,7 +392,9 @@ async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent, enabl
         }
 
         const data = await r.json();
-        return data.choices?.[0]?.message || {};
+        const msg = data.choices?.[0]?.message || {};
+        if (msg.content) msg.content = stripThinkingTags(msg.content);
+        return msg;
     }
 
     throw new Error(`Unknown provider: ${entry.provider}`);
@@ -1763,6 +1783,7 @@ async function handleChat(req, res) {
             enableBookingTool: bookingEnabled,
             extraTools: agentActionToolDefs,
         });
+        if (choice?.content) choice.content = stripThinkingTags(choice.content);
 
         if (bookingEnabled && choice?.content && !choice?.tool_calls) {
             const jsonMatch = choice.content.match(/\{[\s\S]*?"userName"[\s\S]*?"contactInfo"[\s\S]*?\}/);
@@ -1890,6 +1911,7 @@ async function handleChat(req, res) {
                         extraTools: agentActionToolDefs,
                         toolChoice: 'none',
                     });
+                    if (followUpChoice?.content) followUpChoice.content = stripThinkingTags(followUpChoice.content);
                 } catch (err) {
                     console.error('[AgentActions/FollowUp]', err.message);
                     const fallbackAnswer = "I ran that action, but had trouble putting together a response. Could you ask again?";
@@ -1954,18 +1976,6 @@ async function handleROI(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // PROMO CODES — dev-phase plan unlocks
-// ════════════════════════════════════════════════════════════════════════════
-// Backs window.applyPromoCode() in index.html (POST /api/promo/validate).
-// Codes live server-side only, in the Firestore collection "promo_codes",
-// keyed by the uppercased code itself, e.g.:
-//
-//   promo_codes/TESTER100
-//     { planKey: 'teamplus', active: true, maxRedemptions: 50,
-//       redeemedCount: 0, redeemedBy: [], expiresAt: null }
-//
-// Nothing about valid codes is ever shipped to the browser — the client
-// just POSTs whatever the person typed and gets back success/failure plus
-// (on success) the planKey to unlock.
 // ════════════════════════════════════════════════════════════════════════════
 async function handlePromoValidate(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
