@@ -1,6 +1,7 @@
 import admin from 'firebase-admin';
 import Groq from 'groq-sdk';
 import crypto from 'crypto';
+import { Resend } from 'resend';
 
 // ════════════════════════════════════════════════════════════════════════════
 // FIREBASE
@@ -432,6 +433,10 @@ export default async function handler(req, res) {
     if (path === '/api/account/delete-cascade')   return handleAccountDeleteCascade(req, res);
     if (path === '/api/account/update-email')     return handleAccountChangeEmail(req, res);
     if (path === '/api/account/check-exists')     return handleCheckAccountExists(req, res);
+    if (path === '/api/password-reset/request') return handlePasswordResetRequest(req, res);
+    if (path === '/api/password-reset/verify')  return handlePasswordResetVerify(req, res);
+    if (path === '/api/password-reset/confirm') return handlePasswordResetConfirm(req, res);
+
 
     // ── Enterprise dynamic pricing (Whop) ──────────────────────────────────
     if (path === '/api/enterprise/create-checkout') return handleEnterpriseCreateCheckout(req, res);
@@ -3521,6 +3526,130 @@ async function handleAccountChangeEmail(req, res) {
         return res.json({ success: true });
     } catch (err) {
         console.error('[Account/ChangeEmail]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// PASSWORD RESET — fully custom, bypasses Firebase's oobCode/hosted page
+// entirely so the whole flow (and auto-login afterward) stays on our domain.
+// ════════════════════════════════════════════════════════════════════════════
+const PASSWORD_RESET_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+function getResend() {
+    if (!process.env.RESEND_API_KEY) throw new Error('Missing RESEND_API_KEY env var.');
+    return new Resend(process.env.RESEND_API_KEY);
+}
+
+// POST /api/password-reset/request  { email, origin }
+async function handlePasswordResetRequest(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { email, origin } = req.body || {};
+    if (!email) return res.status(400).json({ success: false, message: 'Missing email.' });
+
+    try {
+        const db = getDb();
+        const authAdmin = getAuthAdmin();
+
+        let userRecord;
+        try {
+            userRecord = await authAdmin.getUserByEmail(email);
+        } catch (e) {
+            if (e.code === 'auth/user-not-found') {
+                return res.status(404).json({ success: false, message: 'No account found with that email address.' });
+            }
+            throw e;
+        }
+
+        const token = crypto.randomBytes(32).toString('hex');
+        const now = Date.now();
+        await db.collection('password_reset_tokens').doc(token).set({
+            email, uid: userRecord.uid,
+            createdAt: new Date(now).toISOString(),
+            expiresAt: new Date(now + PASSWORD_RESET_TOKEN_TTL_MS).toISOString(),
+            used: false,
+        });
+
+        const appUrl = origin || process.env.APP_URL || `https://${req.headers.host}`;
+        const resetLink = `${appUrl}/reset-password?token=${token}`;
+
+        const resend = getResend();
+        await resend.emails.send({
+            from: process.env.RESEND_FROM_EMAIL || 'Comex AI <onboarding@resend.dev>',
+            to: email,
+            subject: 'Reset your Comex AI password',
+            html: `
+                <div style="font-family:sans-serif;max-width:480px;margin:0 auto;">
+                    <h2 style="color:#0f172a;">Reset your password</h2>
+                    <p style="color:#475569;">We received a request to reset the password for your Comex AI account (${email}).</p>
+                    <p><a href="${resetLink}" style="display:inline-block;background:#5b3df5;color:#fff;padding:12px 24px;border-radius:100px;text-decoration:none;font-weight:700;">Reset Password</a></p>
+                    <p style="color:#94a3b8;font-size:13px;">This link expires in 1 hour. If you didn't request this, you can safely ignore this email.</p>
+                </div>`,
+        });
+
+        return res.json({ success: true, message: 'Reset email sent.' });
+    } catch (err) {
+        console.error('[PasswordReset/Request]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// GET /api/password-reset/verify?token=...
+async function handlePasswordResetVerify(req, res) {
+    const { token } = req.query;
+    if (!token) return res.status(400).json({ success: false, message: 'Missing token.' });
+
+    try {
+        const db = getDb();
+        const snap = await db.collection('password_reset_tokens').doc(token).get();
+        if (!snap.exists) return res.json({ success: true, valid: false, message: 'This reset link is invalid.' });
+
+        const data = snap.data();
+        if (data.used) return res.json({ success: true, valid: false, message: 'This reset link has already been used.' });
+        if (new Date(data.expiresAt).getTime() < Date.now()) {
+            return res.json({ success: true, valid: false, message: 'This reset link has expired. Please request a new one.' });
+        }
+
+        return res.json({ success: true, valid: true, email: data.email });
+    } catch (err) {
+        console.error('[PasswordReset/Verify]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// POST /api/password-reset/confirm  { token, newPassword }
+async function handlePasswordResetConfirm(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { token, newPassword } = req.body || {};
+    if (!token || !newPassword) return res.status(400).json({ success: false, message: 'Missing token or newPassword.' });
+    if (newPassword.length < 6) return res.status(400).json({ success: false, message: 'Password must be at least 6 characters.' });
+
+    try {
+        const db = getDb();
+        const tokenRef = db.collection('password_reset_tokens').doc(token);
+
+        // Transaction guards against the same token being redeemed twice
+        // (e.g. a double-click or the request firing twice in flight).
+        const result = await db.runTransaction(async (tx) => {
+            const snap = await tx.get(tokenRef);
+            if (!snap.exists) return { success: false, message: 'This reset link is invalid.' };
+            const data = snap.data();
+            if (data.used) return { success: false, message: 'This reset link has already been used.' };
+            if (new Date(data.expiresAt).getTime() < Date.now()) {
+                return { success: false, message: 'This reset link has expired. Please request a new one.' };
+            }
+            tx.update(tokenRef, { used: true, usedAt: new Date().toISOString() });
+            return { success: true, uid: data.uid, email: data.email };
+        });
+
+        if (!result.success) return res.status(400).json(result);
+
+        const authAdmin = getAuthAdmin();
+        await authAdmin.updateUser(result.uid, { password: newPassword });
+
+        return res.json({ success: true, email: result.email });
+    } catch (err) {
+        console.error('[PasswordReset/Confirm]', err.message);
         return res.status(500).json({ success: false, message: err.message });
     }
 }
