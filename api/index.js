@@ -3579,12 +3579,28 @@ async function handlePasswordResetRequest(req, res) {
             to: email,
             subject: 'Reset your Comex AI password',
             html: `
-                <div style="font-family:sans-serif;max-width:480px;margin:0 auto;">
-                    <h2 style="color:#0f172a;">Reset your password</h2>
-                    <p style="color:#475569;">We received a request to reset the password for your Comex AI account (${email}).</p>
-                    <p><a href="${resetLink}" style="display:inline-block;background:#5b3df5;color:#fff;padding:12px 24px;border-radius:100px;text-decoration:none;font-weight:700;">Reset Password</a></p>
-                    <p style="color:#94a3b8;font-size:13px;">This link expires in 1 hour. If you didn't request this, you can safely ignore this email.</p>
-                </div>`,
+                <div style="font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 24px; border: 1px solid #e2e8f0; border-radius: 12px; background: #ffffff;">
+    <h2 style="color: #0f172a; font-size: 20px; font-weight: 700; margin-top: 0; margin-bottom: 8px;">Reset Password</h2>
+    <p style="color: #475569; font-size: 14px; line-height: 1.5; margin-bottom: 24px;">Enter the email associated with your account and we'll check if it exists.</p>
+    
+    <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 12px 16px; margin-bottom: 24px;">
+        <span style="display: block; color: #64748b; font-size: 12px; font-weight: 500; margin-bottom: 4px;">We found an account for:</span>
+        <strong style="color: #0f172a; font-size: 14px; font-weight: 600;">${email}</strong>
+    </div>
+
+    <p style="color: #475569; font-size: 14px; margin-bottom: 24px;">Send a password reset link to this email?</p>
+    
+    <p style="margin: 0;">
+        <a href="${resetLink}" style="display: inline-block; background: #0f172a; color: #ffffff; padding: 10px 18px; border-radius: 6px; text-decoration: none; font-size: 14px; font-weight: 500;">Send Reset Link</a>
+    </p>
+    
+    <div style="margin-top: 32px; border-top: 1px solid #e2e8f0; padding-top: 16px;">
+        <p style="color: #94a3b8; font-size: 12px; line-height: 1.4; margin: 0;">
+            ⚠ <strong>Link Invalid or Expired:</strong> This password reset link is only valid for 1 hour. If you didn't request this, you can safely ignore this email.
+        </p>
+    </div>
+</div>`,
+
         });
 
         return res.json({ success: true, message: 'Reset email sent.' });
