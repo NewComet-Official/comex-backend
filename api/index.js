@@ -3579,28 +3579,54 @@ async function handlePasswordResetRequest(req, res) {
             to: email,
             subject: 'Reset your Comex AI password',
             html: `
-                <div style="font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 24px; border: 1px solid #e2e8f0; border-radius: 12px; background: #ffffff;">
-    <h2 style="color: #0f172a; font-size: 20px; font-weight: 700; margin-top: 0; margin-bottom: 8px;">Reset Password</h2>
-    <p style="color: #475569; font-size: 14px; line-height: 1.5; margin-bottom: 24px;">Enter the email associated with your account and we'll check if it exists.</p>
-    
-    <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 12px 16px; margin-bottom: 24px;">
-        <span style="display: block; color: #64748b; font-size: 12px; font-weight: 500; margin-bottom: 4px;">We found an account for:</span>
-        <strong style="color: #0f172a; font-size: 14px; font-weight: 600;">${email}</strong>
-    </div>
+                <div style="max-width: 520px; margin: 0 auto; font-family: 'Google Sans Flex', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #0f172a; background-color: #ffffff; border: 1px solid #e2e8f0; border-radius: 20px; padding: 40px 36px; box-shadow: 0 10px 25px -5px rgba(15, 23, 42, 0.05); box-sizing: border-box;">
 
-    <p style="color: #475569; font-size: 14px; margin-bottom: 24px;">Send a password reset link to this email?</p>
-    
-    <p style="margin: 0;">
-        <a href="${resetLink}" style="display: inline-block; background: #0f172a; color: #ffffff; padding: 10px 18px; border-radius: 6px; text-decoration: none; font-size: 14px; font-weight: 500;">Send Reset Link</a>
+  <!-- Comex AI Brand Header -->
+  <div style="display: flex; align-items: center; margin-bottom: 28px;">
+    <span style="margin-left: 12px; font-size: 22px; font-weight: 800; color: #0f172a; letter-spacing: -0.5px;">
+      Comex<span style="color: #5b3df5;"> AI</span>
+    </span>
+  </div>
+
+  <!-- Title & Description -->
+  <h2 style="margin: 0 0 16px 0; font-size: 24px; font-weight: 700; color: #0f172a; letter-spacing: -0.3px; line-height: 1.3;">
+    Reset your password
+  </h2>
+  
+  <p style="margin: 0 0 24px 0; font-size: 15px; line-height: 1.6; color: #475569;">
+    We received a request to reset the password for your Comex AI account attached to 
+    <span style="display: inline-block; background-color: #f1f5f9; color: #334155; padding: 2px 10px; border-radius: 6px; font-weight: 600; font-size: 14px; word-break: break-all;">
+      ${email}
+    </span>.
+  </p>
+
+  <!-- Action Button -->
+  <div style="text-align: center; margin-bottom: 28px;">
+    <a href="${resetLink}" target="_blank" style="display: inline-block; padding: 14px 32px; background: linear-gradient(135deg, #5b3df5 0%, #7c3aed 100%); color: #ffffff; text-decoration: none; font-weight: 700; font-size: 15px; border-radius: 100px; box-shadow: 0 6px 20px rgba(91, 61, 245, 0.35); letter-spacing: 0.2px;">
+      Reset Password &rarr;
+    </a>
+  </div>
+
+  <!-- Security Notice -->
+  <div style="background-color: #f8fafc; border-left: 4px solid #5b3df5; border-radius: 8px; padding: 14px 16px; margin-bottom: 24px;">
+    <p style="margin: 0; font-size: 13px; line-height: 1.5; color: #64748b;">
+      <strong style="color: #0f172a; font-weight: 600;">Security Note:</strong> This reset link will expire in <strong style="color: #5b3df5;">1 hour</strong>. If you did not request a password reset, no action is required and you can safely ignore this email.
     </p>
-    
-    <div style="margin-top: 32px; border-top: 1px solid #e2e8f0; padding-top: 16px;">
-        <p style="color: #94a3b8; font-size: 12px; line-height: 1.4; margin: 0;">
-            ⚠ <strong>Link Invalid or Expired:</strong> This password reset link is only valid for 1 hour. If you didn't request this, you can safely ignore this email.
-        </p>
-    </div>
-</div>`,
+  </div>
 
+  <!-- Fallback Link Area -->
+  <div style="border-top: 1px solid #f1f5f9; padding-top: 20px;">
+    <p style="margin: 0 0 8px 0; font-size: 12px; color: #94a3b8; line-height: 1.4;">
+      Having trouble with the button? Copy and paste this link into your web browser:
+    </p>
+    <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px 12px; word-break: break-all;">
+      <a href="${resetLink}" style="font-size: 12px; color: #5b3df5; text-decoration: underline; line-height: 1.4;">
+        ${resetLink}
+      </a>
+    </div>
+  </div>
+
+</div>`,
         });
 
         return res.json({ success: true, message: 'Reset email sent.' });
