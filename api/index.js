@@ -2899,6 +2899,20 @@ async function handleCompanySetup(req, res) {
 
     try {
         const db = getDb();
+
+        // Guard against ever creating a second company for an account that
+        // already has one — this is what protects against the onboarding
+        // wizard accidentally re-running for a returning user (e.g. a stale
+        // pendingSetup flag) and silently spawning an orphaned duplicate.
+        const existingUserSnap = await db.collection('users').doc(ownerEmail).get();
+        const existingCompanyUsername = existingUserSnap.exists ? existingUserSnap.data()?.companyUsername : null;
+        if (existingCompanyUsername) {
+            return res.status(409).json({
+                success: false,
+                message: `This account is already set up with the company "@${existingCompanyUsername}". Contact support if you believe this is wrong.`,
+            });
+        }
+
         const companyRef = db.collection('companies').doc(key);
         const secretRef   = db.collection('company_secrets').doc(key);
 
