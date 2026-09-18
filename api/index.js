@@ -34,6 +34,284 @@ function cors(res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// PLANS, SEATS, AGENTS & CREDITS — SERVER-SIDE SOURCE OF TRUTH
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Everything about what an account is allowed to do lives here, on the server.
+// The browser can freely lie about `planTier` (it's a client-writable Firestore
+// field), so entitlements are resolved from the backend-written `entitlement`
+// object ONLY. That object is written in exactly three places, all server-side:
+//   1. handlePromoValidate      — dev-phase promo unlocks
+//   2. handleWhopWebhook        — real paid subscriptions / cancellations
+//   3. handlePlanSelect         — the free plan, or re-applying an already
+//                                 redeemed promo / verified subscription
+//
+// Anything without a valid entitlement is treated as the Free plan, which caps
+// the Groq spend at 100 messages/month no matter what the page source says.
+// ════════════════════════════════════════════════════════════════════════════
+
+const PLAN_LIMITS = {
+    free:       { label: 'Free',       maxAgents: 1,   maxSeats: 1,   monthlyCredits: 100    },
+    team:       { label: 'Team',       maxAgents: 3,   maxSeats: 3,   monthlyCredits: 2500   },
+    teamplus:   { label: 'Team+',      maxAgents: 10,  maxSeats: 10,  monthlyCredits: 10000  },
+    enterprise: { label: 'Enterprise', maxAgents: 10,  maxSeats: 10,  monthlyCredits: 45000  },
+};
+
+// `maxSeats` = employee accounts that may be connected to the company workspace
+// (the owner does not consume a seat).
+
+// What a single billable operation costs. Every one of these maps 1:1 onto an
+// actual upstream LLM call, so the credit ledger is a direct proxy for spend.
+const CREDIT_COSTS = {
+    message:       1,  // one customer message answered by the LLM
+    routing:       1,  // multi-agent classifier call
+    toolFollowUp:  1,  // post-tool-call summarization pass
+};
+
+const CREDIT_WARNING_THRESHOLD = 0.75;
+
+function currentBillingPeriod(d = new Date()) {
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+function toPositiveInt(v, fallback) {
+    const n = Math.round(Number(v));
+    return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+// Resolves a user document into the limits that actually apply to it.
+// NOTE: `planTier` on the user doc is display-only. It is deliberately NOT
+// trusted here.
+function resolvePlanLimits(userData) {
+    const data = userData || {};
+    const ent  = data.entitlement || null;
+
+    let tier = 'free';
+    if (ent && ent.tier && PLAN_LIMITS[ent.tier]) {
+        const notExpired = !ent.expiresAt || new Date(ent.expiresAt).getTime() > Date.now();
+        const notRevoked = ent.status !== 'revoked' && ent.status !== 'cancelled';
+        if (notExpired && notRevoked) tier = ent.tier;
+    }
+
+    const base = PLAN_LIMITS[tier];
+    const overrides = (ent && ent.limits) ? ent.limits : {};
+
+    return {
+        tier,
+        label:          base.label,
+        maxAgents:      toPositiveInt(overrides.maxAgents,      base.maxAgents),
+        maxSeats:       toPositiveInt(overrides.maxSeats,       base.maxSeats),
+        monthlyCredits: toPositiveInt(overrides.monthlyCredits, base.monthlyCredits),
+        entitlementSource: ent?.source || 'none',
+    };
+}
+
+// Employees inherit their employer's plan, limits and credit pool.
+async function resolveOwnerContext(db, email) {
+    if (!email) return { ownerEmail: null, isEmployee: false, profile: {}, ownerProfile: {} };
+    const snap = await db.collection('users').doc(email).get();
+    const profile = snap.exists ? snap.data() : {};
+
+    if (profile.accountType === 'employee' && profile.employerOwnerEmail) {
+        const ownerSnap = await db.collection('users').doc(profile.employerOwnerEmail).get();
+        return {
+            ownerEmail: profile.employerOwnerEmail,
+            isEmployee: true,
+            profile,
+            ownerProfile: ownerSnap.exists ? ownerSnap.data() : {},
+        };
+    }
+    return { ownerEmail: email, isEmployee: false, profile, ownerProfile: profile };
+}
+
+async function countActiveAgents(db, ownerEmail) {
+    if (!ownerEmail) return 0;
+    const snap = await db.collection('user_bots').where('owner', '==', ownerEmail).get();
+    let n = 0;
+    snap.forEach(d => { if (!d.data()?.deletedAt) n++; });
+    return n;
+}
+
+async function countOccupiedSeats(db, companyUsername) {
+    if (!companyUsername) return 0;
+    const snap = await db.collection('users').where('employeeOf', '==', companyUsername).get();
+    let n = 0;
+    snap.forEach(d => {
+        const status = d.data()?.employeeStatus || 'active';
+        // 'removed' frees the seat; 'disabled' accounts still hold theirs.
+        if (status !== 'removed') n++;
+    });
+    return n;
+}
+
+function readCreditState(userData, limits) {
+    const period = currentBillingPeriod();
+    const used = userData?.creditPeriod === period ? toPositiveInt(userData.creditsUsed, 0) : 0;
+    const limit = limits.monthlyCredits;
+    const ratio = limit > 0 ? used / limit : 1;
+    return {
+        period,
+        used,
+        limit,
+        remaining: Math.max(0, limit - used),
+        percentUsed: Math.min(100, Math.round(ratio * 1000) / 10),
+        warning: ratio >= CREDIT_WARNING_THRESHOLD && ratio < 1,
+        exhausted: used >= limit,
+    };
+}
+
+// Atomically checks + consumes credits. `force` skips the check (used for the
+// extra calls that happen mid-request once we've already committed to answering)
+// so a single conversation turn can never be half-charged.
+async function consumeCredits(db, ownerEmail, amount, opts = {}) {
+    if (!ownerEmail || !amount) {
+        return { allowed: true, skipped: true, used: 0, limit: 0, remaining: 0, percentUsed: 0, warning: false, exhausted: false };
+    }
+    const ref = db.collection('users').doc(ownerEmail);
+
+    try {
+        return await db.runTransaction(async (tx) => {
+            const snap = await tx.get(ref);
+            const data = snap.exists ? snap.data() : {};
+            const limits = resolvePlanLimits(data);
+            const state = readCreditState(data, limits);
+
+            if (!opts.force && state.exhausted) {
+                return { ...state, allowed: false, tier: limits.tier, reason: 'exhausted' };
+            }
+
+            const newUsed = state.used + amount;
+            tx.set(ref, {
+                creditPeriod:    state.period,
+                creditsUsed:     newUsed,
+                creditsLimit:    limits.limit || limits.monthlyCredits,
+                creditsUpdatedAt: new Date().toISOString(),
+            }, { merge: true });
+
+            const ratio = limits.monthlyCredits > 0 ? newUsed / limits.monthlyCredits : 1;
+            return {
+                allowed: true,
+                tier: limits.tier,
+                period: state.period,
+                used: newUsed,
+                limit: limits.monthlyCredits,
+                remaining: Math.max(0, limits.monthlyCredits - newUsed),
+                percentUsed: Math.min(100, Math.round(ratio * 1000) / 10),
+                warning: ratio >= CREDIT_WARNING_THRESHOLD && ratio < 1,
+                exhausted: newUsed >= limits.monthlyCredits,
+            };
+        });
+    } catch (err) {
+        console.error('[Credits/Consume]', ownerEmail, err.message);
+        // Fail CLOSED on the metered path (so a Firestore blip can't be used as
+        // an unlimited-usage bypass), fail open on the best-effort top-ups.
+        if (opts.force) return { allowed: true, error: err.message };
+        return { allowed: false, reason: 'error', error: err.message, used: 0, limit: 0, remaining: 0, exhausted: true };
+    }
+}
+
+function addCreditUsage(db, ownerEmail, amount) {
+    return consumeCredits(db, ownerEmail, amount, { force: true }).catch(() => null);
+}
+
+async function writeEntitlement(db, email, tier, source, limitsOverride, extra = {}) {
+    const payload = {
+        entitlement: {
+            tier,
+            source,
+            status: 'active',
+            grantedAt: new Date().toISOString(),
+            expiresAt: null,
+            limits: limitsOverride || null,
+            ...extra,
+        },
+        planTier: tier, // mirrored for display only — never trusted for enforcement
+    };
+    await db.collection('users').doc(email).set(payload, { merge: true });
+    return payload.entitlement;
+}
+
+async function revokeEntitlement(db, email, reason) {
+    await db.collection('users').doc(email).set({
+        entitlement: {
+            tier: 'free',
+            source: 'revoked',
+            status: 'active',
+            grantedAt: new Date().toISOString(),
+            revokedReason: reason || null,
+            limits: null,
+        },
+        planTier: 'free',
+    }, { merge: true });
+}
+
+async function buildUsageSnapshot(db, requesterEmail) {
+    const ctx = await resolveOwnerContext(db, requesterEmail);
+    const limits = resolvePlanLimits(ctx.ownerProfile);
+    const credits = readCreditState(ctx.ownerProfile, limits);
+
+    const companyUsername = ctx.ownerProfile?.companyUsername || null;
+    const [agentsUsed, seatsUsed] = await Promise.all([
+        countActiveAgents(db, ctx.ownerEmail),
+        countOccupiedSeats(db, companyUsername),
+    ]);
+
+    return {
+        ownerEmail: ctx.ownerEmail,
+        isEmployee: ctx.isEmployee,
+        companyUsername,
+        plan: {
+            tier: limits.tier,
+            label: limits.label,
+            source: limits.entitlementSource,
+        },
+        agents: {
+            used: agentsUsed,
+            limit: limits.maxAgents,
+            remaining: Math.max(0, limits.maxAgents - agentsUsed),
+            full: agentsUsed >= limits.maxAgents,
+        },
+        seats: {
+            used: seatsUsed,
+            limit: limits.maxSeats,
+            remaining: Math.max(0, limits.maxSeats - seatsUsed),
+            full: seatsUsed >= limits.maxSeats,
+        },
+        credits,
+        canCreateAgent: !ctx.isEmployee && agentsUsed < limits.maxAgents,
+        botsDisabled: credits.exhausted,
+        showCreditWarning: credits.warning || credits.exhausted,
+    };
+}
+
+async function getCompanyCapacity(db, rawUsername) {
+    const key = companyKeyFrom(rawUsername);
+    if (!key) return null;
+
+    const [companySnap, secretSnap] = await Promise.all([
+        db.collection('companies').doc(key).get(),
+        db.collection('company_secrets').doc(key).get(),
+    ]);
+    if (!companySnap.exists || !secretSnap.exists) return null;
+
+    const ownerEmail = secretSnap.data()?.ownerEmail;
+    const ownerSnap = ownerEmail ? await db.collection('users').doc(ownerEmail).get() : null;
+    const limits = resolvePlanLimits(ownerSnap?.exists ? ownerSnap.data() : {});
+    const seatsUsed = await countOccupiedSeats(db, key);
+
+    return {
+        companyUsername: key,
+        displayUsername: companySnap.data()?.displayUsername || ('@' + key),
+        logoBase64: companySnap.data()?.logoBase64 || null,
+        planLabel: limits.label,
+        seatsUsed,
+        maxSeats: limits.maxSeats,
+        seatsRemaining: Math.max(0, limits.maxSeats - seatsUsed),
+        full: seatsUsed >= limits.maxSeats,
+    };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // MULTI-MODEL LLM ROUTER
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -430,6 +708,7 @@ export default async function handler(req, res) {
     if (path === '/api/report/submit')            return handleReportSubmit(req, res);
     if (path === '/api/promo/validate')           return handlePromoValidate(req, res);
     if (path === '/api/bot/delete-cascade')       return handleBotDeleteCascade(req, res);
+    if (path === '/api/bot/restore')              return handleBotRestore(req, res);
     if (path === '/api/account/delete-cascade')   return handleAccountDeleteCascade(req, res);
     if (path === '/api/account/update-email')     return handleAccountChangeEmail(req, res);
     if (path === '/api/account/check-exists')     return handleCheckAccountExists(req, res);
@@ -437,6 +716,10 @@ export default async function handler(req, res) {
     if (path === '/api/password-reset/verify')  return handlePasswordResetVerify(req, res);
     if (path === '/api/password-reset/confirm') return handlePasswordResetConfirm(req, res);
 
+    // ── Plan limits / usage metering ───────────────────────────────────────
+    if (path === '/api/plan/usage')               return handlePlanUsage(req, res);
+    if (path === '/api/plan/select')              return handlePlanSelect(req, res);
+    if (path === '/api/plan/can-create-agent')    return handleCanCreateAgent(req, res);
 
     // ── Enterprise dynamic pricing (Whop) ──────────────────────────────────
     if (path === '/api/enterprise/create-checkout') return handleEnterpriseCreateCheckout(req, res);
@@ -462,6 +745,8 @@ export default async function handler(req, res) {
     if (path === '/api/company/setup')                     return handleCompanySetup(req, res);
     if (path === '/api/company/join-code')                 return handleCompanyJoinCode(req, res);
     if (path === '/api/company/join-code/regenerate'       ) return handleCompanyJoinCodeRegenerate(req, res);
+    if (path === '/api/company/capacity')                  return handleCompanyCapacity(req, res);
+    if (path === '/api/company/search')                    return handleCompanySearch(req, res);
     if (path === '/api/employee/verify-and-connect')      return handleEmployeeVerifyAndConnect(req, res);
     if (path === '/api/company/employees/list')           return handleCompanyEmployeesList(req, res);
     if (path === '/api/company/employees/remove')         return handleCompanyEmployeeRemove(req, res);
@@ -492,6 +777,100 @@ async function handleModels(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// GET /api/plan/usage?email=
+// Single source of truth the dashboard reads for: agent count vs limit,
+// employee seats vs limit, and the credit meter (drives the 75% warning
+// banner and the 100% "bots offline" state).
+// ════════════════════════════════════════════════════════════════════════════
+async function handlePlanUsage(req, res) {
+    const email = req.query?.email || req.query?.ownerEmail || req.body?.email;
+    if (!email) return res.status(400).json({ success: false, message: 'Missing email.' });
+    try {
+        const db = getDb();
+        const usage = await buildUsageSnapshot(db, email);
+        return res.json({ success: true, ...usage });
+    } catch (err) {
+        console.error('[Plan/Usage]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/plan/can-create-agent?email=
+// ════════════════════════════════════════════════════════════════════════════
+async function handleCanCreateAgent(req, res) {
+    const email = req.query?.email;
+    if (!email) return res.status(400).json({ success: false, message: 'Missing email.' });
+    try {
+        const db = getDb();
+        const usage = await buildUsageSnapshot(db, email);
+        return res.json({
+            success: true,
+            allowed: usage.canCreateAgent,
+            reason: usage.isEmployee
+                ? 'Employees cannot create agents.'
+                : (usage.agents.full ? `Your ${usage.plan.label} plan allows ${usage.agents.limit} deployed agent(s). Delete one or upgrade to add more.` : null),
+            agents: usage.agents,
+            plan: usage.plan,
+        });
+    } catch (err) {
+        console.error('[Plan/CanCreateAgent]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/plan/select  { email, planKey }
+// The ONLY client-facing way to change a plan. Free is always allowed; paid
+// tiers are only granted if the account has already redeemed a matching promo
+// code or has an active Whop subscription recorded by the webhook.
+// ════════════════════════════════════════════════════════════════════════════
+async function handlePlanSelect(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { email, planKey } = req.body || {};
+    if (!email || !planKey) return res.status(400).json({ success: false, message: 'Missing email or planKey.' });
+    if (!PLAN_LIMITS[planKey]) return res.status(400).json({ success: false, message: `Unknown plan: ${planKey}` });
+
+    try {
+        const db = getDb();
+        const userRef = db.collection('users').doc(email);
+        const snap = await userRef.get();
+        const data = snap.exists ? snap.data() : {};
+
+        if (planKey === 'free') {
+            const ent = await writeEntitlement(db, email, 'free', 'self-serve');
+            return res.json({ success: true, entitlement: ent, limits: resolvePlanLimits({ entitlement: ent }) });
+        }
+
+        // Already entitled to this tier through a verified source — just re-affirm.
+        if (data.entitlement?.tier === planKey && data.entitlement?.status === 'active') {
+            return res.json({ success: true, entitlement: data.entitlement, limits: resolvePlanLimits(data) });
+        }
+
+        // Promo path: verify the redemption actually exists in promo_codes.
+        const promoSnap = await db.collection('promo_codes')
+            .where('planKey', '==', planKey)
+            .where('redeemedBy', 'array-contains', email)
+            .limit(1)
+            .get();
+
+        if (!promoSnap.empty) {
+            const ent = await writeEntitlement(db, email, planKey, 'promo', null, { promoCode: promoSnap.docs[0].id });
+            return res.json({ success: true, entitlement: ent, limits: resolvePlanLimits({ entitlement: ent }) });
+        }
+
+        return res.status(402).json({
+            success: false,
+            message: 'This plan requires an active subscription. Complete checkout to activate it.',
+            requiresCheckout: true,
+        });
+    } catch (err) {
+        console.error('[Plan/Select]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // ENTERPRISE DYNAMIC PRICING (WHOP)
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -500,6 +879,7 @@ const ENTERPRISE_PRICING = {
     baseCredits:      45000,   creditOverageRate: 0.010,  maxCredits: 2000000,
     baseAgents:       10,      agentOverageRate:  15,     maxAgents:  5000,
     baseSeats:        10,      seatOverageRate:   10,     maxSeats:   5000,
+    maxCheckoutPrice: 2500,
 };
 
 // Server-side source of truth for the price — NEVER trust a client-sent
@@ -536,6 +916,8 @@ async function handleEnterpriseCreateCheckout(req, res) {
     const { credits, agents, seats, price } = calculateEnterprisePrice(creditPool, agentCount, seatCount);
     if (!(price >= ENTERPRISE_PRICING.basePrice))
         return res.status(400).json({ success: false, message: 'Invalid plan configuration.' });
+    if (price > ENTERPRISE_PRICING.maxCheckoutPrice)
+        return res.status(400).json({ success: false, message: `This configuration exceeds the $${ENTERPRISE_PRICING.maxCheckoutPrice}/mo self-serve limit. Please contact sales.` });
 
     const whopApiKey    = process.env.WHOP_API_KEY;
     const whopCompanyId = process.env.WHOP_COMPANY_ID;          // biz_xxxxxxxxxxxxxx
@@ -621,7 +1003,40 @@ async function handleEnterpriseCreateCheckout(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // POST /api/webhooks/whop — automated provisioning / downgrade on payment events
+// This is the ONLY place a paid entitlement is granted from a real payment.
 // ════════════════════════════════════════════════════════════════════════════
+
+// Maps a Whop plan id → our internal tier. Set these env vars to the plan ids
+// behind the Team / Team+ checkout links used on the pricing page.
+function whopPlanTierMap() {
+    const map = {};
+    const pairs = [
+        [process.env.WHOP_PLAN_TEAM_MONTHLY,      'team'],
+        [process.env.WHOP_PLAN_TEAM_ANNUAL,       'team'],
+        [process.env.WHOP_PLAN_TEAMPLUS_MONTHLY,  'teamplus'],
+        [process.env.WHOP_PLAN_TEAMPLUS_ANNUAL,   'teamplus'],
+    ];
+    pairs.forEach(([id, tier]) => { if (id) map[id] = tier; });
+    return map;
+}
+
+function resolveWhopTier(data, metadata) {
+    if (metadata?.tier && PLAN_LIMITS[metadata.tier]) return metadata.tier;
+    const planId = data?.plan_id || data?.plan?.id || null;
+    const map = whopPlanTierMap();
+    if (planId && map[planId]) return map[planId];
+    return null;
+}
+
+function resolveWhopEmail(data, metadata) {
+    return metadata?.owner_email ||
+           metadata?.comex_email ||
+           data?.user_email ||
+           data?.email ||
+           data?.user?.email ||
+           null;
+}
+
 async function handleWhopWebhook(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
 
@@ -649,44 +1064,57 @@ async function handleWhopWebhook(req, res) {
     const data     = event.data || {};
     const metadata = data.metadata || {};
 
-
-
     try {
         const db = getDb();
-        const ownerEmail = metadata.owner_email;
-        const creditPool = parseInt(metadata.credit_pool, 10) || ENTERPRISE_PRICING.baseCredits;
-        const agentCount = parseInt(metadata.agent_count, 10) || ENTERPRISE_PRICING.baseAgents;
-        const seatCount  = parseInt(metadata.seat_count, 10)  || ENTERPRISE_PRICING.baseSeats;
+        const ownerEmail = resolveWhopEmail(data, metadata);
 
         if (!ownerEmail) {
-            console.warn('[Whop/Webhook] Event missing owner_email metadata, ignoring:', type);
+            console.warn('[Whop/Webhook] Event missing owner email metadata, ignoring:', type);
             return res.json({ success: true });
         }
 
+        const tier = resolveWhopTier(data, metadata) || 'enterprise';
+
         if (type === 'membership.went_valid' || type === 'payment.succeeded') {
-            await db.collection('users').doc(ownerEmail).set({
-                planTier: 'enterprise',
-                planUnlockedByPromo: false,
-                enterprise: {
-                    monthlyCredits: creditPool,
-                    maxAgents: agentCount, // purchased count, not unlimited — re-run checkout to scale up
-                    maxSeats: seatCount,
-                    integrations: {
-                        firebase: true, supabase: true, canva: true, figma: true,
-                        google_calendar: true, push_alerts: true,
+            if (tier === 'enterprise') {
+                const creditPool = parseInt(metadata.credit_pool, 10) || ENTERPRISE_PRICING.baseCredits;
+                const agentCount = parseInt(metadata.agent_count, 10) || ENTERPRISE_PRICING.baseAgents;
+                const seatCount  = parseInt(metadata.seat_count, 10)  || ENTERPRISE_PRICING.baseSeats;
+
+                await db.collection('users').doc(ownerEmail).set({
+                    planUnlockedByPromo: false,
+                    enterprise: {
+                        monthlyCredits: creditPool,
+                        maxAgents: agentCount, // purchased count, not unlimited — re-run checkout to scale up
+                        maxSeats: seatCount,
+                        integrations: {
+                            firebase: true, supabase: true, canva: true, figma: true,
+                            google_calendar: true, push_alerts: true,
+                        },
+                        status: 'active',
+                        whopMembershipId: data.id || null,
+                        activatedAt: new Date().toISOString(),
                     },
-                    status: 'active',
-                    whopMembershipId: data.id || null,
-                    activatedAt: new Date().toISOString(),
-                },
-            }, { merge: true });
-            console.log(`[Whop/Webhook] Enterprise activated for ${ownerEmail} — ${creditPool} credits, ${agentCount} agents, ${seatCount} seats/mo.`);
-        } else if (type === 'membership.went_invalid') {
+                }, { merge: true });
+
+                await writeEntitlement(db, ownerEmail, 'enterprise', 'whop', {
+                    monthlyCredits: creditPool,
+                    maxAgents: agentCount,
+                    maxSeats: seatCount,
+                }, { whopMembershipId: data.id || null });
+
+                console.log(`[Whop/Webhook] Enterprise activated for ${ownerEmail} — ${creditPool} credits, ${agentCount} agents, ${seatCount} seats/mo.`);
+            } else {
+                await writeEntitlement(db, ownerEmail, tier, 'whop', null, { whopMembershipId: data.id || null });
+                console.log(`[Whop/Webhook] ${tier} activated for ${ownerEmail}.`);
+            }
+        } else if (type === 'membership.went_invalid' || type === 'membership.cancelled') {
             await db.collection('users').doc(ownerEmail).set({
-                planTier: 'free',
+                planUnlockedByPromo: false,
                 enterprise: { status: 'cancelled', cancelledAt: new Date().toISOString() },
             }, { merge: true });
-            console.log(`[Whop/Webhook] Enterprise cancelled for ${ownerEmail}, downgraded to free.`);
+            await revokeEntitlement(db, ownerEmail, 'subscription_ended');
+            console.log(`[Whop/Webhook] Subscription ended for ${ownerEmail}, downgraded to free.`);
         } else {
             console.log(`[Whop/Webhook] Unhandled event type: ${type}`);
         }
@@ -722,7 +1150,7 @@ function getPeriodStart(period) {
     return new Date(now.getTime() - ms);
 }
 
-const FALLBACK_PATTERNS = /don't have (that|this) information|do not have (that|this) information|can only help with questions about this business|i'?m not sure|i am not sure|couldn't find|could not find|don't know the answer|flagged this for our team|speak with a person|connect (you )?(with|to) (a )?(human|team|agent)|live handoff isn't available|isn't available here right now/i;
+const FALLBACK_PATTERNS = /don't have (that|this) information|do not have (that|this) information|can only help with questions about this business|i'?m not sure|i am not sure|couldn't find|could not find|don't know the answer|flagged this for our team|speak with a person|connect (you )?(with|to) (a )?(human|team|agent)|live handoff isn't available|isn't available here right now|monthly usage limit/i;
 
 function detectFallback(answer) {
     return FALLBACK_PATTERNS.test(String(answer || ''));
@@ -1092,6 +1520,48 @@ async function handleBotDeleteCascade(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// POST /api/bot/restore  { businessId, ownerEmail }
+// Restoring from the recycle bin re-activates an agent, so it has to respect
+// the plan's agent cap exactly like creating a new one does.
+// ════════════════════════════════════════════════════════════════════════════
+async function handleBotRestore(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { businessId, ownerEmail } = req.body || {};
+    if (!businessId || !ownerEmail)
+        return res.status(400).json({ success: false, message: 'Missing businessId or ownerEmail.' });
+
+    try {
+        const db = getDb();
+        const ctx = await resolveOwnerContext(db, ownerEmail);
+        if (ctx.isEmployee)
+            return res.status(403).json({ success: false, message: 'Only the company owner can restore agents.' });
+
+        const botRef = db.collection('user_bots').doc(businessId);
+        const botSnap = await botRef.get();
+        if (!botSnap.exists) return res.status(404).json({ success: false, message: 'Agent not found.' });
+        if (botSnap.data()?.owner !== ctx.ownerEmail)
+            return res.status(403).json({ success: false, message: 'You do not own this agent.' });
+
+        const limits = resolvePlanLimits(ctx.ownerProfile);
+        const activeAgents = await countActiveAgents(db, ctx.ownerEmail);
+        if (activeAgents >= limits.maxAgents) {
+            return res.status(403).json({
+                success: false,
+                limitReached: 'agents',
+                message: `Your ${limits.label} plan allows ${limits.maxAgents} active agent(s). Delete an active agent or upgrade before restoring this one.`,
+                agents: { used: activeAgents, limit: limits.maxAgents },
+            });
+        }
+
+        await botRef.set({ deletedAt: null }, { merge: true });
+        return res.json({ success: true });
+    } catch (err) {
+        console.error('[BotRestore]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // POST /api/account/delete-cascade — permanently wipes a user + everything they own
 // ════════════════════════════════════════════════════════════════════════════
 async function handleAccountDeleteCascade(req, res) {
@@ -1251,6 +1721,44 @@ function buildHumanRequestNotification(botName, lastMessage) {
         url:   '/?view=human',
         tag:   'comex-human-request',
     };
+}
+
+function buildCreditWarningNotification(percentUsed, limit) {
+    return {
+        title: '⚠️ 75% of Monthly Credits Used',
+        body:  `Your workspace has used ${percentUsed}% of its ${limit.toLocaleString()} monthly credits. Agents stop responding at 100%.`,
+        url:   '/?view=pricing',
+        tag:   'comex-credit-warning',
+    };
+}
+
+function buildCreditExhaustedNotification(limit) {
+    return {
+        title: '🛑 Monthly Credits Exhausted',
+        body:  `All ${limit.toLocaleString()} credits for this month have been used. Your agents are paused until the next cycle or an upgrade.`,
+        url:   '/?view=pricing',
+        tag:   'comex-credit-exhausted',
+    };
+}
+
+// Fires each threshold alert at most once per billing period.
+async function maybeNotifyCreditThreshold(db, ownerEmail, state) {
+    if (!ownerEmail || !state || state.skipped) return;
+    try {
+        const ref = db.collection('users').doc(ownerEmail);
+        const snap = await ref.get();
+        const data = snap.exists ? snap.data() : {};
+        const alerts = data.creditAlerts || {};
+        const period = state.period || currentBillingPeriod();
+
+        if (state.exhausted && alerts.exhaustedPeriod !== period) {
+            await ref.set({ creditAlerts: { ...alerts, exhaustedPeriod: period } }, { merge: true });
+            await notifyOwnerAndEmployees(db, ownerEmail, buildCreditExhaustedNotification(state.limit)).catch(() => {});
+        } else if (state.warning && alerts.warningPeriod !== period) {
+            await ref.set({ creditAlerts: { ...alerts, warningPeriod: period } }, { merge: true });
+            await notifyOwnerAndEmployees(db, ownerEmail, buildCreditWarningNotification(state.percentUsed, state.limit)).catch(() => {});
+        }
+    } catch (e) { console.warn('[Credits/Notify]', e.message); }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1425,7 +1933,7 @@ async function handleFCMTestNotification(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// DEPLOY
+// DEPLOY — enforces the plan's agent cap for NEW agents (edits always allowed)
 // ════════════════════════════════════════════════════════════════════════════
 async function handleDeploy(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -1433,12 +1941,52 @@ async function handleDeploy(req, res) {
     if (!botData?.id || !botData?.name || !ownerEmail)
         return res.status(400).json({ success: false, message: 'Missing botData.id, botData.name, or ownerEmail.' });
     try {
-        botData.owner     = ownerEmail;
+        const db = getDb();
+        const ctx = await resolveOwnerContext(db, ownerEmail);
+
+        if (ctx.isEmployee) {
+            return res.status(403).json({
+                success: false,
+                message: 'Employees cannot create or edit agents — only the company owner can.',
+            });
+        }
+
+        const botRef = db.collection('user_bots').doc(botData.id);
+        const existingSnap = await botRef.get();
+        const isExisting = existingSnap.exists && !existingSnap.data()?.deletedAt;
+
+        if (existingSnap.exists && existingSnap.data()?.owner && existingSnap.data().owner !== ctx.ownerEmail) {
+            return res.status(403).json({ success: false, message: 'That agent ID belongs to another account.' });
+        }
+
+        const limits = resolvePlanLimits(ctx.ownerProfile);
+
+        if (!isExisting) {
+            const activeAgents = await countActiveAgents(db, ctx.ownerEmail);
+            if (activeAgents >= limits.maxAgents) {
+                return res.status(403).json({
+                    success: false,
+                    limitReached: 'agents',
+                    message: `Your ${limits.label} plan includes ${limits.maxAgents} deployed agent(s) and you already have ${activeAgents}. Delete an agent or upgrade your plan to deploy another.`,
+                    agents: { used: activeAgents, limit: limits.maxAgents },
+                    plan: { tier: limits.tier, label: limits.label },
+                });
+            }
+        }
+
+        botData.owner     = ctx.ownerEmail;
         botData.deletedAt = null;
         botData.displayName = botData.displayName || botData.name;
         botData.createdAt = botData.createdAt || new Date().toISOString();
-        await getDb().collection('user_bots').doc(botData.id).set(botData, { merge: true });
-        return res.status(200).json({ success: true, botId: botData.id });
+        await botRef.set(botData, { merge: true });
+
+        const agentsUsed = await countActiveAgents(db, ctx.ownerEmail);
+        return res.status(200).json({
+            success: true,
+            botId: botData.id,
+            agents: { used: agentsUsed, limit: limits.maxAgents, remaining: Math.max(0, limits.maxAgents - agentsUsed) },
+            plan: { tier: limits.tier, label: limits.label },
+        });
     } catch (err) {
         console.error('[Deploy]', err.message);
         return res.status(500).json({ success: false, message: err.message });
@@ -1485,9 +2033,23 @@ async function handleConfig(req, res) {
     const { businessId } = req.query;
     if (!businessId) return res.status(400).json({ success: false, error: 'Missing businessId.' });
     try {
-        const snap = await getDb().collection('user_bots').doc(businessId).get();
+        const db = getDb();
+        const snap = await db.collection('user_bots').doc(businessId).get();
         if (!snap.exists) return res.status(404).json({ success: false, error: 'Bot not found.' });
         const b = snap.data();
+
+        // Widget-facing availability flag — purely informational; the real
+        // enforcement happens in /api/chat.
+        let serviceAvailable = true;
+        try {
+            if (b.owner) {
+                const ownerSnap = await db.collection('users').doc(b.owner).get();
+                const limits = resolvePlanLimits(ownerSnap.exists ? ownerSnap.data() : {});
+                const credits = readCreditState(ownerSnap.exists ? ownerSnap.data() : {}, limits);
+                serviceAvailable = !credits.exhausted;
+            }
+        } catch (e) { /* best-effort */ }
+
         return res.status(200).json({
             success:         true,
             name:            b.displayName || b.name    || 'AI Assistant',
@@ -1497,6 +2059,7 @@ async function handleConfig(req, res) {
             themeColor:      b.designConfig?.themeColor || '#0f172a',
             designConfig:    b.designConfig             || {},
             modelKey:        b.modelKey                 || DEFAULT_MODEL_KEY,
+            serviceAvailable,
             behaviorConfig:  Object.assign({
                 allowOutOfTopic:      true,
                 allowWebSearch:       true,
@@ -1516,7 +2079,13 @@ async function handleConfig(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// CHAT — with CANCEL / EDIT / multi-model / multi-agent / autonomous actions support
+// CHAT — credit-metered, with CANCEL / EDIT / multi-model / multi-agent /
+// autonomous actions support.
+//
+// The credit check below is the hard spend ceiling: no LLM provider is ever
+// called until a credit has been successfully reserved against the owner's
+// monthly pool, so tampering with the dashboard or the embed snippet cannot
+// run up the Groq bill.
 // ════════════════════════════════════════════════════════════════════════════
 async function handleChat(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -1553,6 +2122,13 @@ async function handleChat(req, res) {
             subAgents  = Array.isArray(b.subAgents) ? b.subAgents.filter(a => a?.id && a?.systemPrompt) : [];
             agentActionsList = Array.isArray(b.agentActions) ? b.agentActions.filter(a => a?.name && a?.url) : [];
             behaviorConfig = Object.assign(behaviorConfig, b.behaviorConfig || {});
+
+            // A soft-deleted (recycle bin) agent must not keep answering or burning credits.
+            if (b.deletedAt) {
+                const reply = 'This assistant is not available right now. Please contact the business directly.';
+                return res.json({ success: true, answer: reply, reply, _unavailable: true });
+            }
+
             const kc   = b.knowledgeContext || {};
             if (kc.systemPrompt) {
                 sysPrompt = kc.systemPrompt;
@@ -1611,6 +2187,9 @@ async function handleChat(req, res) {
         }
 
         // ── HUMAN HANDOFF — checked before anything else (only when enabled).
+        // Deliberately placed BEFORE the credit gate: a visitor asking for a
+        // real person costs no LLM tokens and must keep working even after the
+        // month's credits run out.
         const wantsHuman = humanHandoffEnabled && /speak to human support|connect (me )?(to )?(a )?human|talk to (a )?(human|person|someone|agent|representative)|(human|real) (agent|person)|customer service rep|talk to (someone|somebody) real/i.test(userMsg);
         if (wantsHuman) {
             try {
@@ -1626,6 +2205,39 @@ async function handleChat(req, res) {
                 console.error('[HumanHandoff]', e.message);
             }
         }
+
+        // ══════════════ CREDIT GATE ══════════════
+        // Reserve a credit BEFORE any provider call. At 100% the bot goes quiet
+        // for the rest of the billing period.
+        const creditState = await consumeCredits(db, ownerEmail, CREDIT_COSTS.message);
+        if (!creditState.allowed) {
+            const reply = creditState.reason === 'exhausted'
+                ? "I'm offline for the moment — this assistant has reached its monthly message limit. Please reach out to the business directly and they'll get back to you."
+                : "I'm having trouble responding right now. Please try again in a moment.";
+            await logChat(db, businessId, convId, userMsg, reply, false, false, {
+                fallback: true,
+                creditBlocked: true,
+            });
+            if (creditState.reason === 'exhausted') {
+                maybeNotifyCreditThreshold(db, ownerEmail, { ...creditState, exhausted: true, period: currentBillingPeriod() });
+            }
+            return res.json({
+                success: true,
+                answer: reply,
+                reply,
+                _creditsExhausted: creditState.reason === 'exhausted',
+                _credits: { used: creditState.used, limit: creditState.limit, remaining: 0 },
+            });
+        }
+        maybeNotifyCreditThreshold(db, ownerEmail, creditState);
+
+        const creditMeta = {
+            used: creditState.used,
+            limit: creditState.limit,
+            remaining: creditState.remaining,
+            percentUsed: creditState.percentUsed,
+            warning: creditState.warning,
+        };
 
         const msgLower = userMsg.toLowerCase().trim();
 
@@ -1662,14 +2274,14 @@ async function handleChat(req, res) {
         if (isCancelIntent && !isPendingCancel) {
             const reply = `Are you sure you want to cancel your appointment? Type "YES, CANCEL" to confirm, or "no" to keep it.`;
             await logChat(db, businessId, convId, userMsg, reply, false, false);
-            return res.json({ success: true, answer: reply, reply });
+            return res.json({ success: true, answer: reply, reply, _credits: creditMeta });
         }
 
         if (bookingEnabled && ((isCancelConfirm && isPendingCancel) || (msgLower === 'yes, cancel' || msgLower === 'yes cancel'))) {
             const appt = await findConversationAppointment();
             if (!appt) {
                 const reply = "I couldn't find an active appointment to cancel. Please contact us directly.";
-                return res.json({ success: true, answer: reply, reply });
+                return res.json({ success: true, answer: reply, reply, _credits: creditMeta });
             }
             try {
                 await db.collection('appointments').doc(appt.id).update({
@@ -1686,17 +2298,17 @@ async function handleChat(req, res) {
 
                 const reply = `✅ Your appointment has been successfully cancelled.\n\n📅 Cancelled: ${appt.scheduledDate} at ${appt.appointmentTime}\n👤 Name: ${appt.customerName}\n\nIf you'd like to rebook, just say "I want to book an appointment".`;
                 await logChat(db, businessId, convId, userMsg, reply, false, false);
-                return res.json({ success: true, answer: reply, reply });
+                return res.json({ success: true, answer: reply, reply, _credits: creditMeta });
             } catch {
                 const reply = 'There was an error cancelling your appointment. Please try again.';
-                return res.json({ success: true, answer: reply, reply });
+                return res.json({ success: true, answer: reply, reply, _credits: creditMeta });
             }
         }
 
         if (isEditIntent && !isPendingEdit && !isPendingEditValue) {
             const reply = `Which detail would you like to change?\n\n1. **Name**\n2. **Contact info** (email/phone)\n3. **Date**\n4. **Time**\n\nPlease type the number or the field name.`;
             await logChat(db, businessId, convId, userMsg, reply, false, false);
-            return res.json({ success: true, answer: reply, reply });
+            return res.json({ success: true, answer: reply, reply, _credits: creditMeta });
         }
 
         if (isPendingEdit && !isPendingEditValue) {
@@ -1710,12 +2322,12 @@ async function handleChat(req, res) {
             const field = fieldMap[key] || fieldMap[msgLower.split(/\s+/)[0]];
             if (!field) {
                 const reply = 'I didn\'t catch that. Please type: "name", "contact", "date", or "time".';
-                return res.json({ success: true, answer: reply, reply });
+                return res.json({ success: true, answer: reply, reply, _credits: creditMeta });
             }
             const fieldLabels = { customerName: 'name', contactInfo: 'contact info', appointmentDay: 'date', appointmentTime: 'time' };
             const reply = `What would you like to change the ${fieldLabels[field]} to?`;
             await logChat(db, businessId, convId, userMsg, reply, false, false);
-            return res.json({ success: true, answer: reply, reply, _editField: field });
+            return res.json({ success: true, answer: reply, reply, _editField: field, _credits: creditMeta });
         }
 
         if (isPendingEditValue) {
@@ -1744,7 +2356,7 @@ async function handleChat(req, res) {
                     const fieldLabels2 = { customerName: 'name', contactInfo: 'contact info', appointmentDay: 'date', appointmentTime: 'time' };
                     const reply = `✅ Updated! Your ${fieldLabels2[field]} has been changed from "${oldValue}" to "${newValue}".\n\nIs there anything else you'd like to change, or are you all set?`;
                     await logChat(db, businessId, convId, userMsg, reply, false, false);
-                    return res.json({ success: true, answer: reply, reply });
+                    return res.json({ success: true, answer: reply, reply, _credits: creditMeta });
                 }
             }
         }
@@ -1768,6 +2380,7 @@ async function handleChat(req, res) {
         let routedAgent = null;
         if (subAgents.length) {
             routedAgent = await routeToSubAgent(modelKey, userMsg, subAgents);
+            await addCreditUsage(db, ownerEmail, CREDIT_COSTS.routing);
             if (routedAgent) {
                 sysPrompt += `\n\n[ACTIVE SPECIALIZED AGENT: ${routedAgent.name}]\nYou are now acting as this specialized agent. Follow its instructions closely while still respecting the behavior settings above.\n${routedAgent.systemPrompt}`;
             }
@@ -1807,7 +2420,7 @@ async function handleChat(req, res) {
         if (bookingEnabled && choice?.tool_calls?.[0]?.function?.name === 'appointmentBooking') {
             let args;
             try { args = JSON.parse(choice.tool_calls[0].function.arguments); }
-            catch { return res.json({ success: true, answer: 'Could you confirm your booking details again?' }); }
+            catch { return res.json({ success: true, answer: 'Could you confirm your booking details again?', _credits: creditMeta }); }
 
             const { userName, contactInfo, appointmentDay, appointmentTime } = args;
 
@@ -1815,12 +2428,14 @@ async function handleChat(req, res) {
                 return res.json({
                     success: true,
                     answer:  `Got it! Just one more thing — what time works best for you on ${appointmentDay}?`,
+                    _credits: creditMeta,
                 });
             }
             if (!userName || !contactInfo || !appointmentDay) {
                 return res.json({
                     success: true,
                     answer:  'I need your name, contact info, preferred date and time to complete the booking. What would you like to provide?',
+                    _credits: creditMeta,
                 });
             }
 
@@ -1836,7 +2451,7 @@ async function handleChat(req, res) {
                         const altText = alts.length > 0
                             ? '\n\nHere are 3 available slots on that day:\n' + alts.map((t, i) => `  ${i + 1}. ${t}`).join('\n') + '\n\nWhich one works for you?'
                             : '\n\nWould you like to pick a different date or time?';
-                        return res.json({ success: true, answer: `Sorry, ${appointmentTime} on ${appointmentDay} is already booked.${altText}` });
+                        return res.json({ success: true, answer: `Sorry, ${appointmentTime} on ${appointmentDay} is already booked.${altText}`, _credits: creditMeta });
                     }
                 }
             }
@@ -1879,7 +2494,7 @@ async function handleChat(req, res) {
                 'Reply with "CANCEL" to cancel or "EDIT" to change a detail.',
             ].join('\n');
 
-            return res.json({ success: true, answer, reply: answer });
+            return res.json({ success: true, answer, reply: answer, _credits: creditMeta });
         }
 
         // ── AUTONOMOUS ACTIONS — execute any non-booking tool calls the model requested ──
@@ -1917,12 +2532,13 @@ async function handleChat(req, res) {
                         extraTools: agentActionToolDefs,
                         toolChoice: 'none',
                     });
+                    await addCreditUsage(db, ownerEmail, CREDIT_COSTS.toolFollowUp);
                     if (followUpChoice?.content) followUpChoice.content = stripThinkingTags(followUpChoice.content);
                 } catch (err) {
                     console.error('[AgentActions/FollowUp]', err.message);
                     const fallbackAnswer = "I ran that action, but had trouble putting together a response. Could you ask again?";
                     await logChat(db, businessId, convId, userMsg, fallbackAnswer, true, false, { fallback: true });
-                    return res.json({ success: true, answer: fallbackAnswer, reply: fallbackAnswer, _actionsExecuted: executed.map(e => e.functionName) });
+                    return res.json({ success: true, answer: fallbackAnswer, reply: fallbackAnswer, _actionsExecuted: executed.map(e => e.functionName), _credits: creditMeta });
                 }
 
                 const finalAnswer = followUpChoice?.content?.trim() ||
@@ -1937,13 +2553,14 @@ async function handleChat(req, res) {
                     reply: finalAnswer,
                     _agent: routedAgent?.name || null,
                     _actionsExecuted: executed.map(e => e.functionName),
+                    _credits: creditMeta,
                 });
             }
         }
 
         const answer = choice?.content?.trim() || 'How can I help you?';
         await logChat(db, businessId, convId, userMsg, answer, true, false);
-        return res.json({ success: true, answer, reply: answer, _agent: routedAgent?.name || null });
+        return res.json({ success: true, answer, reply: answer, _agent: routedAgent?.name || null, _credits: creditMeta });
 
     } catch (err) {
         console.error('[Chat]', err.message);
@@ -1981,7 +2598,7 @@ async function handleROI(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// PROMO CODES — dev-phase plan unlocks
+// PROMO CODES — dev-phase plan unlocks (writes a real backend entitlement)
 // ════════════════════════════════════════════════════════════════════════════
 async function handlePromoValidate(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -2035,7 +2652,7 @@ async function handlePromoValidate(req, res) {
                 }, { merge: true });
             }
 
-            return { success: true, planKey: promo.planKey };
+            return { success: true, planKey: promo.planKey, promoLimits: promo.limits || null };
         });
 
         if (!result.success) {
@@ -2043,7 +2660,28 @@ async function handlePromoValidate(req, res) {
             return res.status(isGone ? 410 : 404).json(result);
         }
 
-        return res.json(result);
+        if (!PLAN_LIMITS[result.planKey]) {
+            return res.status(400).json({ success: false, message: 'This promo code is misconfigured. Please contact support.' });
+        }
+
+        // Grant the entitlement server-side — this is what actually raises the
+        // account's agent / seat / credit ceilings.
+        const entitlement = await writeEntitlement(
+            db, email, result.planKey, 'promo', result.promoLimits || null, { promoCode: normalizedCode }
+        );
+        const limits = resolvePlanLimits({ entitlement });
+
+        await db.collection('users').doc(email).set({ planUnlockedByPromo: true }, { merge: true });
+
+        return res.json({
+            success: true,
+            planKey: result.planKey,
+            limits: {
+                maxAgents: limits.maxAgents,
+                maxSeats: limits.maxSeats,
+                monthlyCredits: limits.monthlyCredits,
+            },
+        });
     } catch (err) {
         console.error('[Promo/Validate]', err.message);
         return res.status(500).json({ success: false, message: err.message });
@@ -2885,6 +3523,68 @@ async function handleCompanyCheckUsername(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// GET /api/company/capacity?companyUsername=
+// Powers the greyed-out / unclickable company entry on the employee sign-up
+// screen when a workspace has no seats left on its plan.
+// ════════════════════════════════════════════════════════════════════════════
+async function handleCompanyCapacity(req, res) {
+    const { companyUsername } = req.query;
+    if (!companyUsername) return res.status(400).json({ success: false, message: 'Missing companyUsername.' });
+    try {
+        const db = getDb();
+        const capacity = await getCompanyCapacity(db, companyUsername);
+        if (!capacity) return res.status(404).json({ success: false, message: 'Company not found.' });
+        return res.json({ success: true, ...capacity });
+    } catch (err) {
+        console.error('[Company/Capacity]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/company/search?q=
+// Same prefix search the employee wizard does, but each result already carries
+// its seat capacity so the UI can render full companies as disabled.
+// ════════════════════════════════════════════════════════════════════════════
+async function handleCompanySearch(req, res) {
+    const q = companyKeyFrom(req.query?.q || '');
+    if (!q) return res.json({ success: true, companies: [] });
+    try {
+        const db = getDb();
+        const snap = await db.collection('companies')
+            .orderBy(admin.firestore.FieldPath.documentId())
+            .startAt(q)
+            .endAt(q + '\uf8ff')
+            .limit(8)
+            .get();
+
+        const companies = [];
+        for (const d of snap.docs) {
+            const capacity = await getCompanyCapacity(db, d.id);
+            if (capacity) {
+                companies.push(capacity);
+            } else {
+                const c = d.data() || {};
+                companies.push({
+                    companyUsername: d.id,
+                    displayUsername: c.displayUsername || ('@' + d.id),
+                    logoBase64: c.logoBase64 || null,
+                    planLabel: 'Free',
+                    seatsUsed: 0,
+                    maxSeats: PLAN_LIMITS.free.maxSeats,
+                    seatsRemaining: PLAN_LIMITS.free.maxSeats,
+                    full: false,
+                });
+            }
+        }
+        return res.json({ success: true, companies });
+    } catch (err) {
+        console.error('[Company/Search]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // POST /api/company/setup  { username, ownerEmail, logoBase64 }
 // ════════════════════════════════════════════════════════════════════════════
 async function handleCompanySetup(req, res) {
@@ -2941,6 +3641,12 @@ async function handleCompanySetup(req, res) {
             pendingSetup: false,
         }, { merge: true });
 
+        // Brand-new workspaces start on the Free plan until a plan is chosen.
+        const existing = existingUserSnap.exists ? existingUserSnap.data() : {};
+        if (!existing.entitlement) {
+            await writeEntitlement(db, ownerEmail, 'free', 'signup');
+        }
+
         return res.json({ success: true, key });
     } catch (err) {
         console.error('[Company/Setup]', err.message);
@@ -2959,7 +3665,23 @@ async function handleCompanyJoinCode(req, res) {
         const db = getDb();
         const { key, secret } = await requireCompanyOwner(db, companyUsername, requestedBy);
         const { code, expiresAt } = await ensureValidJoinCode(db, key, secret);
-        return res.json({ success: true, joinCode: code, expiresAt });
+
+        const ownerSnap = await db.collection('users').doc(requestedBy).get();
+        const limits = resolvePlanLimits(ownerSnap.exists ? ownerSnap.data() : {});
+        const seatsUsed = await countOccupiedSeats(db, key);
+
+        return res.json({
+            success: true,
+            joinCode: code,
+            expiresAt,
+            seats: {
+                used: seatsUsed,
+                limit: limits.maxSeats,
+                remaining: Math.max(0, limits.maxSeats - seatsUsed),
+                full: seatsUsed >= limits.maxSeats,
+            },
+            plan: { tier: limits.tier, label: limits.label },
+        });
     } catch (err) {
         if (err.status) return res.status(err.status).json({ success: false, message: err.message });
         console.error('[Company/JoinCode]', err.message);
@@ -2994,6 +3716,8 @@ async function handleCompanyJoinCodeRegenerate(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // POST /api/employee/verify-and-connect  { companyUsername, joinCode, employeeEmail, logoBase64? }
+// Seat cap is checked BEFORE the join code is validated/rotated, so a rejected
+// join never burns the company's current code.
 // ════════════════════════════════════════════════════════════════════════════
 async function handleEmployeeVerifyAndConnect(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -3012,6 +3736,26 @@ async function handleEmployeeVerifyAndConnect(req, res) {
             return res.status(404).json({ success: false, message: 'Company not found.' });
 
         const secret = secretSnap.data();
+
+        // ── SEAT CAP ──
+        const employeeSnap = await db.collection('users').doc(employeeEmail).get();
+        const employeeProfile = employeeSnap.exists ? employeeSnap.data() : {};
+        const isRejoin = employeeProfile.employeeOf === key && (employeeProfile.employeeStatus || 'active') !== 'removed';
+
+        if (!isRejoin) {
+            const ownerSnap = secret.ownerEmail ? await db.collection('users').doc(secret.ownerEmail).get() : null;
+            const limits = resolvePlanLimits(ownerSnap?.exists ? ownerSnap.data() : {});
+            const seatsUsed = await countOccupiedSeats(db, key);
+            if (seatsUsed >= limits.maxSeats) {
+                return res.status(403).json({
+                    success: false,
+                    limitReached: 'seats',
+                    message: `This company's ${limits.label} plan is full (${seatsUsed}/${limits.maxSeats} team members). Ask the owner to upgrade or free up a seat.`,
+                    seats: { used: seatsUsed, limit: limits.maxSeats },
+                });
+            }
+        }
+
         const submitted = String(joinCode).trim().toUpperCase();
         const expiresAt = secret.joinCodeExpiresAt ? new Date(secret.joinCodeExpiresAt).getTime() : 0;
 
@@ -3069,7 +3813,21 @@ async function handleCompanyEmployeesList(req, res) {
             });
         });
 
-        return res.json({ success: true, employees });
+        const ownerSnap = await db.collection('users').doc(requestedBy).get();
+        const limits = resolvePlanLimits(ownerSnap.exists ? ownerSnap.data() : {});
+        const seatsUsed = employees.filter(e => e.status !== 'removed').length;
+
+        return res.json({
+            success: true,
+            employees,
+            seats: {
+                used: seatsUsed,
+                limit: limits.maxSeats,
+                remaining: Math.max(0, limits.maxSeats - seatsUsed),
+                full: seatsUsed >= limits.maxSeats,
+            },
+            plan: { tier: limits.tier, label: limits.label },
+        });
     } catch (err) {
         if (err.status) return res.status(err.status).json({ success: false, message: err.message });
         console.error('[Company/EmployeesList]', err.message);
@@ -3095,7 +3853,7 @@ async function handleCompanyEmployeeRemove(req, res) {
             employeeStatus: 'removed',
         }, { merge: true });
 
-        return res.json({ success: true, message: 'Employee removed from company.' });
+        return res.json({ success: true, message: 'Employee removed from company. Their seat is now free.' });
     } catch (err) {
         if (err.status) return res.status(err.status).json({ success: false, message: err.message });
         console.error('[Company/EmployeeRemove]', err.message);
@@ -3129,7 +3887,7 @@ async function handleCompanyEmployeeDisable(req, res) {
             employeeStatus: isDisabling ? 'disabled' : 'active',
         }, { merge: true });
 
-        return res.json({ success: true, message: isDisabling ? 'Employee account disabled.' : 'Employee account re-enabled.' });
+        return res.json({ success: true, message: isDisabling ? 'Employee account disabled (still holds a seat).' : 'Employee account re-enabled.' });
     } catch (err) {
         if (err.status) return res.status(err.status).json({ success: false, message: err.message });
         console.error('[Company/EmployeeDisable]', err.message);
@@ -3160,7 +3918,7 @@ async function handleCompanyEmployeeDelete(req, res) {
 
         await db.collection('users').doc(employeeEmail).delete().catch(() => {});
 
-        return res.json({ success: true, message: 'Employee account permanently deleted.' });
+        return res.json({ success: true, message: 'Employee account permanently deleted. Their seat is now free.' });
     } catch (err) {
         if (err.status) return res.status(err.status).json({ success: false, message: err.message });
         console.error('[Company/EmployeeDelete]', err.message);
@@ -3396,6 +4154,7 @@ async function logChat(db, businessId, convId, question, answer, isGenuineQuery,
             conversationId: convId, question, answer, isGenuineQuery, isLeadCaptured,
             fallback: !!fallback,
             humanRequested: !!opts.humanRequested,
+            creditBlocked: !!opts.creditBlocked,
             sentimentLabel: sentiment.label,
             sentimentScore: sentiment.score,
             createdAt: new Date().toISOString(),
