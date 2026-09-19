@@ -320,7 +320,7 @@ const MODEL_REGISTRY = {
     'llama-3.1-8b':      { id: 'llama-3.1-8b-instant',    provider: 'groq',    label: 'Meta LLaMA 3.1 8B (Fast)' },
     'gpt-oss-120b':      { id: 'openai/gpt-oss-120b',     provider: 'groq',    label: 'OpenAI GPT-OSS 120B'     },
     'gpt-oss-20b':       { id: 'openai/gpt-oss-20b',      provider: 'groq',    label: 'OpenAI GPT-OSS 20B (Fast)' },
-    'mistral-large-2512':     { id: 'mistral-large-latest',    provider: 'mistral', label: 'mistral-large-2512'           },
+    'mistral-large':     { id: 'mistral-large-latest',    provider: 'mistral', label: 'Mistral Large'           },
     'mistral-small':     { id: 'mistral-small-latest',    provider: 'mistral', label: 'Mistral Small (Fast)'    },
     'gemini-2.5-flash':  { id: 'gemini-2.5-flash',        provider: 'google',  label: 'Gemini 2.5 Flash'        },
 };
