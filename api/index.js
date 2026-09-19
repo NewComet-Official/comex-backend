@@ -316,7 +316,7 @@ async function getCompanyCapacity(db, rawUsername) {
 // ════════════════════════════════════════════════════════════════════════════
 
 const MODEL_REGISTRY = {
-    'qwen-3.6-27b':       { id: 'qwen/qwen3.8-27b',        provider: 'groq',    label: 'Qwen 3.8 27B'            },
+    'qwen-3.8-27b':       { id: 'qwen/qwen3.8-27b',        provider: 'groq',    label: 'Qwen 3.8 27B'            },
     'llama-3.1-8b':      { id: 'llama-3.1-8b-instant',    provider: 'groq',    label: 'Meta LLaMA 3.1 8B (Fast)' },
     'gpt-oss-120b':      { id: 'openai/gpt-oss-120b',     provider: 'groq',    label: 'OpenAI GPT-OSS 120B'     },
     'gpt-oss-20b':       { id: 'openai/gpt-oss-20b',      provider: 'groq',    label: 'OpenAI GPT-OSS 20B (Fast)' },
