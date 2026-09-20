@@ -847,6 +847,101 @@ async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent, enabl
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// LIVE WEBSITE AUTO-SYNC
+// Re-fetches the agent's website (and a few reference links) at chat time,
+// throttled, and only writes to Firestore when the content actually changed.
+// ════════════════════════════════════════════════════════════════════════════
+const SYNC_CHECK_INTERVAL_MS = 60 * 1000;  // how often a site is re-checked (lower = fresher, more fetches)
+const SYNC_FETCH_TIMEOUT_MS  = 5000;       // max extra latency a sync can add to one chat message
+const SYNC_MAX_EXTRA_LINKS   = 3;
+
+function htmlToText(html) {
+    return String(html || '')
+        .replace(/<script[\s\S]*?<\/script>/gi, '')
+        .replace(/<style[\s\S]*?<\/style>/gi, '')
+        .replace(/<noscript[\s\S]*?<\/noscript>/gi, '')
+        .replace(/<!--[\s\S]*?-->/g, '')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/&nbsp;/g, ' ')
+        .replace(/&amp;/g, '&')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+async function fetchPageText(url, timeoutMs = SYNC_FETCH_TIMEOUT_MS) {
+    const r = await fetch(url, {
+        headers: {
+            'User-Agent': 'Mozilla/5.0 ComexAI/1.0',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
+        },
+        cache: 'no-store',
+        redirect: 'follow',
+        signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return htmlToText(await r.text());
+}
+
+// Mutates `bot` (the in-memory doc) with the fresh values so the current chat
+// turn already uses them, and persists them for later turns.
+async function syncBotWebsite(db, businessId, bot, { force = false } = {}) {
+    const url = bot.url;
+    if (!/^https?:\/\//i.test(url || '')) return { skipped: 'no-url' };
+
+    const lastCheck = bot.lastSyncCheckAt ? new Date(bot.lastSyncCheckAt).getTime() : 0;
+    if (!force && Date.now() - lastCheck < SYNC_CHECK_INTERVAL_MS) return { skipped: 'fresh' };
+
+    const botRef = db.collection('user_bots').doc(businessId);
+    const nowISO = new Date().toISOString();
+    bot.lastSyncCheckAt = nowISO;
+    // Written first so concurrent chat requests don't all re-fetch at once.
+    await botRef.set({ lastSyncCheckAt: nowISO }, { merge: true });
+
+    const links = (bot.knowledgeContext?.additionalLinks || [])
+        .filter(l => /^https?:\/\//i.test(l || ''))
+        .slice(0, SYNC_MAX_EXTRA_LINKS);
+
+    const [main, ...extras] = await Promise.allSettled([
+        fetchPageText(url),
+        ...links.map(l => fetchPageText(l)),
+    ]);
+
+    if (main.status !== 'fulfilled' || main.value.length < 20) {
+        const msg = main.status === 'rejected' ? main.reason?.message : 'Page had no readable text.';
+        bot.lastSyncError = msg;
+        await botRef.set({ lastSyncError: msg }, { merge: true });
+        return { error: msg }; // keep serving the last good copy
+    }
+
+    const mainText  = main.value.substring(0, 15000);
+    const linksText = extras
+        .map((e, i) => (e.status === 'fulfilled' && e.value.length >= 20)
+            ? `[Source: ${links[i]}]\n${e.value.substring(0, 4000)}`
+            : null)
+        .filter(Boolean)
+        .join('\n\n');
+
+    const hash = crypto.createHash('sha256').update(mainText + '||' + linksText).digest('hex');
+
+    if (hash === bot.contextHash) {
+        bot.lastSyncedAt = nowISO;
+        await botRef.set({ lastSyncedAt: nowISO, lastSyncError: null }, { merge: true });
+        return { changed: false };
+    }
+
+    Object.assign(bot, {
+        context: mainText, linksContext: linksText, contextHash: hash,
+        lastSyncedAt: nowISO, lastSyncError: null,
+    });
+    await botRef.set({
+        context: mainText, linksContext: linksText, contextHash: hash,
+        lastSyncedAt: nowISO, lastSyncError: null,
+    }, { merge: true });
+    return { changed: true };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // ROUTER
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -2225,22 +2320,19 @@ async function handleScrape(req, res) {
     if (!businessId || !url)
         return res.status(400).json({ success: false, message: 'Missing businessId or url.' });
     try {
-        const r = await fetch(url, {
-            headers: { 'User-Agent': 'Mozilla/5.0 ComexAI/1.0' },
-            signal:  AbortSignal.timeout(12000),
-        });
-        if (!r.ok) throw new Error(`Fetch failed: HTTP ${r.status}`);
-        const html = await r.text();
-        const text = html
-            .replace(/<script[\s\S]*?<\/script>/gi, '')
-            .replace(/<style[\s\S]*?<\/style>/gi, '')
-            .replace(/<[^>]+>/g, ' ')
-            .replace(/\s+/g, ' ')
-            .trim()
-            .substring(0, 15000);
+        const text = (await fetchPageText(url, 12000)).substring(0, 15000);
         if (text.length < 20) throw new Error('Could not extract text from this URL.');
-        const update = { context: text };
-        if (customInstructions) update['knowledgeContext.systemPrompt'] = customInstructions;
+
+        const nowISO = new Date().toISOString();
+        const update = {
+            url,
+            context: text,
+            contextHash: crypto.createHash('sha256').update(text + '||').digest('hex'),
+            lastSyncedAt: nowISO,
+            lastSyncCheckAt: nowISO,
+            lastSyncError: null,
+        };
+        if (customInstructions) update.knowledgeContext = { systemPrompt: customInstructions };
         await getDb().collection('user_bots').doc(businessId).set(update, { merge: true });
         return res.status(200).json({ success: true, message: `Scraped ${text.length} chars.`, snippet: text.substring(0, 200) });
     } catch (err) {
@@ -2377,11 +2469,20 @@ async function handleChat(req, res) {
             }
             if (!planLimits.features.appointmentBooking) behaviorConfig.allowAppointmentBooking = false;
 
+                        // ── Live website auto-sync (throttled; only re-fetches when stale) ──
+            try { await syncBotWebsite(db, businessId, b); }
+            catch (e) { console.warn('[Chat/Sync]', e.message); }
+
             const kc   = b.knowledgeContext || {};
             if (kc.systemPrompt) {
                 sysPrompt = kc.systemPrompt;
-            } else if (b.context) {
-                sysPrompt = `You are a helpful, friendly customer service assistant for "${botName}". Use the following business information to answer questions accurately:\n\n${b.context}`;
+            } else {
+                sysPrompt = `You are a helpful, friendly customer service assistant for "${botName}". Use the business information below to answer questions accurately.`;
+            }
+            if (b.context) {
+                sysPrompt += `\n\n[WEBSITE CONTENT — LIVE, last synced ${b.lastSyncedAt || 'at deploy time'}]:\n${b.context}`;
+                if (b.linksContext) sysPrompt += `\n\n[REFERENCE LINKS — LIVE]:\n${b.linksContext}`;
+                sysPrompt += `\n\nThe website content above is the current source of truth. If earlier messages in this conversation contradict it, the website content is correct and the earlier messages are outdated.`;
             }
             if (kc.fileContents) {
                 sysPrompt += `\n\n[REFERENCE DOCUMENTS]:\n${String(kc.fileContents).substring(0, 6000)}`;
