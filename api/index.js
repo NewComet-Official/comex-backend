@@ -34,7 +34,7 @@ function cors(res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// PLANS, SEATS, AGENTS & CREDITS — SERVER-SIDE SOURCE OF TRUTH
+// PLANS, SEATS, AGENTS, CREDITS & FEATURES — SERVER-SIDE SOURCE OF TRUTH
 // ════════════════════════════════════════════════════════════════════════════
 //
 // Everything about what an account is allowed to do lives here, on the server.
@@ -48,6 +48,13 @@ function cors(res) {
 //
 // Anything without a valid entitlement is treated as the Free plan, which caps
 // the Groq spend at 100 messages/month no matter what the page source says.
+//
+// FEATURE GATING: every paid feature (Google Calendar, push notifications,
+// Firebase / Supabase live data, Canva / Figma imports, appointment booking…)
+// is checked HERE against the resolved plan — at the OAuth start, the OAuth
+// callback, every API route that uses the feature, and again at chat time.
+// The frontend only greys buttons out for UX; removing that in devtools gets
+// a person nothing because the server refuses to serve the feature.
 // ════════════════════════════════════════════════════════════════════════════
 
 const PLAN_LIMITS = {
@@ -56,6 +63,160 @@ const PLAN_LIMITS = {
     teamplus:   { label: 'Team+',      maxAgents: 10,  maxSeats: 10,  monthlyCredits: 10000  },
     enterprise: { label: 'Enterprise', maxAgents: 10,  maxSeats: 10,  monthlyCredits: 45000  },
 };
+
+// Order used when listing "which plans unlock this feature" in upgrade messages.
+const PLAN_ORDER = ['free', 'team', 'teamplus', 'enterprise'];
+
+// Feature → which plan tiers include it. This is the ONLY place that decides
+// what a plan can use; edit this table to change plan contents.
+const FEATURE_CATALOG = {
+    appointmentBooking: { label: 'Appointment Booking',                     plans: ['team', 'teamplus', 'enterprise'] },
+    googleCalendar:     { label: 'Google Calendar Auto-Booking',            plans: ['team', 'teamplus', 'enterprise'] },
+    pushNotifications:  { label: 'Desktop Push Notifications',              plans: ['team', 'teamplus', 'enterprise'] },
+    firebaseDatabase:   { label: 'Firebase Live Database Source',           plans: ['teamplus', 'enterprise'] },
+    supabaseDatabase:   { label: 'Supabase Live Database Source',           plans: ['teamplus', 'enterprise'] },
+    canvaDesign:        { label: 'Canva Design Import',                     plans: ['teamplus', 'enterprise'] },
+    figmaDesign:        { label: 'Figma Design Import',                     plans: ['teamplus', 'enterprise'] },
+    advancedReports:    { label: 'Full Reports & Feedback (Agent Filter)',  plans: ['teamplus', 'enterprise'] },
+};
+
+// Maps the `service` name used by the database / design routes onto a feature key.
+const DB_SERVICE_FEATURE = { firebase: 'firebaseDatabase', supabase: 'supabaseDatabase' };
+const DESIGN_SERVICE_FEATURE = { canva: 'canvaDesign', figma: 'figmaDesign' };
+
+function requiredPlanTiers(featureKey) {
+    const def = FEATURE_CATALOG[featureKey];
+    if (!def) return [];
+    return PLAN_ORDER.filter(t => def.plans.includes(t));
+}
+
+function joinWithOr(labels) {
+    if (!labels.length) return '';
+    if (labels.length === 1) return labels[0];
+    return labels.slice(0, -1).join(', ') + ' or ' + labels[labels.length - 1];
+}
+
+// "Upgrade to Team+ or Enterprise to unlock this feature."
+function buildUpgradeMessage(featureKey) {
+    const labels = requiredPlanTiers(featureKey).map(t => PLAN_LIMITS[t].label);
+    if (!labels.length) return 'This feature is not available.';
+    return `Upgrade to ${joinWithOr(labels)} to unlock this feature.`;
+}
+
+function resolveFeatureAccess(tier, overrides) {
+    const out = {};
+    Object.keys(FEATURE_CATALOG).forEach(key => {
+        out[key] = FEATURE_CATALOG[key].plans.includes(tier);
+        // Optional backend-written per-account override (entitlement.features).
+        if (overrides && typeof overrides[key] === 'boolean') out[key] = overrides[key];
+    });
+    return out;
+}
+
+// What the dashboard reads to grey out locked controls + show the tooltip text.
+function buildFeatureSnapshot(limits) {
+    const out = {};
+    Object.keys(FEATURE_CATALOG).forEach(key => {
+        const allowed = !!limits.features[key];
+        out[key] = {
+            allowed,
+            label: FEATURE_CATALOG[key].label,
+            requiredPlans: requiredPlanTiers(key).map(t => ({ tier: t, label: PLAN_LIMITS[t].label })),
+            upgradeMessage: allowed ? null : buildUpgradeMessage(key),
+        };
+    });
+    return out;
+}
+
+function featureLockedPayload(featureKey, limits) {
+    return {
+        success: false,
+        featureLocked: featureKey,
+        featureLabel: FEATURE_CATALOG[featureKey]?.label || featureKey,
+        message: buildUpgradeMessage(featureKey),
+        currentPlan: limits ? { tier: limits.tier, label: limits.label } : null,
+        requiredPlans: requiredPlanTiers(featureKey).map(t => ({ tier: t, label: PLAN_LIMITS[t].label })),
+    };
+}
+
+// Resolves the requester's (or their employer's) plan and checks one feature.
+async function checkFeatureForEmail(db, email, featureKey) {
+    const ctx = await resolveOwnerContext(db, email);
+    const limits = resolvePlanLimits(ctx.ownerProfile);
+    return { allowed: !!limits.features[featureKey], ctx, limits };
+}
+
+// Convenience for JSON routes: returns true (and has already replied 403) if locked.
+async function denyIfFeatureLocked(res, db, email, featureKey) {
+    const access = await checkFeatureForEmail(db, email, featureKey);
+    if (access.allowed) return false;
+    res.status(403).json(featureLockedPayload(featureKey, access.limits));
+    return true;
+}
+
+function buildAppUrl(req, origin) {
+    return origin ||
+           process.env.APP_URL ||
+           `https://${String(req.headers.host || '').replace('comex-backend', 'cometchat-ai-platform').replace('.vercel.app', '.web.app')}`;
+}
+
+// Browser-redirect flows (OAuth) can't return JSON, so a locked feature bounces
+// back to the app with ?feature_locked=<key>&upgrade_message=<text>.
+function redirectFeatureLocked(req, res, origin, featureKey, limits) {
+    const message = buildUpgradeMessage(featureKey);
+    try {
+        const url = new URL(buildAppUrl(req, origin));
+        url.searchParams.set('feature_locked', featureKey);
+        url.searchParams.set('upgrade_message', message);
+        return res.redirect(302, url.toString());
+    } catch (e) {
+        return res.status(403).send(message);
+    }
+}
+
+// Used at the top of every OAuth start / callback. Returns true if it already
+// responded (locked or lookup failure) so the caller should just `return`.
+async function gateOAuthFeature(req, res, email, origin, featureKey) {
+    try {
+        const access = await checkFeatureForEmail(getDb(), email, featureKey);
+        if (access.allowed) return false;
+        redirectFeatureLocked(req, res, origin, featureKey, access.limits);
+        return true;
+    } catch (err) {
+        console.error('[FeatureGate/OAuth]', featureKey, err.message);
+        res.status(500).send('Could not verify your plan right now. Please try again.');
+        return true;
+    }
+}
+
+// Strips anything a plan doesn't include from an agent config before it's saved,
+// so a tampered request body can't smuggle locked features onto a bot doc.
+function sanitizeBotDataForPlan(botData, limits) {
+    const stripped = [];
+    const f = limits.features;
+
+    if (botData.behaviorConfig && botData.behaviorConfig.allowAppointmentBooking && !f.appointmentBooking) {
+        botData.behaviorConfig.allowAppointmentBooking = false;
+        stripped.push('appointmentBooking');
+    }
+
+    const sources = botData.knowledgeContext?.databaseSources;
+    if (Array.isArray(sources) && sources.length) {
+        const kept = sources.filter(s => {
+            const key = DB_SERVICE_FEATURE[s?.service];
+            return key && f[key];
+        });
+        if (kept.length !== sources.length) {
+            sources.forEach(s => {
+                const key = DB_SERVICE_FEATURE[s?.service] || null;
+                if (!key || !f[key]) stripped.push(key || 'databaseSource');
+            });
+            botData.knowledgeContext.databaseSources = kept;
+        }
+    }
+
+    return [...new Set(stripped)];
+}
 
 // `maxSeats` = employee accounts that may be connected to the company workspace
 // (the owner does not consume a seat).
@@ -87,10 +248,14 @@ function resolvePlanLimits(userData) {
     const ent  = data.entitlement || null;
 
     let tier = 'free';
+    let featureOverrides = null;
     if (ent && ent.tier && PLAN_LIMITS[ent.tier]) {
         const notExpired = !ent.expiresAt || new Date(ent.expiresAt).getTime() > Date.now();
         const notRevoked = ent.status !== 'revoked' && ent.status !== 'cancelled';
-        if (notExpired && notRevoked) tier = ent.tier;
+        if (notExpired && notRevoked) {
+            tier = ent.tier;
+            featureOverrides = ent.features || null;
+        }
     }
 
     const base = PLAN_LIMITS[tier];
@@ -102,6 +267,7 @@ function resolvePlanLimits(userData) {
         maxAgents:      toPositiveInt(overrides.maxAgents,      base.maxAgents),
         maxSeats:       toPositiveInt(overrides.maxSeats,       base.maxSeats),
         monthlyCredits: toPositiveInt(overrides.monthlyCredits, base.monthlyCredits),
+        features:       resolveFeatureAccess(tier, featureOverrides),
         entitlementSource: ent?.source || 'none',
     };
 }
@@ -278,6 +444,7 @@ async function buildUsageSnapshot(db, requesterEmail) {
             full: seatsUsed >= limits.maxSeats,
         },
         credits,
+        features: buildFeatureSnapshot(limits),
         canCreateAgent: !ctx.isEmployee && agentsUsed < limits.maxAgents,
         botsDisabled: credits.exhausted,
         showCreditWarning: credits.warning || credits.exhausted,
@@ -716,8 +883,9 @@ export default async function handler(req, res) {
     if (path === '/api/password-reset/verify')  return handlePasswordResetVerify(req, res);
     if (path === '/api/password-reset/confirm') return handlePasswordResetConfirm(req, res);
 
-    // ── Plan limits / usage metering ───────────────────────────────────────
+    // ── Plan limits / usage metering / feature access ──────────────────────
     if (path === '/api/plan/usage')               return handlePlanUsage(req, res);
+    if (path === '/api/plan/features')            return handlePlanFeatures(req, res);
     if (path === '/api/plan/select')              return handlePlanSelect(req, res);
     if (path === '/api/plan/can-create-agent')    return handleCanCreateAgent(req, res);
 
@@ -779,8 +947,9 @@ async function handleModels(req, res) {
 // ════════════════════════════════════════════════════════════════════════════
 // GET /api/plan/usage?email=
 // Single source of truth the dashboard reads for: agent count vs limit,
-// employee seats vs limit, and the credit meter (drives the 75% warning
-// banner and the 100% "bots offline" state).
+// employee seats vs limit, the credit meter (drives the 75% warning banner
+// and the 100% "bots offline" state) and per-feature access (drives the
+// greyed-out / "Upgrade to …" state of locked controls).
 // ════════════════════════════════════════════════════════════════════════════
 async function handlePlanUsage(req, res) {
     const email = req.query?.email || req.query?.ownerEmail || req.body?.email;
@@ -791,6 +960,29 @@ async function handlePlanUsage(req, res) {
         return res.json({ success: true, ...usage });
     } catch (err) {
         console.error('[Plan/Usage]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// GET /api/plan/features?email=
+// Lightweight: just the plan + which features it includes, each with the
+// ready-made "Upgrade to X or Y to unlock this feature." tooltip text.
+// ════════════════════════════════════════════════════════════════════════════
+async function handlePlanFeatures(req, res) {
+    const email = req.query?.email || req.query?.ownerEmail || req.body?.email;
+    if (!email) return res.status(400).json({ success: false, message: 'Missing email.' });
+    try {
+        const db = getDb();
+        const ctx = await resolveOwnerContext(db, email);
+        const limits = resolvePlanLimits(ctx.ownerProfile);
+        return res.json({
+            success: true,
+            plan: { tier: limits.tier, label: limits.label, source: limits.entitlementSource },
+            features: buildFeatureSnapshot(limits),
+        });
+    } catch (err) {
+        console.error('[Plan/Features]', err.message);
         return res.status(500).json({ success: false, message: err.message });
     }
 }
@@ -1606,6 +1798,19 @@ async function sendFCMToUser(ownerEmail, { title, body, url, tag }) {
     if (!ownerEmail) return { sent: 0, failed: 0 };
 
     const db = getDb();
+
+    // Plan gate: push notifications are a paid feature. Even if a device token
+    // is sitting in Firestore (e.g. after a downgrade, or written by hand),
+    // nothing is delivered unless the account's plan includes the feature.
+    try {
+        const ctx = await resolveOwnerContext(db, ownerEmail);
+        const limits = resolvePlanLimits(ctx.ownerProfile);
+        if (!limits.features.pushNotifications) return { sent: 0, failed: 0, skipped: 'plan' };
+    } catch (e) {
+        console.error('[FCM/PlanGate]', e.message);
+        return { sent: 0, failed: 0, skipped: 'plan-check-failed' };
+    }
+
     const userRef = db.collection('users').doc(ownerEmail);
     const userSnap = await userRef.get();
     if (!userSnap.exists) return { sent: 0, failed: 0 };
@@ -1617,7 +1822,7 @@ async function sendFCMToUser(ownerEmail, { title, body, url, tag }) {
     const message = {
         tokens,
         data: {
-            title: title || 'Comex AI Notification',
+            title: title || 'Mebor AI Notification',
             body:  body  || '',
             url:   url   || '/',
             tag:   tag   || 'comex-general',
@@ -1675,7 +1880,7 @@ function buildBookingNotification(appt) {
         title: '📅 New Appointment Booked!',
         body:  `${appt.customerName} booked ${appt.appointmentDay} at ${appt.appointmentTime}. Contact: ${appt.contactInfo}`,
         url:   '/?view=analytics',
-        tag:   'comex-appointment',
+        tag:   'Mebor-appointment',
     };
 }
 
@@ -1866,6 +2071,10 @@ async function handleFCMRegisterToken(req, res) {
 
     try {
         const db      = getDb();
+
+        // Plan gate — Free accounts can't register a device for push alerts.
+        if (await denyIfFeatureLocked(res, db, userEmail, 'pushNotifications')) return;
+
         const userRef  = db.collection('users').doc(userEmail);
         const snap     = await userRef.get();
         const existing = snap.exists ? (snap.data()?.fcmTokens || []) : [];
@@ -1915,9 +2124,11 @@ async function handleFCMTestNotification(req, res) {
     if (!userEmail) return res.status(400).json({ success: false, message: 'Missing userEmail.' });
 
     try {
+        if (await denyIfFeatureLocked(res, getDb(), userEmail, 'pushNotifications')) return;
+
         const result = await sendFCMToUser(userEmail, {
             title: '✅ Notifications Connected!',
-            body:  'This is a test alert from Comex AI. You will receive one like this for every new appointment.',
+            body:  'This is a test alert from Mebor AI. You will receive one like this for every new appointment.',
             url:   '/?view=integrations',
             tag:   'comex-test',
         });
@@ -1934,6 +2145,7 @@ async function handleFCMTestNotification(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // DEPLOY — enforces the plan's agent cap for NEW agents (edits always allowed)
+// and strips any feature the plan doesn't include from the saved config.
 // ════════════════════════════════════════════════════════════════════════════
 async function handleDeploy(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -1974,6 +2186,9 @@ async function handleDeploy(req, res) {
             }
         }
 
+        // FEATURE GATE: whatever the browser sent, locked features never reach the bot doc.
+        const featuresStripped = sanitizeBotDataForPlan(botData, limits);
+
         botData.owner     = ctx.ownerEmail;
         botData.deletedAt = null;
         botData.displayName = botData.displayName || botData.name;
@@ -1986,6 +2201,14 @@ async function handleDeploy(req, res) {
             botId: botData.id,
             agents: { used: agentsUsed, limit: limits.maxAgents, remaining: Math.max(0, limits.maxAgents - agentsUsed) },
             plan: { tier: limits.tier, label: limits.label },
+            ...(featuresStripped.length ? {
+                featuresStripped,
+                featureWarnings: featuresStripped.map(k => ({
+                    feature: k,
+                    label: FEATURE_CATALOG[k]?.label || k,
+                    message: FEATURE_CATALOG[k] ? buildUpgradeMessage(k) : 'Not available on your plan.',
+                })),
+            } : {}),
         });
     } catch (err) {
         console.error('[Deploy]', err.message);
@@ -2041,14 +2264,26 @@ async function handleConfig(req, res) {
         // Widget-facing availability flag — purely informational; the real
         // enforcement happens in /api/chat.
         let serviceAvailable = true;
+        let planFeatures = null;
         try {
             if (b.owner) {
                 const ownerSnap = await db.collection('users').doc(b.owner).get();
                 const limits = resolvePlanLimits(ownerSnap.exists ? ownerSnap.data() : {});
                 const credits = readCreditState(ownerSnap.exists ? ownerSnap.data() : {}, limits);
                 serviceAvailable = !credits.exhausted;
+                planFeatures = limits.features;
             }
         } catch (e) { /* best-effort */ }
+
+        const behaviorConfig = Object.assign({
+            allowOutOfTopic:      true,
+            allowWebSearch:       true,
+            allowHallucination:   false,
+            allowAppointmentBooking: false,
+            allowHumanHandoff:    true,
+        }, b.behaviorConfig || {});
+        // Never advertise a feature the owner's plan doesn't include.
+        if (planFeatures && !planFeatures.appointmentBooking) behaviorConfig.allowAppointmentBooking = false;
 
         return res.status(200).json({
             success:         true,
@@ -2060,13 +2295,7 @@ async function handleConfig(req, res) {
             designConfig:    b.designConfig             || {},
             modelKey:        b.modelKey                 || DEFAULT_MODEL_KEY,
             serviceAvailable,
-            behaviorConfig:  Object.assign({
-                allowOutOfTopic:      true,
-                allowWebSearch:       true,
-                allowHallucination:   false,
-                allowAppointmentBooking: false,
-                allowHumanHandoff:    true,
-            }, b.behaviorConfig || {}),
+            behaviorConfig,
             messageConfig:   Object.assign({
                 user: { showTime: true, editMessage: true, copy: true },
                 bot:  { showTime: true, copy: true, regenerate: true, report: true },
@@ -2086,6 +2315,11 @@ async function handleConfig(req, res) {
 // called until a credit has been successfully reserved against the owner's
 // monthly pool, so tampering with the dashboard or the embed snippet cannot
 // run up the Groq bill.
+//
+// The plan's feature flags are re-applied here on EVERY message: appointment
+// booking, Google Calendar, and live database sources are switched off at
+// runtime if the owner's plan doesn't include them, regardless of what the
+// bot document says.
 // ════════════════════════════════════════════════════════════════════════════
 async function handleChat(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -2106,6 +2340,9 @@ async function handleChat(req, res) {
         let modelKey   = DEFAULT_MODEL_KEY;
         let subAgents  = [];
         let agentActionsList = [];
+        // Most restrictive (Free) by default — only replaced once the owner's
+        // real plan has been resolved below.
+        let planLimits = resolvePlanLimits({});
         let behaviorConfig = {
             allowOutOfTopic: true,
             allowWebSearch: true,
@@ -2129,6 +2366,17 @@ async function handleChat(req, res) {
                 return res.json({ success: true, answer: reply, reply, _unavailable: true });
             }
 
+            // ── PLAN FEATURE GATE ──────────────────────────────────────────
+            if (ownerEmail) {
+                try {
+                    const ownerPlanSnap = await db.collection('users').doc(ownerEmail).get();
+                    planLimits = resolvePlanLimits(ownerPlanSnap.exists ? ownerPlanSnap.data() : {});
+                } catch (e) {
+                    console.error('[Chat/PlanLookup]', e.message); // stays on the Free defaults
+                }
+            }
+            if (!planLimits.features.appointmentBooking) behaviorConfig.allowAppointmentBooking = false;
+
             const kc   = b.knowledgeContext || {};
             if (kc.systemPrompt) {
                 sysPrompt = kc.systemPrompt;
@@ -2140,7 +2388,11 @@ async function handleChat(req, res) {
             }
 
             // ── Database sources (Firebase Project / Supabase) ──────────────
-            const dbSources = kc.databaseSources || [];
+            // Only sources whose feature is included in the owner's plan are read.
+            const dbSources = (kc.databaseSources || []).filter(s => {
+                const featureKey = DB_SERVICE_FEATURE[s?.service];
+                return featureKey && planLimits.features[featureKey];
+            });
             if (dbSources.length) {
                 const limitedSources = dbSources.slice(0, 3); // cap latency/cost
                 const snapshots = await Promise.all(limitedSources.map(async s => {
@@ -2441,8 +2693,10 @@ async function handleChat(req, res) {
 
             const dateISO = resolveDay(appointmentDay);
 
+            // Google Calendar is its own plan feature — without it the booking is
+            // still recorded, but no calendar is ever read from or written to.
             let bookingAccounts = [];
-            if (ownerEmail) {
+            if (ownerEmail && planLimits.features.googleCalendar) {
                 bookingAccounts = bookingEnabledAccounts(await getGoogleCalendarAccounts(db, ownerEmail));
                 if (bookingAccounts.length) {
                     const avail = await checkCalendarAvailability(bookingAccounts[0], dateISO, appointmentTime, ownerEmail, db);
@@ -2665,7 +2919,7 @@ async function handlePromoValidate(req, res) {
         }
 
         // Grant the entitlement server-side — this is what actually raises the
-        // account's agent / seat / credit ceilings.
+        // account's agent / seat / credit / feature ceilings.
         const entitlement = await writeEntitlement(
             db, email, result.planKey, 'promo', result.promoLimits || null, { promoCode: normalizedCode }
         );
@@ -2681,6 +2935,7 @@ async function handlePromoValidate(req, res) {
                 maxSeats: limits.maxSeats,
                 monthlyCredits: limits.monthlyCredits,
             },
+            features: buildFeatureSnapshot(limits),
         });
     } catch (err) {
         console.error('[Promo/Validate]', err.message);
@@ -2744,11 +2999,14 @@ async function handleReportSubmit(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// GOOGLE OAUTH (Calendar)
+// GOOGLE OAUTH (Calendar) — feature: googleCalendar
 // ════════════════════════════════════════════════════════════════════════════
 async function handleGoogleOAuth(req, res) {
     const { email, origin } = req.query;
     if (!email) return res.status(400).send('Missing email.');
+
+    // Plan gate — checked on the server before Google is ever contacted.
+    if (await gateOAuthFeature(req, res, email, origin, 'googleCalendar')) return;
 
     const clientId    = process.env.GOOGLE_CLIENT_ID;
     const redirectUri = process.env.GOOGLE_REDIRECT_URI ||
@@ -2779,6 +3037,9 @@ async function handleGoogleCallback(req, res) {
         email  = parsed.email;
         origin = parsed.origin;
     } catch { return res.status(400).send('Invalid state parameter.'); }
+
+    // Re-check the plan here too, so a hand-crafted callback URL can't store tokens.
+    if (await gateOAuthFeature(req, res, email, origin, 'googleCalendar')) return;
 
     const clientId     = process.env.GOOGLE_CLIENT_ID;
     const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
@@ -2852,6 +3113,7 @@ async function handleGoogleCallback(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // POST /api/disconnect-calendar  { userEmail, calendarId? , all? }
+// (Always allowed — disconnecting is never gated.)
 // ════════════════════════════════════════════════════════════════════════════
 async function handleDisconnectCalendar(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -2909,6 +3171,9 @@ async function handleToggleCalendarAccount(req, res) {
 
     try {
         const db = getDb();
+
+        if (await denyIfFeatureLocked(res, db, userEmail, 'googleCalendar')) return;
+
         const userRef = db.collection('users').doc(userEmail);
         const snap = await userRef.get();
         const accounts = snap.exists ? (snap.data()?.integrations?.google_calendar_accounts || []) : [];
@@ -2927,10 +3192,13 @@ async function handleToggleCalendarAccount(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // FIREBASE PROJECT OAUTH (data source, NOT the calendar flow above)
+// feature: firebaseDatabase
 // ════════════════════════════════════════════════════════════════════════════
 async function handleFirebaseProjectOAuth(req, res) {
     const { email, origin } = req.query;
     if (!email) return res.status(400).send('Missing email.');
+
+    if (await gateOAuthFeature(req, res, email, origin, 'firebaseDatabase')) return;
 
     const clientId    = process.env.GOOGLE_CLIENT_ID;
     const redirectUri = process.env.GOOGLE_REDIRECT_URI_FIREBASE ||
@@ -2964,6 +3232,8 @@ async function handleFirebaseProjectCallback(req, res) {
         email  = parsed.email;
         origin = parsed.origin;
     } catch { return res.status(400).send('Invalid state parameter.'); }
+
+    if (await gateOAuthFeature(req, res, email, origin, 'firebaseDatabase')) return;
 
     const clientId     = process.env.GOOGLE_CLIENT_ID;
     const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
@@ -3018,11 +3288,13 @@ async function handleFirebaseProjectCallback(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// SUPABASE OAUTH (data source)
+// SUPABASE OAUTH (data source) — feature: supabaseDatabase
 // ════════════════════════════════════════════════════════════════════════════
 async function handleSupabaseOAuth(req, res) {
     const { email, origin } = req.query;
     if (!email) return res.status(400).send('Missing email.');
+
+    if (await gateOAuthFeature(req, res, email, origin, 'supabaseDatabase')) return;
 
     const clientId    = process.env.SUPABASE_CLIENT_ID;
     const redirectUri = process.env.SUPABASE_REDIRECT_URI ||
@@ -3050,6 +3322,8 @@ async function handleSupabaseCallback(req, res) {
         email  = parsed.email;
         origin = parsed.origin;
     } catch { return res.status(400).send('Invalid state parameter.'); }
+
+    if (await gateOAuthFeature(req, res, email, origin, 'supabaseDatabase')) return;
 
     const clientId     = process.env.SUPABASE_CLIENT_ID;
     const clientSecret  = process.env.SUPABASE_CLIENT_SECRET;
@@ -3097,10 +3371,13 @@ async function handleSupabaseCallback(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // FIGMA OAUTH (design source — standard authorization-code flow)
+// feature: figmaDesign
 // ════════════════════════════════════════════════════════════════════════════
 async function handleFigmaOAuth(req, res) {
     const { email, origin } = req.query;
     if (!email) return res.status(400).send('Missing email.');
+
+    if (await gateOAuthFeature(req, res, email, origin, 'figmaDesign')) return;
 
     const clientId    = process.env.FIGMA_CLIENT_ID;
     const redirectUri = process.env.FIGMA_REDIRECT_URI || `https://${req.headers.host}/api/oauth/figma/callback`;
@@ -3128,6 +3405,8 @@ async function handleFigmaCallback(req, res) {
         email  = parsed.email;
         origin = parsed.origin;
     } catch { return res.status(400).send('Invalid state parameter.'); }
+
+    if (await gateOAuthFeature(req, res, email, origin, 'figmaDesign')) return;
 
     const clientId     = process.env.FIGMA_CLIENT_ID;
     const clientSecret = process.env.FIGMA_CLIENT_SECRET;
@@ -3176,6 +3455,7 @@ async function handleFigmaCallback(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // CANVA OAUTH (design source — Connect API, REQUIRES PKCE)
+// feature: canvaDesign
 // The code_verifier can't survive in memory across the redirect on a
 // serverless function, so it's parked in a short-lived Firestore doc keyed
 // by a random state id, then deleted once the callback consumes it.
@@ -3187,6 +3467,8 @@ function base64url(buffer) {
 async function handleCanvaOAuth(req, res) {
     const { email, origin } = req.query;
     if (!email) return res.status(400).send('Missing email.');
+
+    if (await gateOAuthFeature(req, res, email, origin, 'canvaDesign')) return;
 
     const clientId    = process.env.CANVA_CLIENT_ID;
     const redirectUri = process.env.CANVA_REDIRECT_URI || `https://${req.headers.host}/api/oauth/canva/callback`;
@@ -3225,6 +3507,8 @@ async function handleCanvaCallback(req, res) {
 
     const { email, origin, codeVerifier } = pkceSnap.data();
     await pkceRef.delete().catch(() => {});
+
+    if (await gateOAuthFeature(req, res, email, origin, 'canvaDesign')) return;
 
     const clientId     = process.env.CANVA_CLIENT_ID;
     const clientSecret = process.env.CANVA_CLIENT_SECRET;
@@ -3294,6 +3578,10 @@ async function handleDesignImport(req, res) {
 
     try {
         const db = getDb();
+
+        // Plan gate — Canva / Figma imports are Team+ and above.
+        if (await denyIfFeatureLocked(res, db, ownerEmail, DESIGN_SERVICE_FEATURE[service])) return;
+
         const userSnap = await db.collection('users').doc(ownerEmail).get();
         const integrations = userSnap.exists ? (userSnap.data()?.integrations || {}) : {};
 
@@ -3362,6 +3650,11 @@ async function handleListProjects(req, res) {
 
     try {
         const db = getDb();
+
+        // Plan gate — live database sources are Team+ and above.
+        const featureKey = DB_SERVICE_FEATURE[service];
+        if (featureKey && await denyIfFeatureLocked(res, db, ownerEmail, featureKey)) return;
+
         const userSnap = await db.collection('users').doc(ownerEmail).get();
         const integrations = userSnap.exists ? (userSnap.data()?.integrations || {}) : {};
 
@@ -3413,6 +3706,7 @@ async function handleListProjects(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // POST /api/integrations/disconnect-database  { ownerEmail, service }
+// (Always allowed — disconnecting is never gated.)
 // ════════════════════════════════════════════════════════════════════════════
 async function handleDisconnectDatabase(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -4348,16 +4642,16 @@ async function handlePasswordResetRequest(req, res) {
 
         const resend = getResend();
         await resend.emails.send({
-            from: process.env.RESEND_FROM_EMAIL || 'Comex AI <onboarding@resend.dev>',
+            from: process.env.RESEND_FROM_EMAIL || 'Mebor AI <onboarding@resend.dev>',
             to: email,
-            subject: 'Reset your Comex AI password',
+            subject: 'Reset your Mebor AI password',
             html: `
                 <div style="max-width: 520px; margin: 0 auto; font-family: 'Google Sans Flex', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #0f172a; background-color: #ffffff; border: 1px solid #e2e8f0; border-radius: 20px; padding: 40px 36px; box-shadow: 0 10px 25px -5px rgba(15, 23, 42, 0.05); box-sizing: border-box;">
 
-  <!-- Comex AI Brand Header -->
+  <!-- Mebor AI Brand Header -->
   <div style="display: flex; align-items: center; margin-bottom: 28px;">
     <span style="margin-left: 12px; font-size: 22px; font-weight: 800; color: #0f172a; letter-spacing: -0.5px;">
-      Comex<span style="color: #5b3df5;"> AI</span>
+      Mebor<span style="color: #5b3df5;"> AI</span>
     </span>
   </div>
 
@@ -4367,7 +4661,7 @@ async function handlePasswordResetRequest(req, res) {
   </h2>
   
   <p style="margin: 0 0 24px 0; font-size: 15px; line-height: 1.6; color: #475569;">
-    We received a request to reset the password for your Comex AI account attached to 
+    We received a request to reset the password for your Mebor AI account attached to 
     <span style="display: inline-block; background-color: #f1f5f9; color: #334155; padding: 2px 10px; border-radius: 6px; font-weight: 600; font-size: 14px; word-break: break-all;">
       ${email}
     </span>.
@@ -4643,7 +4937,7 @@ async function addCalendarEvent(account, appt, ownerEmail, db) {
         headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
         body:    JSON.stringify({
             summary:     `Appointment: ${appt.customerName}`,
-            description: `Contact: ${appt.contactInfo}\nBooked via Comex AI`,
+            description: `Contact: ${appt.contactInfo}\nBooked via Mebor AI`,
             start: { dateTime: localStart, timeZone },
             end:   { dateTime: localEnd,   timeZone },
         }),
@@ -4669,7 +4963,7 @@ async function updateCalendarEvent(account, eventId, appt, ownerEmail, db) {
         headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
         body:    JSON.stringify({
             summary:     `Appointment: ${appt.customerName}`,
-            description: `Contact: ${appt.contactInfo}\nBooked via Comex AI`,
+            description: `Contact: ${appt.contactInfo}\nBooked via Mebor AI`,
             start: { dateTime: localStart, timeZone },
             end:   { dateTime: localEnd,   timeZone },
         }),
