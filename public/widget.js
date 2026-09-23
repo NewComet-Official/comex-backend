@@ -48,12 +48,7 @@
     let humanRequestId     = existingSession?.humanRequestId || null;
     let humanPollTimer     = null;
     let humanLastPollISO   = existingSession?.humanLastPollISO || null;
-    // Tracks message doc IDs already rendered so a slow/overlapping poll
-    // cycle can never render the same message twice.
     let humanRenderedIds   = new Set(existingSession?.humanRenderedIds || []);
-    // Prevents two poll cycles from running concurrently (e.g. a slow
-    // network response still in flight when the next interval tick fires),
-    // which was the root cause of messages appearing doubled/tripled.
     let humanPollInFlight  = false;
     if (existingSession?.chatHistory?.length) chatHistory = existingSession.chatHistory;
 
@@ -111,261 +106,303 @@
 
     // ── Position Computations ────────────────────────────────────────────────
     const positions = {
-        'bottom-right': { bubble: 'bottom:24px; right:24px;', window: 'bottom:100px; right:24px; transform-origin: bottom right;' },
-        'bottom-left':  { bubble: 'bottom:24px; left:24px;',  window: 'bottom:100px; left:24px; transform-origin: bottom left;'  },
-        'top-right':    { bubble: 'top:24px; right:24px;',    window: 'top:100px; right:24px; transform-origin: top right;'     },
-        'top-left':     { bubble: 'top:24px; left:24px;',     window: 'top:100px; left:24px; transform-origin: top left;'      }
+        'bottom-right': { bubble: 'bottom:24px; right:24px;', window: 'bottom:96px; right:24px; transform-origin: bottom right;' },
+        'bottom-left':  { bubble: 'bottom:24px; left:24px;',  window: 'bottom:96px; left:24px; transform-origin: bottom left;'  },
+        'top-right':    { bubble: 'top:24px; right:24px;',    window: 'top:96px; right:24px; transform-origin: top right;'     },
+        'top-left':     { bubble: 'top:24px; left:24px;',     window: 'top:96px; left:24px; transform-origin: top left;'      }
     };
     const pos = positions[config.position] || positions['bottom-right'];
 
-    // ── Inject Premium Ultra-Modern Styles ───────────────────────────────────
+    // ── Inject Modern Modern CSS & Micro-Interactions ─────────────────────────
     const style = document.createElement('style');
     style.textContent = `
-        @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap');
         
         #cc-widget-bubble {
             position: fixed; ${pos.bubble}
-            width: 60px; height: 60px; background-color: ${themeColor};
+            width: 62px; height: 62px; background-color: ${themeColor};
             border-radius: 50%; display: flex; align-items: center; justify-content: center;
-            cursor: pointer; box-shadow: 0 8px 32px rgba(0, 0, 0, 0.24), inset 0 2px 4px rgba(255,255,255,0.15);
-            transition: transform 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275), box-shadow 0.3s; z-index: 999999;
-            user-select: none; color: #fff; background-size: cover; background-position: center;
-            border: 1px solid rgba(255,255,255,0.1); will-change: transform;
+            cursor: pointer;
+            box-shadow: 0 12px 32px -8px rgba(15, 23, 42, 0.35), inset 0 1px 2px rgba(255,255,255,0.25);
+            transition: transform 0.35s cubic-bezier(0.34, 1.56, 0.64, 1), box-shadow 0.3s ease;
+            z-index: 999999; user-select: none; color: #fff; background-size: cover; background-position: center;
+            border: 1px solid rgba(255,255,255,0.18); will-change: transform;
         }
-        #cc-widget-bubble:hover { transform: scale(1.08) translateY(-2px); box-shadow: 0 12px 40px rgba(0, 0, 0, 0.32); }
-        #cc-widget-bubble:active { transform: scale(0.94); }
-        #cc-widget-bubble svg { width: 26px; height: 26px; fill: currentColor; transition: transform 0.3s ease; }
-        
+        #cc-widget-bubble:hover {
+            transform: scale(1.08) translateY(-3px);
+            box-shadow: 0 16px 40px -6px rgba(15, 23, 42, 0.45), inset 0 1px 2px rgba(255,255,255,0.35);
+        }
+        #cc-widget-bubble:active { transform: scale(0.92); }
+        #cc-widget-bubble svg { width: 28px; height: 28px; fill: currentColor; transition: transform 0.3s ease; }
+        #cc-widget-bubble:hover svg { transform: scale(1.05); }
+
         #cc-widget-window {
             position: fixed; ${pos.window}
-            width: 410px; 
-            height: 660px; 
-            max-height: calc(100vh - 130px); /* FIX: Prevents overflow on non-fullscreen or laptop screens */
+            width: 420px; 
+            height: 680px; 
+            max-height: calc(100vh - 120px);
             background: #ffffff;
-            border: 1px solid rgba(226, 232, 240, 0.8); border-radius: 24px; display: none;
-            flex-direction: column; overflow: hidden; 
-            box-shadow: 0 20px 50px -12px rgba(15, 23, 42, 0.15), 0 0 1px 1px rgba(0,0,0,0.03);
-            z-index: 999999; font-family: 'Plus Jakarta Sans', -apple-system, sans-serif;
+            border: 1px solid rgba(226, 232, 240, 0.8);
+            border-radius: 24px;
+            display: none; flex-direction: column; overflow: hidden; 
+            box-shadow: 0 24px 60px -12px rgba(15, 23, 42, 0.18), 0 0 1px 1px rgba(0,0,0,0.02);
+            z-index: 999999; font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
             color: #0f172a; will-change: transform, opacity; opacity: 0;
-            transition: opacity 0.3s cubic-bezier(0.34, 1.56, 0.64, 1), transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+            transform: scale(0.94) translateY(16px);
+            transition: opacity 0.3s cubic-bezier(0.16, 1, 0.3, 1), transform 0.3s cubic-bezier(0.16, 1, 0.3, 1);
         }
         #cc-widget-window.cc-open { display: flex; opacity: 1; transform: scale(1) translateY(0); }
-        #cc-widget-window.cc-closed { transform: scale(0.9) translateY(20px); opacity: 0; }
-        
+        #cc-widget-window.cc-closed { opacity: 0; transform: scale(0.94) translateY(16px); pointer-events: none; }
+
         .cc-header {
-            padding: 22px 24px; background: ${themeColor}; color: #fff;
+            padding: 20px 24px; background: ${themeColor}; color: #fff;
             display: flex; align-items: center; justify-content: space-between;
             flex-shrink: 0; position: relative; overflow: hidden;
         }
         .cc-header::before {
             content: ''; position: absolute; top: -50%; left: -50%; width: 200%; height: 200%;
-            background: radial-gradient(circle, rgba(255,255,255,0.12) 0%, transparent 65%); pointer-events: none;
+            background: radial-gradient(circle, rgba(255,255,255,0.12) 0%, transparent 60%);
+            pointer-events: none;
         }
         .cc-header-left { display: flex; align-items: center; gap: 14px; position: relative; z-index: 1; }
         .cc-avatar-container { position: relative; }
         .cc-avatar {
             width: 44px; height: 44px; border-radius: 50%;
-            background: rgba(255,255,255,0.15); border: 1px solid rgba(255,255,255,0.25);
+            background: rgba(255,255,255,0.18); border: 1px solid rgba(255,255,255,0.3);
             display: flex; align-items: center; justify-content: center; color: #fff; flex-shrink: 0;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.08);
         }
         .cc-avatar svg { width: 22px; height: 22px; fill: currentColor; }
         .cc-status-dot {
-            width: 12px; height: 12px; background: #10b981; border: 2.5px solid ${themeColor};
-            border-radius: 50%; position: absolute; bottom: -1px; right: -1px;
+            width: 12px; height: 12px; background: #10b981; border: 2px solid ${themeColor};
+            border-radius: 50%; position: absolute; bottom: 0; right: 0;
         }
         .cc-status-dot::after {
-            content: ''; position: absolute; width: 100%; height: 100%; background: inherit;
-            border-radius: inherit; left: -2.5px; top: -2.5px; border: 2.5px solid transparent; animation: ccPulseGreen 2s infinite;
+            content: ''; position: absolute; inset: -2px; border-radius: inherit;
+            border: 2px solid #10b981; animation: ccPulseGreen 2s cubic-bezier(0.25, 0.46, 0.45, 0.94) infinite;
         }
-        @keyframes ccPulseGreen { 0% { transform: scale(1); opacity: 1; } 100% { transform: scale(2.5); opacity: 0; } }
-        
-        .cc-bot-title { font-weight: 700; font-size: 16px; letter-spacing: -0.02em; margin-bottom: 2px; }
+        @keyframes ccPulseGreen { 0% { transform: scale(0.8); opacity: 1; } 100% { transform: scale(2.2); opacity: 0; } }
+
+        .cc-bot-title { font-weight: 700; font-size: 16px; letter-spacing: -0.01em; margin-bottom: 2px; }
         .cc-bot-status { font-size: 12px; opacity: 0.85; font-weight: 500; display: flex; align-items: center; gap: 4px; }
-        
-        .cc-header-actions { display: flex; align-items: center; gap: 4px; position: relative; z-index: 1; }
+
+        .cc-header-actions { display: flex; align-items: center; gap: 6px; position: relative; z-index: 1; }
         .cc-close-btn, .cc-endchat-btn {
-            background: transparent; border: none; color: #fff; opacity: 0.8;
-            transition: all 0.2s; cursor: pointer; width: 34px; height: 34px; border-radius: 50%;
+            background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.15); color: #fff;
+            transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1); cursor: pointer; width: 34px; height: 34px; border-radius: 50%;
             display: flex; align-items: center; justify-content: center;
         }
-        .cc-close-btn:hover { opacity: 1; background: rgba(255,255,255,0.15); transform: rotate(90deg); }
-        .cc-close-btn svg { width: 18px; height: 18px; stroke: currentColor; }
-        .cc-endchat-btn:hover { opacity: 1; background: rgba(239,68,68,0.35); }
-        .cc-endchat-btn svg { width: 17px; height: 17px; stroke: currentColor; }
+        .cc-close-btn:hover { background: rgba(255,255,255,0.25); transform: rotate(90deg) scale(1.05); }
+        .cc-close-btn:active { transform: rotate(90deg) scale(0.95); }
+        .cc-close-btn svg { width: 16px; height: 16px; stroke: currentColor; }
+        .cc-endchat-btn:hover { background: rgba(239, 68, 68, 0.85); border-color: transparent; transform: scale(1.05); }
+        .cc-endchat-btn:active { transform: scale(0.95); }
+        .cc-endchat-btn svg { width: 16px; height: 16px; stroke: currentColor; }
 
         /* ── END CHAT CONFIRM ── */
         .cc-confirm-overlay {
-            position: fixed; inset: 0; background: rgba(2,6,23,0.55); z-index: 1000001;
+            position: fixed; inset: 0; background: rgba(15, 23, 42, 0.6); z-index: 1000001;
             display: flex; align-items: center; justify-content: center; padding: 20px;
-            font-family: 'Plus Jakarta Sans', -apple-system, sans-serif;
+            backdrop-filter: blur(4px); font-family: 'Plus Jakarta Sans', -apple-system, sans-serif;
+            animation: ccFadeIn 0.2s ease forwards;
         }
-        .cc-confirm-card { background: #fff; border-radius: 18px; width: 100%; max-width: 320px; padding: 24px; box-shadow: 0 20px 50px rgba(0,0,0,0.3); text-align: center; }
-        .cc-confirm-card p { font-size: 14px; font-weight: 600; color: #0f172a; margin-bottom: 18px; line-height: 1.5; }
+        .cc-confirm-card {
+            background: #fff; border-radius: 20px; width: 100%; max-width: 320px; padding: 24px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.2); text-align: center; transform: scale(0.95);
+            animation: ccPopIn 0.25s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+        }
+        @keyframes ccPopIn { to { transform: scale(1); } }
+        .cc-confirm-card p { font-size: 14.5px; font-weight: 600; color: #0f172a; margin-bottom: 20px; line-height: 1.5; }
         .cc-confirm-actions { display: flex; gap: 10px; }
-        .cc-confirm-actions button { flex: 1; padding: 11px; border-radius: 100px; font-weight: 700; font-size: 13px; cursor: pointer; border: none; font-family: inherit; }
+        .cc-confirm-actions button {
+            flex: 1; padding: 12px; border-radius: 12px; font-weight: 700; font-size: 13px;
+            cursor: pointer; border: none; font-family: inherit; transition: all 0.2s;
+        }
         .cc-confirm-cancel { background: #f1f5f9; color: #475569; }
-        .cc-confirm-ok { background: #ef4444; color: #fff; }
+        .cc-confirm-cancel:hover { background: #e2e8f0; }
+        .cc-confirm-ok { background: #ef4444; color: #fff; box-shadow: 0 4px 12px rgba(239, 68, 68, 0.25); }
+        .cc-confirm-ok:hover { background: #dc2626; transform: translateY(-1px); }
 
         .cc-chatbox {
-            flex: 1; padding: 24px; overflow-y: auto; display: flex;
-            flex-direction: column; gap: 18px; background: #f8fafc; scroll-behavior: smooth;
+            flex: 1; padding: 20px 20px 12px 20px; overflow-y: auto; display: flex;
+            flex-direction: column; gap: 16px; background: #f8fafc; scroll-behavior: smooth;
         }
-        .cc-chatbox::-webkit-scrollbar { width: 5px; }
+        .cc-chatbox::-webkit-scrollbar { width: 6px; }
         .cc-chatbox::-webkit-scrollbar-track { background: transparent; }
         .cc-chatbox::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
-        
+        .cc-chatbox::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
         .cc-welcome-card {
-            background: #ffffff; border: 1px solid #f1f5f9; border-radius: 20px;
-            padding: 24px; text-align: left; margin-bottom: 6px;
-            box-shadow: 0 10px 25px -5px rgba(15,23,42,0.03);
+            background: #ffffff; border: 1px solid #e2e8f0; border-radius: 20px;
+            padding: 20px; text-align: left; margin-bottom: 4px;
+            box-shadow: 0 10px 25px -5px rgba(15,23,42,0.04);
+            animation: ccFadeIn 0.3s ease forwards;
         }
-        .cc-welcome-card p { margin: 0 0 18px 0; font-size: 14.5px; color: #475569; line-height: 1.6; font-weight: 500; }
-        .cc-suggested-grid { display: flex; flex-direction: column; gap: 10px; }
+        .cc-welcome-card p { margin: 0 0 16px 0; font-size: 14px; color: #475569; line-height: 1.55; font-weight: 500; }
+        .cc-suggested-grid { display: flex; flex-direction: column; gap: 8px; }
         .cc-suggested-chip {
-            background: #f1f5f9; border: 1px solid transparent; padding: 12px 16px;
-            border-radius: 12px; font-size: 13.5px; color: #334155; text-align: left;
-            cursor: pointer; transition: all 0.25s ease; font-weight: 600;
+            background: #f1f5f9; border: 1px solid #e2e8f0; padding: 12px 16px;
+            border-radius: 14px; font-size: 13.5px; color: #334155; text-align: left;
+            cursor: pointer; transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1); font-weight: 600;
             display: flex; align-items: center; justify-content: space-between;
         }
-        .cc-suggested-chip:hover { background: #ffffff; border-color: ${themeColor}; color: ${themeColor}; transform: translateX(4px); box-shadow: 0 4px 12px rgba(0,0,0,0.05); }
-
-        .cc-bubble-container { display: flex; flex-direction: column; width: 100%; animation: ccFadeIn 0.35s cubic-bezier(0.34, 1.56, 0.64, 1) forwards; }
-        @keyframes ccFadeIn { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
-        
-        .cc-bubble {
-            max-width: 80%; padding: 14px 18px; border-radius: 20px;
-            font-size: 14.5px; line-height: 1.6; word-break: break-word;
-            font-weight: 500;
+        .cc-suggested-chip:hover {
+            background: #ffffff; border-color: ${themeColor}; color: ${themeColor};
+            transform: translateY(-2px); box-shadow: 0 6px 16px rgba(15,23,42,0.08);
         }
-        .cc-bubble p { margin: 0 0 8px 0; }
+        .cc-suggested-chip:active { transform: translateY(0); }
+
+        .cc-bubble-container {
+            display: flex; flex-direction: column; width: 100%;
+            animation: ccFadeIn 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+            will-change: transform, opacity;
+        }
+        @keyframes ccFadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+
+        .cc-bubble {
+            max-width: 82%; padding: 13px 17px; border-radius: 20px;
+            font-size: 14px; line-height: 1.55; word-break: break-word; font-weight: 500;
+        }
+        .cc-bubble p { margin: 0 0 6px 0; }
         .cc-bubble p:last-child { margin-bottom: 0; }
-        
+
         .cc-user { align-items: flex-end; }
         .cc-user .cc-bubble {
-            background: ${themeColor}; color: #fff; border-bottom-right-radius: 4px;
-            box-shadow: 0 8px 20px -4px rgba(0,0,0,0.12);
+            background: ${themeColor}; color: #ffffff; border-bottom-right-radius: 4px;
+            box-shadow: 0 6px 16px -4px rgba(15,23,42,0.15);
         }
         .cc-ai { align-items: flex-start; }
         .cc-ai .cc-bubble {
-            background: #ffffff; color: #1e293b; border-bottom-left-radius: 4px;
-            border: 1px solid rgba(226,232,240,0.8); box-shadow: 0 8px 20px -4px rgba(15,23,42,0.04);
+            background: #ffffff; color: #0f172a; border-bottom-left-radius: 4px;
+            border: 1px solid #e2e8f0; box-shadow: 0 6px 16px -4px rgba(15,23,42,0.04);
         }
         .cc-agent .cc-bubble {
             background: #ecfdf5; color: #065f46; border-bottom-left-radius: 4px;
-            border: 1px solid #a7f3d0; box-shadow: 0 8px 20px -4px rgba(15,23,42,0.04);
+            border: 1px solid #a7f3d0; box-shadow: 0 6px 16px -4px rgba(16,185,129,0.08);
         }
         .cc-system-note {
             text-align: center; font-size: 12px; color: #94a3b8; font-weight: 600;
-            padding: 4px 0; margin: 2px 0;
+            padding: 6px 12px; background: #f1f5f9; border-radius: 20px; align-self: center;
+            margin: 4px 0; border: 1px solid #e2e8f0;
         }
-        .cc-meta-row { display: flex; align-items: center; gap: 10px; margin-top: 6px; padding: 0 6px; }
+        .cc-meta-row { display: flex; align-items: center; gap: 8px; margin-top: 4px; padding: 0 4px; }
         .cc-user .cc-meta-row { flex-direction: row-reverse; }
         .cc-meta { font-size: 11px; color: #94a3b8; font-weight: 500; }
-        .cc-msg-actions { display: flex; align-items: center; gap: 4px; opacity: 0; transition: opacity 0.15s ease; }
+        .cc-msg-actions { display: flex; align-items: center; gap: 2px; opacity: 0; transition: opacity 0.2s ease; }
         .cc-bubble-container:hover .cc-msg-actions { opacity: 1; }
         .cc-action-btn {
             background: transparent; border: none; cursor: pointer; color: #94a3b8;
-            width: 22px; height: 22px; display: flex; align-items: center; justify-content: center;
-            border-radius: 6px; transition: background 0.15s, color 0.15s; padding: 0;
+            width: 24px; height: 24px; display: flex; align-items: center; justify-content: center;
+            border-radius: 6px; transition: all 0.15s; padding: 0;
         }
-        .cc-action-btn:hover { background: #e2e8f0; color: #334155; }
+        .cc-action-btn:hover { background: #e2e8f0; color: #1e293b; transform: scale(1.1); }
+        .cc-action-btn:active { transform: scale(0.95); }
         .cc-action-btn.cc-reported { color: #ef4444; }
-        .cc-action-btn svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
-        
+        .cc-action-btn svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+
         .cc-footer {
-            padding: 18px 24px; background: #ffffff; border-top: 1px solid #f1f5f9;
-            display: flex; gap: 12px; align-items: center; flex-shrink: 0;
+            padding: 16px 20px 12px 20px; background: #ffffff; border-top: 1px solid #f1f5f9;
+            display: flex; gap: 10px; align-items: center; flex-shrink: 0;
         }
         .cc-input-wrapper { flex: 1; position: relative; display: flex; align-items: center; }
         .cc-input {
             width: 100%; background: #f8fafc; border: 1.5px solid #e2e8f0;
             color: #0f172a; outline: none; font-family: inherit;
             padding: ${typebarSize === 'large' ? '14px 46px 14px 18px' : '12px 46px 12px 18px'};
-            font-size: 14.5px; border-radius: 16px; transition: all 0.25s ease;
+            font-size: 14px; border-radius: 16px; transition: all 0.2s ease;
             font-weight: 500;
         }
-        .cc-input:focus { border-color: ${themeColor}; background-color: #fff; box-shadow: 0 0 0 4px rgba(15,23,42,0.06); }
-        
+        .cc-input::placeholder { color: #94a3b8; }
+        .cc-input:focus { border-color: ${themeColor}; background-color: #ffffff; box-shadow: 0 0 0 4px rgba(15,23,42,0.08); }
+
         .cc-send-btn {
             background: ${themeColor}; border: none; color: #fff;
             cursor: pointer; display: flex; align-items: center; justify-content: center;
-            padding: ${sendButtonStyle === 'pill' ? '0 24px' : '0'};
-            width: ${sendButtonStyle === 'pill' ? 'auto' : '48px'};
-            height: 48px; border-radius: ${sendButtonStyle === 'pill' ? '24px' : '16px'};
-            transition: all 0.25s cubic-bezier(0.175, 0.885, 0.32, 1.275); flex-shrink: 0;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+            padding: ${sendButtonStyle === 'pill' ? '0 20px' : '0'};
+            width: ${sendButtonStyle === 'pill' ? 'auto' : '46px'};
+            height: 46px; border-radius: ${sendButtonStyle === 'pill' ? '23px' : '14px'};
+            transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1); flex-shrink: 0;
+            box-shadow: 0 4px 12px rgba(15,23,42,0.12);
         }
-        .cc-send-btn svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; transition: transform 0.2s; }
-        .cc-send-btn:hover:not(:disabled) { transform: scale(1.04) translateY(-1px); box-shadow: 0 8px 20px rgba(0,0,0,0.15); }
+        .cc-send-btn svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; transition: transform 0.2s ease; }
+        .cc-send-btn:hover:not(:disabled) { transform: scale(1.05) translateY(-1px); box-shadow: 0 6px 16px rgba(15,23,42,0.2); }
         .cc-send-btn:hover:not(:disabled) svg { transform: translateX(2px); }
-        .cc-send-btn:disabled { opacity: 0.35; cursor: not-allowed; transform: none; box-shadow: none; }
-        
+        .cc-send-btn:active:not(:disabled) { transform: scale(0.95); }
+        .cc-send-btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; box-shadow: none; }
+
         .cc-mic-btn {
-            position: absolute; right: 14px; background: none; border: none; color: #64748b;
+            position: absolute; right: 12px; background: none; border: none; color: #64748b;
             cursor: pointer; padding: 6px; display: ${voiceEnabled ? 'flex' : 'none'};
             align-items: center; justify-content: center; border-radius: 50%; transition: all 0.2s;
         }
         .cc-mic-btn:hover { color: #0f172a; background-color: #e2e8f0; }
-        .cc-mic-btn svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 2; }
+        .cc-mic-btn svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; }
         .cc-mic-btn.recording { color: #ef4444; background-color: #fef2f2; animation: ccPulse 1.4s infinite cubic-bezier(0.4, 0, 0.6, 1); }
         @keyframes ccPulse { 0%,100% { transform: scale(1); } 50% { transform: scale(1.1); } }
-        
+
         .cc-typing {
-            display: none; align-self: flex-start; background: #fff; border: 1px solid rgba(226,232,240,0.8);
-            padding: 14px 22px; border-radius: 20px; border-bottom-left-radius: 4px;
-            gap: 6px; align-items: center; box-shadow: 0 4px 12px rgba(15,23,42,0.03);
+            display: none; align-self: flex-start; background: #ffffff; border: 1px solid #e2e8f0;
+            padding: 12px 18px; border-radius: 20px; border-bottom-left-radius: 4px;
+            gap: 5px; align-items: center; box-shadow: 0 4px 12px rgba(15,23,42,0.03);
+            animation: ccFadeIn 0.25s ease forwards;
         }
         .cc-typing.visible { display: flex; }
-        .cc-dot { width: 8px; height: 8px; border-radius: 50%; background: #94a3b8; animation: ccBounce 1.4s ease-in-out infinite; }
+        .cc-dot { width: 7px; height: 7px; border-radius: 50%; background: #94a3b8; animation: ccBounce 1.4s ease-in-out infinite; }
         .cc-dot:nth-child(2) { animation-delay: 0.2s; }
         .cc-dot:nth-child(3) { animation-delay: 0.4s; }
-        @keyframes ccBounce { 0%,80%,100% { transform: translateY(0); } 40% { transform: translateY(-6px); } }
+        @keyframes ccBounce { 0%,80%,100% { transform: translateY(0); } 40% { transform: translateY(-5px); } }
 
-        .cc-brand-footer { text-align: center; font-size: 11px; color: #94a3b8; padding: 0 0 16px 0; background: #fff; font-weight: 600; letter-spacing: 0.02em; }
+        .cc-brand-footer { text-align: center; font-size: 11px; color: #94a3b8; padding: 0 0 12px 0; background: #ffffff; font-weight: 600; letter-spacing: 0.01em; }
         .cc-brand-footer a { color: #64748b; text-decoration: none; font-weight: 700; transition: color 0.2s; }
         .cc-brand-footer a:hover { color: ${themeColor}; }
 
         /* ── REPORT MODAL ── */
         .cc-report-overlay {
-            position: fixed; inset: 0; background: rgba(2,6,23,0.55); z-index: 1000000;
+            position: fixed; inset: 0; background: rgba(15, 23, 42, 0.6); z-index: 1000000;
             display: flex; align-items: center; justify-content: center; padding: 20px;
-            font-family: 'Plus Jakarta Sans', -apple-system, sans-serif;
+            backdrop-filter: blur(4px); font-family: 'Plus Jakarta Sans', -apple-system, sans-serif;
+            animation: ccFadeIn 0.2s ease forwards;
         }
         .cc-report-card {
             background: #fff; border-radius: 20px; width: 100%; max-width: 400px;
-            max-height: 90vh; overflow-y: auto; padding: 26px; box-shadow: 0 20px 50px rgba(0,0,0,0.3);
+            max-height: 90vh; overflow-y: auto; padding: 24px; box-shadow: 0 20px 50px rgba(0,0,0,0.25);
+            transform: scale(0.95); animation: ccPopIn 0.25s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
         }
         .cc-report-card h3 { margin: 0 0 4px; font-size: 17px; color: #0f172a; font-weight: 800; }
-        .cc-report-card p.cc-rsub { margin: 0 0 18px; font-size: 12.5px; color: #64748b; font-weight: 500; }
+        .cc-report-card p.cc-rsub { margin: 0 0 16px; font-size: 12.5px; color: #64748b; font-weight: 500; }
         .cc-rfield { margin-bottom: 14px; }
-        .cc-rfield label { display:block; font-size: 11.5px; font-weight: 700; color: #334155; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.03em; }
+        .cc-rfield label { display:block; font-size: 11px; font-weight: 700; color: #334155; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.04em; }
         .cc-rfield input, .cc-rfield textarea {
             width: 100%; border: 1.5px solid #e2e8f0; border-radius: 10px; padding: 10px 12px;
-            font-family: inherit; font-size: 13.5px; outline: none; box-sizing: border-box; resize: vertical;
+            font-family: inherit; font-size: 13.5px; outline: none; box-sizing: border-box; resize: vertical; transition: border-color 0.2s;
         }
         .cc-rfield input:focus, .cc-rfield textarea:focus { border-color: ${themeColor}; }
         .cc-rfield textarea[readonly] { background: #f8fafc; color: #64748b; }
         .cc-rphone-row { display: flex; gap: 8px; }
         .cc-rphone-row input:first-child { width: 78px; flex-shrink: 0; }
         .cc-rstars { display: flex; gap: 6px; }
-        .cc-rstar { font-size: 24px; cursor: pointer; color: #e2e8f0; user-select: none; transition: color 0.15s, transform 0.1s; }
+        .cc-rstar { font-size: 24px; cursor: pointer; color: #cbd5e1; user-select: none; transition: color 0.15s, transform 0.15s; }
         .cc-rstar.active { color: #f59e0b; }
-        .cc-rstar:hover { transform: scale(1.15); }
+        .cc-rstar:hover { transform: scale(1.2); }
         .cc-report-actions { display: flex; gap: 10px; margin-top: 20px; }
         .cc-report-actions button {
-            flex: 1; padding: 12px; border-radius: 100px; font-weight: 700; font-size: 13.5px;
-            cursor: pointer; border: none; font-family: inherit;
+            flex: 1; padding: 12px; border-radius: 12px; font-weight: 700; font-size: 13.5px;
+            cursor: pointer; border: none; font-family: inherit; transition: all 0.2s;
         }
         .cc-rcancel { background: #f1f5f9; color: #475569; }
-        .cc-rsubmit { background: ${themeColor}; color: #fff; }
+        .cc-rcancel:hover { background: #e2e8f0; }
+        .cc-rsubmit { background: ${themeColor}; color: #fff; box-shadow: 0 4px 12px rgba(15,23,42,0.12); }
+        .cc-rsubmit:hover { transform: translateY(-1px); box-shadow: 0 6px 16px rgba(15,23,42,0.2); }
         .cc-rerror { color: #ef4444; font-size: 12px; font-weight: 600; margin-top: -6px; margin-bottom: 12px; display: none; }
-        
+
         @media (max-width: 480px) {
             #cc-widget-window {
                 width: 100% !important; height: 100% !important; max-height: 100vh !important;
                 bottom: 0 !important; right: 0 !important; left: 0 !important; top: 0 !important;
-                border-radius: 0 !important; transform: none !important;
+                border-radius: 0 !important; transform: translateY(100%);
             }
+            #cc-widget-window.cc-open { transform: translateY(0); }
+            #cc-widget-window.cc-closed { transform: translateY(100%); opacity: 0; }
         }
     `;
     document.head.appendChild(style);
@@ -455,24 +492,21 @@
     welcomeCard.innerHTML = `
         <p>Hello! Welcome to our automated support helper. Choose a quick question below or type your inquiry natively.</p>
         <div class="cc-suggested-grid">
-<!-- Services Chip -->
-<div class="cc-suggested-chip" data-msg="What services do you offer?">
-  <span>
-    <svg xmlns="http://w3.org" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display: inline-block; vertical-align: text-bottom; margin-right: 6px;"><path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .6 2.2 1.5 3.1.7.7 1.3 1.5 1.5 2.5"/><path d="M9 18h6"/><path d="M10 22h4"/></svg>
-    What services do you offer?
-  </span> 
-  ➔
-</div> 
-${humanHandoffEnabled ? `
-<!-- Human Support Chip -->
-<div class="cc-suggested-chip" data-msg="Speak to human support">
-  <span>
-    <svg xmlns="http://w3.org" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display: inline-block; vertical-align: text-bottom; margin-right: 6px;"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
-    Connect to human agent
-  </span> 
-  ➔
-</div>` : ''}
-
+            <div class="cc-suggested-chip" data-msg="What services do you offer?">
+              <span>
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display: inline-block; vertical-align: text-bottom; margin-right: 6px;"><path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .6 2.2 1.5 3.1.7.7 1.3 1.5 1.5 2.5"/><path d="M9 18h6"/><path d="M10 22h4"/></svg>
+                What services do you offer?
+              </span> 
+              ➔
+            </div> 
+            ${humanHandoffEnabled ? `
+            <div class="cc-suggested-chip" data-msg="Speak to human support">
+              <span>
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display: inline-block; vertical-align: text-bottom; margin-right: 6px;"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+                Connect to human agent
+              </span> 
+              ➔
+            </div>` : ''}
         </div>
     `;
     chatBox.appendChild(welcomeCard);
@@ -556,7 +590,7 @@ ${humanHandoffEnabled ? `
         document.body.removeChild(ta);
     }
 
-    // ── Custom confirm dialog (replaces window.confirm for consistent UX) ────
+    // ── Custom confirm dialog ────────────────────────────────────────────────
     function ccConfirm(message) {
         return new Promise(resolve => {
             const overlay = document.createElement('div');
@@ -599,7 +633,6 @@ ${humanHandoffEnabled ? `
         }
         container.appendChild(bubbleEl);
 
-        // ── Meta row: timestamp + action buttons ──
         const metaCfg = isUser ? userMsgCfg : botMsgCfg;
         const metaRow = document.createElement('div');
         metaRow.className = 'cc-meta-row';
@@ -684,7 +717,7 @@ ${humanHandoffEnabled ? `
         chatBox.scrollTop = chatBox.scrollHeight;
     }
 
-    // ── Human handoff: poll for agent replies while a request is open ────────
+    // ── Human handoff: poll for agent replies ────────────────────────────────
     function startHumanPolling() {
         if (!humanHandoffEnabled) return;
         endChatBtn.style.display = 'flex';
@@ -705,10 +738,6 @@ ${humanHandoffEnabled ? `
     }
 
     async function pollHumanMessages(isInitialReplay) {
-        // Guard against overlapping poll cycles — if a prior fetch is still
-        // in flight when the next interval tick fires (e.g. slow network),
-        // letting both run concurrently is what caused messages to render
-        // more than once.
         if (!humanHandoffEnabled || !humanRequestId || humanPollInFlight) return;
         humanPollInFlight = true;
         try {
@@ -726,9 +755,6 @@ ${humanHandoffEnabled ? `
 
             (data.messages || []).forEach(m => {
                 humanLastPollISO = m.createdAt;
-                // Dedup by message id — belt-and-suspenders alongside the
-                // in-flight guard above, in case of any timestamp-boundary
-                // overlap between consecutive poll windows.
                 if (humanRenderedIds.has(m.id)) return;
                 humanRenderedIds.add(m.id);
 
@@ -737,7 +763,6 @@ ${humanHandoffEnabled ? `
                 } else if (m.sender === 'agent' && m.isSystem) {
                     appendSystemNote(m.text);
                 } else if (m.sender === 'user' && isInitialReplay) {
-                    // Replaying history after a refresh — show the visitor's own prior messages too.
                     appendMsg(m.text, true, { isHuman: true });
                 }
             });
@@ -746,16 +771,14 @@ ${humanHandoffEnabled ? `
             if (data.status === 'closed') {
                 stopHumanPolling("This conversation was closed — you're chatting with the AI assistant again.");
             }
-        } catch (err) { /* silent — will retry next tick */ }
+        } catch (err) { /* silent — retry next tick */ }
         finally {
             humanPollInFlight = false;
         }
     }
 
-    // ── Regenerate: resend the last user message, replace this bot bubble ────
+    // ── Regenerate Answer ────────────────────────────────────────────────────
     async function regenerateAnswer(container, bubbleEl, metaRow) {
-        const idx = chatHistory.length - 1;
-        // find last user message before this bot message
         let lastUserContent = null;
         for (let i = chatHistory.length - 1; i >= 0; i--) {
             if (chatHistory[i].role === 'user') { lastUserContent = chatHistory[i].content; break; }
@@ -765,7 +788,7 @@ ${humanHandoffEnabled ? `
         bubbleEl.innerHTML = '<p style="opacity:.6;">Regenerating…</p>';
 
         try {
-            const historyForCall = chatHistory.slice(0, -1); // drop the old assistant reply
+            const historyForCall = chatHistory.slice(0, -1);
             const r = await fetch('https://comex-backend.vercel.app/api/chat', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -788,7 +811,7 @@ ${humanHandoffEnabled ? `
         }
     }
 
-    // ── Report Modal ───────────────────────────────────────────────────────
+    // ── Report Modal ────────────────────────────────────────────────────────
     function openReportModal(botMessageText, triggerBtn) {
         const overlay = document.createElement('div');
         overlay.className = 'cc-report-overlay';
@@ -891,18 +914,20 @@ ${humanHandoffEnabled ? `
         };
     }
 
-    // Initialize Global Interactive Handlers
+    // ── Widget Handlers ──────────────────────────────────────────────────────
     function openWidget() {
         win.style.display = 'flex';
-        setTimeout(() => {
-            win.className = 'cc-open';
+        requestAnimationFrame(() => {
+            win.classList.remove('cc-closed');
+            win.classList.add('cc-open');
             inputEl.focus();
-        }, 10);
+        });
     }
 
     function closeWidget() {
-        win.className = 'cc-closed';
-        setTimeout(() => { win.style.display = 'none'; }, 300);
+        win.classList.remove('cc-open');
+        win.classList.add('cc-closed');
+        setTimeout(() => { if (win.classList.contains('cc-closed')) win.style.display = 'none'; }, 300);
     }
 
     bubble.addEventListener('click', () => {
@@ -929,11 +954,11 @@ ${humanHandoffEnabled ? `
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ requestId: humanRequestId, closedBy: 'user' })
             });
-        } catch (err) { /* the poll loop / stopHumanPolling below still cleans up locally */ }
+        } catch (err) { /* silent cleanup */ }
         stopHumanPolling('You ended this conversation.');
     });
 
-    // ── Onboarding Suggestion Setup ──────────────────────────────────────────
+    // ── Onboarding Chip Listeners ────────────────────────────────────────────
     win.querySelectorAll('.cc-suggested-chip').forEach(chip => {
         chip.addEventListener('click', () => {
             inputEl.value = chip.getAttribute('data-msg');
@@ -957,9 +982,6 @@ ${humanHandoffEnabled ? `
         chatBox.scrollTop = chatBox.scrollHeight;
         saveSession();
 
-        // Once a human has been requested/connected, messages go straight into
-        // that thread instead of back through the LLM — the agent (or the
-        // polling loop once one connects) is who responds from here on.
         if (humanHandoffEnabled && humanSessionActive && humanRequestId) {
             try {
                 await fetch('https://comex-backend.vercel.app/api/human/send-message', {
@@ -967,7 +989,7 @@ ${humanHandoffEnabled ? `
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ requestId: humanRequestId, sender: 'user', text })
                 });
-            } catch (err) { /* the next poll cycle will still pick up any agent replies */ }
+            } catch (err) { /* handled by next poll tick */ }
             isSending = false;
             sendBtn.disabled = false;
             inputEl.focus();
@@ -996,16 +1018,13 @@ ${humanHandoffEnabled ? `
                 return;
             }
 
-            const data  = await r.json();
+            const data = await r.json();
 
-            // ── Human handoff signal — kicked off by this message ──
             if (humanHandoffEnabled && data._humanRequested) {
                 const reply = data.answer || data.reply || "I've flagged this for our team — someone will join shortly.";
                 appendMsg(reply, false, { noRegenerate: true, noReport: true });
                 chatHistory.push({ role: 'assistant', content: reply });
                 humanRequestId = data._requestId || humanRequestId;
-                // Fresh thread — reset dedup state so nothing bleeds over
-                // from a previous (now-closed) human conversation.
                 humanRenderedIds = new Set();
                 humanLastPollISO = null;
                 startHumanPolling();
@@ -1021,7 +1040,7 @@ ${humanHandoffEnabled ? `
             typingEl.classList.remove('visible');
             appendMsg('Connection interrupted. Please try again.', false, { noRegenerate: true, noReport: true });
         } finally {
-            isSending    = false;
+            isSending = false;
             sendBtn.disabled = false;
             inputEl.focus();
         }
@@ -1061,20 +1080,17 @@ ${humanHandoffEnabled ? `
         }
     }
 
-    // ── Restore an in-progress human conversation after a page refresh ───────
+    // ── Restore active human session after refresh ────────────────────────────
     if (humanHandoffEnabled && humanSessionActive && humanRequestId) {
-        // Replay any prior chat history bubbles (AI ones) already restored from
-        // localStorage into memory — re-render them so the window looks the same.
         welcomeCard.style.display = 'none';
         chatHistory.forEach(m => {
             if (m.role === 'user') appendMsg(m.content, true);
             else if (m.role === 'assistant') appendMsg(m.content, false, { noRegenerate: true, noReport: true });
         });
-        humanLastPollISO = null; // force a full replay of the human thread from the server
+        humanLastPollISO = null;
         startHumanPolling();
         pollHumanMessages(true);
     } else if (humanSessionActive) {
-        // Handoff was disabled after this session's state was saved — clear stale state.
         clearHumanFromSession();
     }
 })();
