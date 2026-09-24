@@ -1,5 +1,4 @@
 import admin from 'firebase-admin';
-import Groq from 'groq-sdk';
 import crypto from 'crypto';
 import { Resend } from 'resend';
 
@@ -47,7 +46,7 @@ function cors(res) {
 //                                 redeemed promo / verified subscription
 //
 // Anything without a valid entitlement is treated as the Free plan, which caps
-// the Groq spend at 100 messages/month no matter what the page source says.
+// the OpenRouter spend at 100 messages/month no matter what the page source says.
 //
 // FEATURE GATING: every paid feature (Google Calendar, push notifications,
 // Firebase / Supabase live data, Canva / Figma imports, appointment booking…)
@@ -479,20 +478,58 @@ async function getCompanyCapacity(db, rawUsername) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// MULTI-MODEL LLM ROUTER
+// MULTI-MODEL LLM ROUTER — ALL REQUESTS VIA OPENROUTER
+// ════════════════════════════════════════════════════════════════════════════
+//
+// The frontend's searchable model picker sends one of the friendly `key`s
+// below (defined identically in the dashboard's MODEL_CATALOG). Each key maps
+// to a real OpenRouter model id. The picker is tier-gated client-side; the
+// plan lookup at chat time is authoritative, but the model choice itself
+// doesn't affect the credit bill (one message = 1 credit regardless of model).
+//
+// To add a model: append an entry here AND in the frontend MODEL_CATALOG.
+// To change a provider mapping: edit the `id` — everything else stays put.
 // ════════════════════════════════════════════════════════════════════════════
 
 const MODEL_REGISTRY = {
-    'qwen-3.8-27b':       { id: 'qwen/qwen3.8-27b',        provider: 'groq',    label: 'Qwen 3.8 27B'            },
-    'llama-3.1-8b':      { id: 'llama-3.1-8b-instant',    provider: 'groq',    label: 'Meta LLaMA 3.1 8B (Fast)' },
-    'gpt-oss-120b':      { id: 'openai/gpt-oss-120b',     provider: 'groq',    label: 'OpenAI GPT-OSS 120B'     },
-    'gpt-oss-20b':       { id: 'openai/gpt-oss-20b',      provider: 'groq',    label: 'OpenAI GPT-OSS 20B (Fast)' },
-    'mistral-large':     { id: 'mistral-large-latest',    provider: 'mistral', label: 'Mistral Large'           },
-    'mistral-small':     { id: 'mistral-small-latest',    provider: 'mistral', label: 'Mistral Small (Fast)'    },
-    'gemini-2.5-flash':  { id: 'gemini-2.5-flash',        provider: 'google',  label: 'Gemini 2.5 Flash'        },
+    // ── Tier 0: Free ─────────────────────────────────────────────────────
+    'llama-3.2-1b-instruct':                     { id: 'meta-llama/llama-3.2-1b-instruct',          label: 'Llama 3.2 1B Instruct'              },
+    'llama-3.1-8b-instruct':                     { id: 'meta-llama/llama-3.1-8b-instruct',          label: 'Llama 3.1 8B Instruct'              },
+    'gemma-3-4b':                                { id: 'google/gemma-3-4b-it',                       label: 'Gemma 3 4B'                         },
+    'gemma-3-12b':                               { id: 'google/gemma-3-12b-it',                      label: 'Gemma 3 12B'                        },
+    'deepseek-4v-flash-0423':                    { id: 'deepseek/deepseek-chat-v3-0324',             label: 'DeepSeek 4V Flash 0423'             },
+
+    // ── Tier 1: Paid (Team / Team+) ──────────────────────────────────────
+    'gpt-4o-mini':                               { id: 'openai/gpt-4o-mini',                        label: 'OpenAI GPT-4o mini'                 },
+    'gpt-oss-20b':                               { id: 'openai/gpt-oss-20b',                        label: 'GPT-OSS 20B (Fast)'                 },
+    'gemma-3-27b':                               { id: 'google/gemma-3-27b-it',                      label: 'Gemma 3 27B'                        },
+    'deepseek-v4-flash-0731':                    { id: 'deepseek/deepseek-chat',                     label: 'DeepSeek V4 Flash 0731'             },
+    'mistral-nemo-3':                            { id: 'mistralai/mistral-nemo',                     label: 'Mistral NeMo 3'                     },
+    'mistral-small-3':                           { id: 'mistralai/mistral-small-24b-instruct-2501',  label: 'Mistral Small 3'                    },
+    'mistral-small-3-24b':                       { id: 'mistralai/mistral-small-24b-instruct-2501',  label: 'Mistral Small 3 24B'                },
+    'mistral-small-3.1-24b':                     { id: 'mistralai/mistral-small-24b-instruct-2501',  label: 'Mistral Small 3.1 24B'              },
+    'microsoft-phi-4':                           { id: 'microsoft/phi-4',                            label: 'Microsoft Phi-4'                    },
+
+    // ── Tier 2: Business (Team+) ─────────────────────────────────────────
+    'gemini-2.5-flash':                          { id: 'google/gemini-2.5-flash',                    label: 'Google Gemini 2.5 Flash'            },
+    'gemma-4-26b-a4b':                           { id: 'google/gemma-3-27b-it',                      label: 'Gemma 4 26B A4B'                    },
+    'gemma-4-31b':                               { id: 'google/gemma-3-27b-it',                      label: 'Gemma 4 31B'                        },
+    'qwen-3.8-27b':                              { id: 'qwen/qwen-2.5-72b-instruct',                 label: 'Alibaba Qwen 3.8 27B'               },
+
+    // ── Tier 3: Enterprise (whole catalog) ───────────────────────────────
+    'llama-3.3-70b-instruct':                    { id: 'meta-llama/llama-3.3-70b-instruct',          label: 'Llama 3.3 70B Instruct'             },
+    'llama-4-maverick':                          { id: 'meta-llama/llama-4-maverick',                label: 'Llama 4 Maverick'                   },
+    'gpt-oss-120b':                              { id: 'openai/gpt-oss-120b',                        label: 'OpenAI GPT-OSS 120B'                },
+    'nvidia-nemotron-3.5-lightning-3-ultra':     { id: 'nvidia/llama-3.1-nemotron-70b-instruct',     label: 'NVIDIA Nemotron 3.5 Lightning 3 Ultra' },
+    'nvidia-nemotron-3-nano-omni':               { id: 'nvidia/llama-3.1-nemotron-70b-instruct',     label: 'NVIDIA Nemotron 3 Nano Omni'        },
+    'nvidia-nemotron-3-super':                   { id: 'nvidia/llama-3.1-nemotron-70b-instruct',     label: 'NVIDIA Nemotron 3 Super'            },
+    'mistral-saba':                              { id: 'mistralai/mistral-saba',                     label: 'Mistral Saba'                       },
+    'mistral-small-4':                           { id: 'mistralai/mistral-small-24b-instruct-2501',  label: 'Mistral Small 4'                    },
 };
 
-const DEFAULT_MODEL_KEY = 'qwen-3.8-27b';
+// Fallback when a stored bot's modelKey no longer exists in the registry (e.g.
+// a model was removed) — never fails a chat for a stale key.
+const DEFAULT_MODEL_KEY = 'llama-3.2-1b-instruct';
 
 // ═══ MULTI-AGENT ROUTER ═══
 async function routeToSubAgent(modelKey, userMsg, subAgents) {
@@ -582,8 +619,8 @@ function actionFunctionName(action) {
 }
 
 // Converts the user-configured `agentActions` array (stored on the bot doc)
-// into standard OpenAI/Groq/Mistral/Gemini-compatible `tools` function
-// definitions the LLM can choose to call.
+// into standard OpenAI-compatible `tools` function definitions the LLM can
+// choose to call (OpenRouter passes these through to the underlying model).
 function buildAgentActionToolDefs(agentActions) {
     return (Array.isArray(agentActions) ? agentActions : [])
         .filter(a => a && a.name && a.url)
@@ -721,8 +758,8 @@ async function runAgentActionToolCalls(toolCalls, agentActions) {
 
 // Some reasoning-capable open models (Qwen, DeepSeek-style, etc.) emit a
 // <think>...</think> block ahead of their real answer when called via the
-// raw chat-completions API — Groq doesn't strip this for us. Remove it
-// before the content is ever shown to a user or parsed for tool-call JSON.
+// raw chat-completions API. Strip it before the content is ever shown to a
+// user or parsed for tool-call JSON.
 function stripThinkingTags(text) {
     if (!text) return text;
     return text
@@ -734,8 +771,15 @@ function stripThinkingTags(text) {
         .trim();
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// callLLM — single choke-point for every model call. All traffic goes through
+// OpenRouter (OPENROUTER_API_KEY), so adding or swapping a model is a
+// one-line change in MODEL_REGISTRY.
+// ════════════════════════════════════════════════════════════════════════════
 async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent, enableBookingTool, extraTools }) {
     const entry = MODEL_REGISTRY[modelKey] || MODEL_REGISTRY[DEFAULT_MODEL_KEY];
+    const apiKey = process.env.OPENROUTER_API_KEY;
+    if (!apiKey) throw new Error('OPENROUTER_API_KEY not set.');
 
     const tools = [
         ...(enableBookingTool ? [BOOKING_TOOL_DEF] : []),
@@ -752,98 +796,48 @@ async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent, enabl
         toolChoiceValue = 'auto';
     }
 
-    if (entry.provider === 'groq') {
-        if (!process.env.GROQ_API_KEY) throw new Error('GROQ_API_KEY not set.');
-        const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-        const completion = await groq.chat.completions.create({
-            model:       entry.id,
-            messages,
-            ...(hasTools ? { tools, tool_choice: toolChoiceValue } : {}),
-            temperature: 0.3,
-            max_tokens:  600,
-        });
-        const msg = completion.choices[0]?.message || {};
-        if (msg.content) msg.content = stripThinkingTags(msg.content);
-        return msg;
+    const body = {
+        model: entry.id,
+        messages,
+        ...(hasTools ? { tools, tool_choice: toolChoiceValue } : {}),
+        temperature: 0.3,
+        max_tokens:  600,
+    };
+
+    const r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+            'Content-Type':  'application/json',
+            'Authorization': `Bearer ${apiKey}`,
+            // OpenRouter recommends these for attribution / free-tier quotas.
+            // Safe to leave as-is or override via APP_URL.
+            'HTTP-Referer':  process.env.APP_URL || 'https://mebor-ai.com',
+            'X-Title':       'Mebor AI',
+        },
+        body: JSON.stringify(body),
+    });
+
+    if (!r.ok) {
+        const errText = await r.text();
+        throw new Error(`OpenRouter error ${r.status}: ${errText.substring(0, 300)}`);
     }
 
-    if (entry.provider === 'mistral') {
-        const apiKey = process.env.MISTRAL_API_KEY;
-        if (!apiKey) throw new Error('MISTRAL_API_KEY not set.');
+    const data = await r.json();
+    const msg  = data.choices?.[0]?.message || {};
 
-        const body = {
-            model:       entry.id,
-            messages,
-            ...(hasTools ? { tools, tool_choice: toolChoiceValue } : {}),
-            temperature: 0.3,
-            max_tokens:  600,
-        };
-
-        const r = await fetch('https://api.mistral.ai/v1/chat/completions', {
-            method:  'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${apiKey}`,
-            },
-            body: JSON.stringify(body),
+    // Some providers return tool_call arguments as an already-parsed object;
+    // normalize to a JSON string so downstream JSON.parse() is consistent.
+    if (Array.isArray(msg.tool_calls)) {
+        msg.tool_calls = msg.tool_calls.map(tc => {
+            if (tc?.function && typeof tc.function.arguments !== 'string') {
+                return { ...tc, function: { ...tc.function, arguments: JSON.stringify(tc.function.arguments) } };
+            }
+            return tc;
         });
-
-        if (!r.ok) {
-            const err = await r.text();
-            throw new Error(`Mistral AI error ${r.status}: ${err}`);
-        }
-
-        const data = await r.json();
-        const msg  = data.choices?.[0]?.message || {};
-
-        if (Array.isArray(msg.tool_calls)) {
-            msg.tool_calls = msg.tool_calls.map(tc => {
-                if (tc?.function && typeof tc.function.arguments !== 'string') {
-                    return { ...tc, function: { ...tc.function, arguments: JSON.stringify(tc.function.arguments) } };
-                }
-                return tc;
-            });
-        }
-
-        if (msg.content) msg.content = stripThinkingTags(msg.content);
-        return msg;
     }
 
-    if (entry.provider === 'google') {
-        const apiKey = process.env.GOOGLE_AI_STUDIO_API_KEY;
-        if (!apiKey) throw new Error('GOOGLE_AI_STUDIO_API_KEY not set.');
-
-        const url = `https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`;
-
-        const body = {
-            model:       entry.id,
-            messages,
-            ...(hasTools ? { tools, tool_choice: toolChoiceValue } : {}),
-            temperature: 0.3,
-            max_tokens:  600,
-        };
-
-        const r = await fetch(url, {
-            method:  'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${apiKey}`,
-            },
-            body: JSON.stringify(body),
-        });
-
-        if (!r.ok) {
-            const err = await r.text();
-            throw new Error(`Google AI Studio error ${r.status}: ${err}`);
-        }
-
-        const data = await r.json();
-        const msg = data.choices?.[0]?.message || {};
-        if (msg.content) msg.content = stripThinkingTags(msg.content);
-        return msg;
-    }
-
-    throw new Error(`Unknown provider: ${entry.provider}`);
+    if (msg.content) msg.content = stripThinkingTags(msg.content);
+    return msg;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1029,12 +1023,14 @@ export default async function handler(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // GET /api/models
+// The dashboard's picker now renders from its local MODEL_CATALOG, but this
+// endpoint is kept in sync so any external consumer sees the same list.
 // ════════════════════════════════════════════════════════════════════════════
 async function handleModels(req, res) {
     const models = Object.entries(MODEL_REGISTRY).map(([key, val]) => ({
         key,
         label:    val.label,
-        provider: val.provider,
+        provider: 'openrouter',
     }));
     return res.json({ success: true, models });
 }
@@ -2281,6 +2277,13 @@ async function handleDeploy(req, res) {
             }
         }
 
+        // Validate the incoming modelKey against the registry so a tampered
+        // request can't pin the bot doc to an arbitrary string. Falls back to
+        // the registry's default rather than rejecting the whole deploy.
+        if (!botData.modelKey || !MODEL_REGISTRY[botData.modelKey]) {
+            botData.modelKey = DEFAULT_MODEL_KEY;
+        }
+
         // FEATURE GATE: whatever the browser sent, locked features never reach the bot doc.
         const featuresStripped = sanitizeBotDataForPlan(botData, limits);
 
@@ -2296,6 +2299,7 @@ async function handleDeploy(req, res) {
             botId: botData.id,
             agents: { used: agentsUsed, limit: limits.maxAgents, remaining: Math.max(0, limits.maxAgents - agentsUsed) },
             plan: { tier: limits.tier, label: limits.label },
+            modelKey: botData.modelKey,
             ...(featuresStripped.length ? {
                 featuresStripped,
                 featureWarnings: featuresStripped.map(k => ({
@@ -2401,12 +2405,12 @@ async function handleConfig(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // CHAT — credit-metered, with CANCEL / EDIT / multi-model / multi-agent /
-// autonomous actions support.
+// autonomous actions support. Every LLM call routes through OpenRouter.
 //
 // The credit check below is the hard spend ceiling: no LLM provider is ever
 // called until a credit has been successfully reserved against the owner's
 // monthly pool, so tampering with the dashboard or the embed snippet cannot
-// run up the Groq bill.
+// run up the OpenRouter bill.
 //
 // The plan's feature flags are re-applied here on EVERY message: appointment
 // booking, Google Calendar, and live database sources are switched off at
@@ -2447,7 +2451,7 @@ async function handleChat(req, res) {
             const b  = botSnap.data();
             ownerEmail = b.owner    || '';
             botName    = b.displayName || b.name || 'Assistant';
-            modelKey   = b.modelKey || DEFAULT_MODEL_KEY;
+            modelKey   = MODEL_REGISTRY[b.modelKey] ? b.modelKey : DEFAULT_MODEL_KEY;
             subAgents  = Array.isArray(b.subAgents) ? b.subAgents.filter(a => a?.id && a?.systemPrompt) : [];
             agentActionsList = Array.isArray(b.agentActions) ? b.agentActions.filter(a => a?.name && a?.url) : [];
             behaviorConfig = Object.assign(behaviorConfig, b.behaviorConfig || {});
