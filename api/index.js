@@ -493,43 +493,86 @@ async function getCompanyCapacity(db, rawUsername) {
 
 const MODEL_REGISTRY = {
     // ── Tier 0: Free ─────────────────────────────────────────────────────
-    'llama-3.2-1b-instruct':                     { id: 'meta-llama/llama-3.2-1b-instruct',          label: 'Llama 3.2 1B Instruct'              },
-    'llama-3.1-8b-instruct':                     { id: 'meta-llama/llama-3.1-8b-instruct',          label: 'Llama 3.1 8B Instruct'              },
-    'gemma-3-4b':                                { id: 'google/gemma-3-4b-it',                       label: 'Gemma 3 4B'                         },
-    'gemma-3-12b':                               { id: 'google/gemma-3-12b-it',                      label: 'Gemma 3 12B'                        },
-    'deepseek-v4-flash-0423':                    { id: 'deepseek/deepseek-v4-flash',             label: 'DeepSeek V4 Flash 0423'             },
+    'llama-3.2-1b-instruct': { 
+        id: 'meta-llama/llama-3.2-1b-instruct', 
+        label: 'Llama 3.2 1B Instruct',
+        providers: ['Cloudflare', 'Groq'] // Tries Cloudflare BYOK first, falls back to Groq
+    },
+    'llama-3.1-8b-instruct': { 
+        id: 'meta-llama/llama-3.1-8b-instruct', 
+        label: 'Llama 3.1 8B Instruct',
+        providers: ['Cloudflare', 'Groq'] // Tries Cloudflare BYOK first, falls back to Groq
+    },
+    'gemma-3-4b':              { id: 'google/gemma-3-4b-it', label: 'Gemma 3 4B' },
+    'gemma-3-12b':             { id: 'google/gemma-3-12b-it', label: 'Gemma 3 12B' },
+    'deepseek-v4-flash-0423': { id: 'deepseek/deepseek-v4-flash', label: 'DeepSeek V4 Flash 0423' },
 
     // ── Tier 1: Paid (Team / Team+) ──────────────────────────────────────
-    'gpt-4o-mini':                               { id: 'openai/gpt-4o-mini',                        label: 'OpenAI GPT-4o mini'                 },
-    'gpt-oss-20b':                               { id: 'openai/gpt-oss-20b',                        label: 'GPT-OSS 20B (Fast)'                 },
-    'gemma-3-27b':                               { id: 'google/gemma-3-27b-it',                      label: 'Gemma 3 27B'                        },
-    'deepseek-v4-flash-0731':                    { id: 'deepseek/deepseek-v4-flash-0731',                     label: 'DeepSeek V4 Flash 0731'             },
-    'mistral-nemo':                            { id: 'mistralai/mistral-nemo',                     label: 'Mistral NeMo'                     },
-    'mistral-small-3':                           { id: 'mistralai/mistral-small-24b-instruct-2501',  label: 'Mistral Small 3'                    },
-    'mistral-small-3.2-24b':                       { id: 'mistralai/mistral-small-3.2-24b-instruct',  label: 'Mistral Small 3.2 24B'                },
-    'mistral-small-3.1-24b':                     { id: 'mistralai/mistral-small-3.1-24b-instruct',  label: 'Mistral Small 3.1 24B'              },
-    'microsoft-phi-4':                           { id: 'microsoft/phi-4',                            label: 'Microsoft Phi-4'                    },
+    'gpt-4o-mini':             { id: 'openai/gpt-4o-mini', label: 'OpenAI GPT-4o mini' },
+    'gpt-oss-20b':             { id: 'openai/gpt-oss-20b', label: 'GPT-OSS 20B (Fast)', providers: ['Groq'] },
+    'gemma-3-27b':             { id: 'google/gemma-3-27b-it', label: 'Gemma 3 27B' },
+    'deepseek-v4-flash-0731': { id: 'deepseek/deepseek-v4-flash-0731', label: 'DeepSeek V4 Flash 0731', providers: ['Cloudflare'] },
+    'mistral-nemo':            { id: 'mistralai/mistral-nemo', label: 'Mistral NeMo' },
+    'mistral-small-3':         { id: 'mistralai/mistral-small-24b-instruct-2501', label: 'Mistral Small 3' },
+    'mistral-small-3.2-24b':   { id: 'mistralai/mistral-small-3.2-24b-instruct', label: 'Mistral Small 3.2 24B' },
+    'mistral-small-3.1-24b':   { id: 'mistralai/mistral-small-3.1-24b-instruct', label: 'Mistral Small 3.1 24B', providers: ['Cloudflare'] },
+    'microsoft-phi-4':         { id: 'microsoft/phi-4', label: 'Microsoft Phi-4' },
 
     // ── Tier 2: Business (Team+) ─────────────────────────────────────────
-    'gemini-2.5-flash':                          { id: 'google/gemini-2.5-flash',                    label: 'Google Gemini 2.5 Flash'            },
-    'gemma-4-26b-a4b':                           { id: 'google/gemma-4-26b-a4b-it:free',                      label: 'Gemma 4 26B A4B'                    },
-    'gemma-4-31b':                               { id: 'google/gemma-4-31b-it:free',                      label: 'Gemma 4 31B'                        },
-    'qwen-3.8-27b':                              { id: 'qwen/qwen3.8-27b:free',                 label: 'Alibaba Qwen 3.8 27B'               },
+    'gemini-2.5-flash':        { id: 'google/gemini-2.5-flash', label: 'Google Gemini 2.5 Flash', providers: ['Google AI Studio', 'Google'] },
+    'gemma-4-26b-a4b':         { id: 'google/gemma-4-26b-a4b-it', label: 'Gemma 4 26B A4B', providers: ['Google AI Studio', 'Google'] },
+    'gemma-4-31b':             { id: 'google/gemma-4-31b-it', label: 'Gemma 4 31B', providers: ['Google AI Studio', 'Google'] },
+    'qwen-3.8-27b':            { id: 'qwen/qwen3.8-27b', label: 'Alibaba Qwen 3.8 27B', providers: ['Cloudflare'] },
 
     // ── Tier 3: Enterprise (whole catalog) ───────────────────────────────
-    'llama-3.3-70b-instruct':                    { id: 'meta-llama/llama-3.3-70b-instruct',          label: 'Llama 3.3 70B Instruct'             },
-    'llama-4-maverick':                          { id: 'meta-llama/llama-4-maverick',                label: 'Llama 4 Maverick'                   },
-    'gpt-oss-120b':                              { id: 'openai/gpt-oss-120b',                        label: 'OpenAI GPT-OSS 120B'                },
-    'nvidia-nemotron-3.5-lightning-3-ultra':     { id: 'nvidia/nemotron-3.5-lightning:free',     label: 'NVIDIA Nemotron 3.5 Lightning 3 Ultra' },
-    'nvidia-nemotron-3-nano-omni':               { id: 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',     label: 'NVIDIA Nemotron 3 Nano Omni'        },
-    'nvidia-nemotron-3-super':                   { id: 'nvidia/nemotron-3-super-120b-a12b:free',     label: 'NVIDIA Nemotron 3 Super'            },
-    'mistral-saba':                              { id: 'mistralai/mistral-saba',                     label: 'Mistral Saba'                       },
-    'mistral-small-4':                           { id: 'mistralai/mistral-small-2603',  label: 'Mistral Small 4'                    },
+    'llama-3.3-70b-instruct':  { id: 'meta-llama/llama-3.3-70b-instruct', label: 'Llama 3.3 70B Instruct', providers: ['Cloudflare'] },
+    'llama-4-maverick':        { id: 'meta-llama/llama-4-maverick', label: 'Llama 4 Maverick' },
+    'gpt-oss-120b':            { id: 'openai/gpt-oss-120b', label: 'OpenAI GPT-OSS 120B', providers: ['Groq'] },
+    'mistral-saba':            { id: 'mistralai/mistral-saba', label: 'Mistral Saba' },
+    'mistral-small-4':         { id: 'mistralai/mistral-small-2603', label: 'Mistral Small 4' },
 };
 
 // Fallback when a stored bot's modelKey no longer exists in the registry (e.g.
 // a model was removed) — never fails a chat for a stale key.
 const DEFAULT_MODEL_KEY = 'llama-3.2-1b-instruct';
+
+async function sendOpenRouterRequest(modelKey, messages) {
+  const modelConfig = MODEL_REGISTRY[modelKey];
+  
+  if (!modelConfig) {
+    throw new Error(`Model key '${modelKey}' not found in registry.`);
+  }
+
+  // Base request payload
+  const payload = {
+    model: modelConfig.id,
+    messages: messages,
+  };
+
+  // Dynamically attach BYOK provider ordering if configured for the model
+  if (modelConfig.providers && modelConfig.providers.length > 0) {
+    payload.provider = {
+      order: modelConfig.providers,
+      allow_fallbacks: true // Fall back through the list if the primary provider fails
+    };
+  }
+
+  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok) {
+    const errorData = await response.json();
+    throw new Error(`OpenRouter Error: ${JSON.stringify(errorData)}`);
+  }
+
+  return await response.json();
+}
 
 // ═══ MULTI-AGENT ROUTER ═══
 async function routeToSubAgent(modelKey, userMsg, subAgents) {
