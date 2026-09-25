@@ -1,6 +1,8 @@
 import admin from 'firebase-admin';
 import crypto from 'crypto';
 import { Resend } from 'resend';
+import { ImapFlow } from 'imapflow';
+import nodemailer from 'nodemailer';
 
 // ════════════════════════════════════════════════════════════════════════════
 // FIREBASE
@@ -29,31 +31,11 @@ function getAuthAdmin() {
 function cors(res) {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-worker-secret');
 }
 
 // ════════════════════════════════════════════════════════════════════════════
 // PLANS, SEATS, AGENTS, CREDITS & FEATURES — SERVER-SIDE SOURCE OF TRUTH
-// ════════════════════════════════════════════════════════════════════════════
-//
-// Everything about what an account is allowed to do lives here, on the server.
-// The browser can freely lie about `planTier` (it's a client-writable Firestore
-// field), so entitlements are resolved from the backend-written `entitlement`
-// object ONLY. That object is written in exactly three places, all server-side:
-//   1. handlePromoValidate      — dev-phase promo unlocks
-//   2. handleWhopWebhook        — real paid subscriptions / cancellations
-//   3. handlePlanSelect         — the free plan, or re-applying an already
-//                                 redeemed promo / verified subscription
-//
-// Anything without a valid entitlement is treated as the Free plan, which caps
-// the OpenRouter spend at 100 messages/month no matter what the page source says.
-//
-// FEATURE GATING: every paid feature (Google Calendar, push notifications,
-// Firebase / Supabase live data, Canva / Figma imports, appointment booking…)
-// is checked HERE against the resolved plan — at the OAuth start, the OAuth
-// callback, every API route that uses the feature, and again at chat time.
-// The frontend only greys buttons out for UX; removing that in devtools gets
-// a person nothing because the server refuses to serve the feature.
 // ════════════════════════════════════════════════════════════════════════════
 
 const PLAN_LIMITS = {
@@ -63,15 +45,13 @@ const PLAN_LIMITS = {
     enterprise: { label: 'Enterprise', maxAgents: 10,  maxSeats: 10,  monthlyCredits: 45000  },
 };
 
-// Order used when listing "which plans unlock this feature" in upgrade messages.
 const PLAN_ORDER = ['free', 'team', 'teamplus', 'enterprise'];
 
-// Feature → which plan tiers include it. This is the ONLY place that decides
-// what a plan can use; edit this table to change plan contents.
 const FEATURE_CATALOG = {
     appointmentBooking: { label: 'Appointment Booking',                     plans: ['team', 'teamplus', 'enterprise'] },
     googleCalendar:     { label: 'Google Calendar Auto-Booking',            plans: ['team', 'teamplus', 'enterprise'] },
     pushNotifications:  { label: 'Desktop Push Notifications',              plans: ['team', 'teamplus', 'enterprise'] },
+    emailAgent:         { label: 'Email Agent (IMAP/SMTP Inbox)',           plans: ['team', 'teamplus', 'enterprise'] },
     firebaseDatabase:   { label: 'Firebase Live Database Source',           plans: ['teamplus', 'enterprise'] },
     supabaseDatabase:   { label: 'Supabase Live Database Source',           plans: ['teamplus', 'enterprise'] },
     canvaDesign:        { label: 'Canva Design Import',                     plans: ['teamplus', 'enterprise'] },
@@ -79,7 +59,6 @@ const FEATURE_CATALOG = {
     advancedReports:    { label: 'Full Reports & Feedback (Agent Filter)',  plans: ['teamplus', 'enterprise'] },
 };
 
-// Maps the `service` name used by the database / design routes onto a feature key.
 const DB_SERVICE_FEATURE = { firebase: 'firebaseDatabase', supabase: 'supabaseDatabase' };
 const DESIGN_SERVICE_FEATURE = { canva: 'canvaDesign', figma: 'figmaDesign' };
 
@@ -95,7 +74,6 @@ function joinWithOr(labels) {
     return labels.slice(0, -1).join(', ') + ' or ' + labels[labels.length - 1];
 }
 
-// "Upgrade to Team+ or Enterprise to unlock this feature."
 function buildUpgradeMessage(featureKey) {
     const labels = requiredPlanTiers(featureKey).map(t => PLAN_LIMITS[t].label);
     if (!labels.length) return 'This feature is not available.';
@@ -106,13 +84,11 @@ function resolveFeatureAccess(tier, overrides) {
     const out = {};
     Object.keys(FEATURE_CATALOG).forEach(key => {
         out[key] = FEATURE_CATALOG[key].plans.includes(tier);
-        // Optional backend-written per-account override (entitlement.features).
         if (overrides && typeof overrides[key] === 'boolean') out[key] = overrides[key];
     });
     return out;
 }
 
-// What the dashboard reads to grey out locked controls + show the tooltip text.
 function buildFeatureSnapshot(limits) {
     const out = {};
     Object.keys(FEATURE_CATALOG).forEach(key => {
@@ -138,14 +114,12 @@ function featureLockedPayload(featureKey, limits) {
     };
 }
 
-// Resolves the requester's (or their employer's) plan and checks one feature.
 async function checkFeatureForEmail(db, email, featureKey) {
     const ctx = await resolveOwnerContext(db, email);
     const limits = resolvePlanLimits(ctx.ownerProfile);
     return { allowed: !!limits.features[featureKey], ctx, limits };
 }
 
-// Convenience for JSON routes: returns true (and has already replied 403) if locked.
 async function denyIfFeatureLocked(res, db, email, featureKey) {
     const access = await checkFeatureForEmail(db, email, featureKey);
     if (access.allowed) return false;
@@ -159,8 +133,6 @@ function buildAppUrl(req, origin) {
            `https://${String(req.headers.host || '').replace('comex-backend', 'cometchat-ai-platform').replace('.vercel.app', '.web.app')}`;
 }
 
-// Browser-redirect flows (OAuth) can't return JSON, so a locked feature bounces
-// back to the app with ?feature_locked=<key>&upgrade_message=<text>.
 function redirectFeatureLocked(req, res, origin, featureKey, limits) {
     const message = buildUpgradeMessage(featureKey);
     try {
@@ -173,8 +145,6 @@ function redirectFeatureLocked(req, res, origin, featureKey, limits) {
     }
 }
 
-// Used at the top of every OAuth start / callback. Returns true if it already
-// responded (locked or lookup failure) so the caller should just `return`.
 async function gateOAuthFeature(req, res, email, origin, featureKey) {
     try {
         const access = await checkFeatureForEmail(getDb(), email, featureKey);
@@ -188,8 +158,6 @@ async function gateOAuthFeature(req, res, email, origin, featureKey) {
     }
 }
 
-// Strips anything a plan doesn't include from an agent config before it's saved,
-// so a tampered request body can't smuggle locked features onto a bot doc.
 function sanitizeBotDataForPlan(botData, limits) {
     const stripped = [];
     const f = limits.features;
@@ -214,18 +182,20 @@ function sanitizeBotDataForPlan(botData, limits) {
         }
     }
 
+    // Email agent mode is a plan feature — silently drop it if the plan can't
+    // include it, so a tampered request body can't pin an email agent on Free.
+    if (!f.emailAgent && (botData.agentBuildMode === 'email' || botData.agentBuildMode === 'both')) {
+        botData.agentBuildMode = 'widget';
+        stripped.push('emailAgent');
+    }
+
     return [...new Set(stripped)];
 }
 
-// `maxSeats` = employee accounts that may be connected to the company workspace
-// (the owner does not consume a seat).
-
-// What a single billable operation costs. Every one of these maps 1:1 onto an
-// actual upstream LLM call, so the credit ledger is a direct proxy for spend.
 const CREDIT_COSTS = {
-    message:       1,  // one customer message answered by the LLM
-    routing:       1,  // multi-agent classifier call
-    toolFollowUp:  1,  // post-tool-call summarization pass
+    message:       1,
+    routing:       1,
+    toolFollowUp:  1,
 };
 
 const CREDIT_WARNING_THRESHOLD = 0.75;
@@ -239,9 +209,6 @@ function toPositiveInt(v, fallback) {
     return Number.isFinite(n) && n >= 0 ? n : fallback;
 }
 
-// Resolves a user document into the limits that actually apply to it.
-// NOTE: `planTier` on the user doc is display-only. It is deliberately NOT
-// trusted here.
 function resolvePlanLimits(userData) {
     const data = userData || {};
     const ent  = data.entitlement || null;
@@ -271,7 +238,6 @@ function resolvePlanLimits(userData) {
     };
 }
 
-// Employees inherit their employer's plan, limits and credit pool.
 async function resolveOwnerContext(db, email) {
     if (!email) return { ownerEmail: null, isEmployee: false, profile: {}, ownerProfile: {} };
     const snap = await db.collection('users').doc(email).get();
@@ -303,7 +269,6 @@ async function countOccupiedSeats(db, companyUsername) {
     let n = 0;
     snap.forEach(d => {
         const status = d.data()?.employeeStatus || 'active';
-        // 'removed' frees the seat; 'disabled' accounts still hold theirs.
         if (status !== 'removed') n++;
     });
     return n;
@@ -325,9 +290,6 @@ function readCreditState(userData, limits) {
     };
 }
 
-// Atomically checks + consumes credits. `force` skips the check (used for the
-// extra calls that happen mid-request once we've already committed to answering)
-// so a single conversation turn can never be half-charged.
 async function consumeCredits(db, ownerEmail, amount, opts = {}) {
     if (!ownerEmail || !amount) {
         return { allowed: true, skipped: true, used: 0, limit: 0, remaining: 0, percentUsed: 0, warning: false, exhausted: false };
@@ -368,8 +330,6 @@ async function consumeCredits(db, ownerEmail, amount, opts = {}) {
         });
     } catch (err) {
         console.error('[Credits/Consume]', ownerEmail, err.message);
-        // Fail CLOSED on the metered path (so a Firestore blip can't be used as
-        // an unlimited-usage bypass), fail open on the best-effort top-ups.
         if (opts.force) return { allowed: true, error: err.message };
         return { allowed: false, reason: 'error', error: err.message, used: 0, limit: 0, remaining: 0, exhausted: true };
     }
@@ -390,7 +350,7 @@ async function writeEntitlement(db, email, tier, source, limitsOverride, extra =
             limits: limitsOverride || null,
             ...extra,
         },
-        planTier: tier, // mirrored for display only — never trusted for enforcement
+        planTier: tier,
     };
     await db.collection('users').doc(email).set(payload, { merge: true });
     return payload.entitlement;
@@ -480,34 +440,22 @@ async function getCompanyCapacity(db, rawUsername) {
 // ════════════════════════════════════════════════════════════════════════════
 // MULTI-MODEL LLM ROUTER — ALL REQUESTS VIA OPENROUTER
 // ════════════════════════════════════════════════════════════════════════════
-//
-// The frontend's searchable model picker sends one of the friendly `key`s
-// below (defined identically in the dashboard's MODEL_CATALOG). Each key maps
-// to a real OpenRouter model id. The picker is tier-gated client-side; the
-// plan lookup at chat time is authoritative, but the model choice itself
-// doesn't affect the credit bill (one message = 1 credit regardless of model).
-//
-// To add a model: append an entry here AND in the frontend MODEL_CATALOG.
-// To change a provider mapping: edit the `id` — everything else stays put.
-// ════════════════════════════════════════════════════════════════════════════
 
 const MODEL_REGISTRY = {
-    // ── Tier 0: Free ─────────────────────────────────────────────────────
     'llama-3.2-1b-instruct': { 
         id: 'meta-llama/llama-3.2-1b-instruct', 
         label: 'Llama 3.2 1B Instruct',
-        providers: ['Cloudflare', 'Groq'] // Tries Cloudflare BYOK first, falls back to Groq
+        providers: ['Cloudflare', 'Groq']
     },
     'llama-3.1-8b-instruct': { 
         id: 'meta-llama/llama-3.1-8b-instruct', 
         label: 'Llama 3.1 8B Instruct',
-        providers: ['Cloudflare', 'Groq'] // Tries Cloudflare BYOK first, falls back to Groq
+        providers: ['Cloudflare', 'Groq']
     },
     'gemma-3-4b':              { id: 'google/gemma-3-4b-it', label: 'Gemma 3 4B' },
     'gemma-3-12b':             { id: 'google/gemma-3-12b-it', label: 'Gemma 3 12B' },
     'deepseek-v4-flash-0423': { id: 'deepseek/deepseek-v4-flash', label: 'DeepSeek V4 Flash 0423' },
 
-    // ── Tier 1: Paid (Team / Team+) ──────────────────────────────────────
     'gpt-4o-mini':             { id: 'openai/gpt-4o-mini', label: 'OpenAI GPT-4o mini' },
     'gpt-oss-20b':             { id: 'openai/gpt-oss-20b', label: 'GPT-OSS 20B (Fast)', providers: ['Groq'] },
     'gemma-3-27b':             { id: 'google/gemma-3-27b-it', label: 'Gemma 3 27B' },
@@ -518,13 +466,11 @@ const MODEL_REGISTRY = {
     'mistral-small-3.1-24b':   { id: 'mistralai/mistral-small-3.1-24b-instruct', label: 'Mistral Small 3.1 24B', providers: ['Cloudflare'] },
     'microsoft-phi-4':         { id: 'microsoft/phi-4', label: 'Microsoft Phi-4' },
 
-    // ── Tier 2: Business (Team+) ─────────────────────────────────────────
     'gemini-2.5-flash':        { id: 'google/gemini-2.5-flash', label: 'Google Gemini 2.5 Flash', providers: ['Google AI Studio', 'Google'] },
     'gemma-4-26b-a4b':         { id: 'google/gemma-4-26b-a4b-it', label: 'Gemma 4 26B A4B', providers: ['Google AI Studio', 'Google'] },
     'gemma-4-31b':             { id: 'google/gemma-4-31b-it', label: 'Gemma 4 31B', providers: ['Google AI Studio', 'Google'] },
     'qwen-3.8-27b':            { id: 'qwen/qwen3.8-27b', label: 'Alibaba Qwen 3.8 27B', providers: ['Cloudflare'] },
 
-    // ── Tier 3: Enterprise (whole catalog) ───────────────────────────────
     'llama-3.3-70b-instruct':  { id: 'meta-llama/llama-3.3-70b-instruct', label: 'Llama 3.3 70B Instruct', providers: ['Cloudflare'] },
     'llama-4-maverick':        { id: 'meta-llama/llama-4-maverick', label: 'Llama 4 Maverick' },
     'gpt-oss-120b':            { id: 'openai/gpt-oss-120b', label: 'OpenAI GPT-OSS 120B', providers: ['Groq'] },
@@ -532,8 +478,6 @@ const MODEL_REGISTRY = {
     'mistral-small-4':         { id: 'mistralai/mistral-small-2603', label: 'Mistral Small 4' },
 };
 
-// Fallback when a stored bot's modelKey no longer exists in the registry (e.g.
-// a model was removed) — never fails a chat for a stale key.
 const DEFAULT_MODEL_KEY = 'llama-3.2-1b-instruct';
 
 async function sendOpenRouterRequest(modelKey, messages) {
@@ -543,17 +487,15 @@ async function sendOpenRouterRequest(modelKey, messages) {
     throw new Error(`Model key '${modelKey}' not found in registry.`);
   }
 
-  // Base request payload
   const payload = {
     model: modelConfig.id,
     messages: messages,
   };
 
-  // Dynamically attach BYOK provider ordering if configured for the model
   if (modelConfig.providers && modelConfig.providers.length > 0) {
     payload.provider = {
       order: modelConfig.providers,
-      allow_fallbacks: true // Fall back through the list if the primary provider fails
+      allow_fallbacks: true
     };
   }
 
@@ -644,7 +586,6 @@ const BOOKING_TOOL_DEF = {
 // AUTONOMOUS ACTIONS — TOOL CALLING & WEBHOOK EXECUTION
 // ════════════════════════════════════════════════════════════════════════════
 
-// Sanitizes a user-configured action name into a safe function-calling identifier.
 function sanitizeActionFunctionName(name) {
     return String(name || '')
         .trim()
@@ -654,16 +595,10 @@ function sanitizeActionFunctionName(name) {
         .substring(0, 64) || 'action';
 }
 
-// Resolves the callable function name for a configured agent action, preferring
-// the stored id (set client-side from the action name) and falling back to a
-// freshly sanitized version of the name if the id is missing/stale.
 function actionFunctionName(action) {
     return action.id ? sanitizeActionFunctionName(action.id) : sanitizeActionFunctionName(action.name);
 }
 
-// Converts the user-configured `agentActions` array (stored on the bot doc)
-// into standard OpenAI-compatible `tools` function definitions the LLM can
-// choose to call (OpenRouter passes these through to the underlying model).
 function buildAgentActionToolDefs(agentActions) {
     return (Array.isArray(agentActions) ? agentActions : [])
         .filter(a => a && a.name && a.url)
@@ -695,9 +630,6 @@ function buildAgentActionToolDefs(agentActions) {
         });
 }
 
-// Replaces `:param_name` path segments in a URL template with real values
-// extracted by the LLM (e.g. "https://api.site.com/orders/:order_id" with
-// { order_id: "1234" } becomes "https://api.site.com/orders/1234").
 function formatActionUrl(urlTemplate, params) {
     let url = String(urlTemplate || '');
     const usedKeys = new Set();
@@ -711,10 +643,6 @@ function formatActionUrl(urlTemplate, params) {
     return { url, usedKeys };
 }
 
-// Executes a single configured autonomous action (webhook/API call) using the
-// parameters the LLM extracted from the conversation. Supports GET, POST,
-// PUT, DELETE, custom headers (e.g. Authorization / Bearer tokens), dynamic
-// URL path substitution, and query-string / JSON-body param placement.
 async function executeAgentAction(action, extractedParams) {
     const params = extractedParams && typeof extractedParams === 'object' ? extractedParams : {};
     const method = String(action.method || 'GET').toUpperCase();
@@ -723,8 +651,6 @@ async function executeAgentAction(action, extractedParams) {
     try {
         const { url: pathFormattedUrl, usedKeys } = formatActionUrl(action.url, params);
 
-        // Any parameters NOT consumed by the URL path template are sent either
-        // as query-string params (GET/DELETE) or as a JSON body (POST/PUT).
         const remainingParams = {};
         Object.keys(params).forEach(key => {
             if (!usedKeys.has(key)) remainingParams[key] = params[key];
@@ -775,9 +701,6 @@ async function executeAgentAction(action, extractedParams) {
     }
 }
 
-// Runs every requested tool call for a batch of configured agent actions and
-// returns { toolCallId, functionName, result } entries ready to be appended
-// back into the conversation as `tool` role messages.
 async function runAgentActionToolCalls(toolCalls, agentActions) {
     const results = [];
     for (const tc of toolCalls) {
@@ -799,26 +722,15 @@ async function runAgentActionToolCalls(toolCalls, agentActions) {
     return results;
 }
 
-// Some reasoning-capable open models (Qwen, DeepSeek-style, etc.) emit a
-// <think>...</think> block ahead of their real answer when called via the
-// raw chat-completions API. Strip it before the content is ever shown to a
-// user or parsed for tool-call JSON.
 function stripThinkingTags(text) {
     if (!text) return text;
     return text
         .replace(/<think>[\s\S]*?<\/think>/gi, '')
         .replace(/<thinking>[\s\S]*?<\/thinking>/gi, '')
-        // Handles the rarer case of a closing tag with no matching opener
-        // (can happen if the model's reasoning gets truncated).
         .replace(/^[\s\S]*?<\/think>/i, '')
         .trim();
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// callLLM — single choke-point for every model call. All traffic goes through
-// OpenRouter (OPENROUTER_API_KEY), so adding or swapping a model is a
-// one-line change in MODEL_REGISTRY.
-// ════════════════════════════════════════════════════════════════════════════
 async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent, enableBookingTool, extraTools }) {
     const entry = MODEL_REGISTRY[modelKey] || MODEL_REGISTRY[DEFAULT_MODEL_KEY];
     const apiKey = process.env.OPENROUTER_API_KEY;
@@ -852,8 +764,6 @@ async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent, enabl
         headers: {
             'Content-Type':  'application/json',
             'Authorization': `Bearer ${apiKey}`,
-            // OpenRouter recommends these for attribution / free-tier quotas.
-            // Safe to leave as-is or override via APP_URL.
             'HTTP-Referer':  process.env.APP_URL || 'https://mebor-ai.com',
             'X-Title':       'Mebor AI',
         },
@@ -868,8 +778,6 @@ async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent, enabl
     const data = await r.json();
     const msg  = data.choices?.[0]?.message || {};
 
-    // Some providers return tool_call arguments as an already-parsed object;
-    // normalize to a JSON string so downstream JSON.parse() is consistent.
     if (Array.isArray(msg.tool_calls)) {
         msg.tool_calls = msg.tool_calls.map(tc => {
             if (tc?.function && typeof tc.function.arguments !== 'string') {
@@ -885,11 +793,9 @@ async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent, enabl
 
 // ════════════════════════════════════════════════════════════════════════════
 // LIVE WEBSITE AUTO-SYNC
-// Re-fetches the agent's website (and a few reference links) at chat time,
-// throttled, and only writes to Firestore when the content actually changed.
 // ════════════════════════════════════════════════════════════════════════════
-const SYNC_CHECK_INTERVAL_MS = 60 * 1000;  // how often a site is re-checked (lower = fresher, more fetches)
-const SYNC_FETCH_TIMEOUT_MS  = 5000;       // max extra latency a sync can add to one chat message
+const SYNC_CHECK_INTERVAL_MS = 60 * 1000;
+const SYNC_FETCH_TIMEOUT_MS  = 5000;
 const SYNC_MAX_EXTRA_LINKS   = 3;
 
 function htmlToText(html) {
@@ -920,8 +826,6 @@ async function fetchPageText(url, timeoutMs = SYNC_FETCH_TIMEOUT_MS) {
     return htmlToText(await r.text());
 }
 
-// Mutates `bot` (the in-memory doc) with the fresh values so the current chat
-// turn already uses them, and persists them for later turns.
 async function syncBotWebsite(db, businessId, bot, { force = false } = {}) {
     const url = bot.url;
     if (!/^https?:\/\//i.test(url || '')) return { skipped: 'no-url' };
@@ -932,7 +836,6 @@ async function syncBotWebsite(db, businessId, bot, { force = false } = {}) {
     const botRef = db.collection('user_bots').doc(businessId);
     const nowISO = new Date().toISOString();
     bot.lastSyncCheckAt = nowISO;
-    // Written first so concurrent chat requests don't all re-fetch at once.
     await botRef.set({ lastSyncCheckAt: nowISO }, { merge: true });
 
     const links = (bot.knowledgeContext?.additionalLinks || [])
@@ -948,7 +851,7 @@ async function syncBotWebsite(db, businessId, bot, { force = false } = {}) {
         const msg = main.status === 'rejected' ? main.reason?.message : 'Page had no readable text.';
         bot.lastSyncError = msg;
         await botRef.set({ lastSyncError: msg }, { merge: true });
-        return { error: msg }; // keep serving the last good copy
+        return { error: msg };
     }
 
     const mainText  = main.value.substring(0, 15000);
@@ -1025,6 +928,12 @@ export default async function handler(req, res) {
     if (path === '/api/enterprise/create-checkout') return handleEnterpriseCreateCheckout(req, res);
     if (path === '/api/webhooks/whop')               return handleWhopWebhook(req, res);
 
+    // ── Email Agent (IMAP/SMTP) — feature: emailAgent ──────────────────────
+    if (path === '/api/email/connect')      return handleEmailConnect(req, res);
+    if (path === '/api/email/disconnect')   return handleEmailDisconnect(req, res);
+    if (path === '/api/email/status')       return handleEmailStatus(req, res);
+    if (path === '/api/email/poll-worker')  return handleEmailPollWorker(req, res);
+
     // ── Database source integrations (Firebase Project / Supabase) ────────
     if (path === '/api/oauth/firebase-project')          return handleFirebaseProjectOAuth(req, res);
     if (path === '/api/oauth/firebase-project/callback')  return handleFirebaseProjectCallback(req, res);
@@ -1066,8 +975,6 @@ export default async function handler(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // GET /api/models
-// The dashboard's picker now renders from its local MODEL_CATALOG, but this
-// endpoint is kept in sync so any external consumer sees the same list.
 // ════════════════════════════════════════════════════════════════════════════
 async function handleModels(req, res) {
     const models = Object.entries(MODEL_REGISTRY).map(([key, val]) => ({
@@ -1080,10 +987,6 @@ async function handleModels(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // GET /api/plan/usage?email=
-// Single source of truth the dashboard reads for: agent count vs limit,
-// employee seats vs limit, the credit meter (drives the 75% warning banner
-// and the 100% "bots offline" state) and per-feature access (drives the
-// greyed-out / "Upgrade to …" state of locked controls).
 // ════════════════════════════════════════════════════════════════════════════
 async function handlePlanUsage(req, res) {
     const email = req.query?.email || req.query?.ownerEmail || req.body?.email;
@@ -1100,8 +1003,6 @@ async function handlePlanUsage(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // GET /api/plan/features?email=
-// Lightweight: just the plan + which features it includes, each with the
-// ready-made "Upgrade to X or Y to unlock this feature." tooltip text.
 // ════════════════════════════════════════════════════════════════════════════
 async function handlePlanFeatures(req, res) {
     const email = req.query?.email || req.query?.ownerEmail || req.body?.email;
@@ -1147,9 +1048,6 @@ async function handleCanCreateAgent(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // POST /api/plan/select  { email, planKey }
-// The ONLY client-facing way to change a plan. Free is always allowed; paid
-// tiers are only granted if the account has already redeemed a matching promo
-// code or has an active Whop subscription recorded by the webhook.
 // ════════════════════════════════════════════════════════════════════════════
 async function handlePlanSelect(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -1168,12 +1066,10 @@ async function handlePlanSelect(req, res) {
             return res.json({ success: true, entitlement: ent, limits: resolvePlanLimits({ entitlement: ent }) });
         }
 
-        // Already entitled to this tier through a verified source — just re-affirm.
         if (data.entitlement?.tier === planKey && data.entitlement?.status === 'active') {
             return res.json({ success: true, entitlement: data.entitlement, limits: resolvePlanLimits(data) });
         }
 
-        // Promo path: verify the redemption actually exists in promo_codes.
         const promoSnap = await db.collection('promo_codes')
             .where('planKey', '==', planKey)
             .where('redeemedBy', 'array-contains', email)
@@ -1201,15 +1097,13 @@ async function handlePlanSelect(req, res) {
 // ════════════════════════════════════════════════════════════════════════════
 
 const ENTERPRISE_PRICING = {
-    basePrice:        499,     // $499/mo base, includes baseCredits + baseAgents + baseSeats
+    basePrice:        499,
     baseCredits:      45000,   creditOverageRate: 0.010,  maxCredits: 2000000,
     baseAgents:       10,      agentOverageRate:  15,     maxAgents:  5000,
     baseSeats:        10,      seatOverageRate:   10,     maxSeats:   5000,
     maxCheckoutPrice: 2500,
 };
 
-// Server-side source of truth for the price — NEVER trust a client-sent
-// dollar amount. Re-derives price from credits + agents + seats every time.
 function calculateEnterprisePrice(rawCreditPool, rawAgentCount, rawSeatCount) {
     let credits = Math.round(Number(rawCreditPool) || 0);
     credits = Math.max(ENTERPRISE_PRICING.baseCredits, Math.min(ENTERPRISE_PRICING.maxCredits, credits));
@@ -1228,11 +1122,6 @@ function calculateEnterprisePrice(rawCreditPool, rawAgentCount, rawSeatCount) {
     return { credits, agents, seats, price: Math.round(price * 100) / 100 };
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// POST /api/enterprise/create-checkout  { email, companyId, creditPool, agentCount, seatCount }
-// Server re-validates the price, then asks Whop for an exact-amount dynamic
-// checkout session and returns the URL to redirect the user to.
-// ════════════════════════════════════════════════════════════════════════════
 async function handleEnterpriseCreateCheckout(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
     const { email, companyId, creditPool, agentCount, seatCount } = req.body || {};
@@ -1246,8 +1135,8 @@ async function handleEnterpriseCreateCheckout(req, res) {
         return res.status(400).json({ success: false, message: `This configuration exceeds the $${ENTERPRISE_PRICING.maxCheckoutPrice}/mo self-serve limit. Please contact sales.` });
 
     const whopApiKey    = process.env.WHOP_API_KEY;
-    const whopCompanyId = process.env.WHOP_COMPANY_ID;          // biz_xxxxxxxxxxxxxx
-    const whopProductId = process.env.WHOP_ENTERPRISE_PRODUCT_ID; // prod_xxxxxxxxxxxxx
+    const whopCompanyId = process.env.WHOP_COMPANY_ID;
+    const whopProductId = process.env.WHOP_ENTERPRISE_PRODUCT_ID;
     if (!whopApiKey || !whopCompanyId || !whopProductId) {
         return res.status(500).json({
             success: false,
@@ -1258,14 +1147,8 @@ async function handleEnterpriseCreateCheckout(req, res) {
     try {
         const appUrl = process.env.APP_URL || `https://${req.headers.host}`;
 
-        // DEBUG: confirm exactly which IDs are being sent to Whop (never log
-        // the API key itself). A 404 here means one of these two doesn't
-        // resolve under the account that owns WHOP_API_KEY.
         console.log('[Enterprise/CreateCheckout] company_id=', whopCompanyId, 'product_id=', whopProductId, 'price=', price);
 
-        // Whop's REST API (api.whop.com/api/v1) has no "custom_amount" override
-        // for a fixed plan_id. Dynamic pricing = a checkout configuration with
-        // an inline plan whose renewal_price is the amount computed above.
         const r = await fetch('https://api.whop.com/api/v1/checkout_configurations', {
             method: 'POST',
             headers: {
@@ -1297,9 +1180,6 @@ async function handleEnterpriseCreateCheckout(req, res) {
 
         if (!r.ok) {
             const errText = await r.text();
-            // Surface the exact IDs in the thrown message too, so this shows
-            // up in Vercel's function log for the failed request without
-            // needing to cross-reference the earlier console.log line.
             throw new Error(`Whop checkout configuration failed (HTTP ${r.status}) [company_id=${whopCompanyId}, product_id=${whopProductId}]: ${errText.substring(0, 300)}`);
         }
 
@@ -1327,13 +1207,6 @@ async function handleEnterpriseCreateCheckout(req, res) {
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// POST /api/webhooks/whop — automated provisioning / downgrade on payment events
-// This is the ONLY place a paid entitlement is granted from a real payment.
-// ════════════════════════════════════════════════════════════════════════════
-
-// Maps a Whop plan id → our internal tier. Set these env vars to the plan ids
-// behind the Team / Team+ checkout links used on the pricing page.
 function whopPlanTierMap() {
     const map = {};
     const pairs = [
@@ -1366,9 +1239,6 @@ function resolveWhopEmail(data, metadata) {
 async function handleWhopWebhook(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
 
-    // Verify the webhook signature if Whop supplied one and you've set
-    // WHOP_WEBHOOK_SECRET. Adjust the header name / HMAC scheme to match
-    // whatever Whop documents for your account — this is the common pattern.
     const signature = req.headers['x-whop-signature'];
     const webhookSecret = process.env.WHOP_WEBHOOK_SECRET;
     if (webhookSecret && signature) {
@@ -1411,11 +1281,11 @@ async function handleWhopWebhook(req, res) {
                     planUnlockedByPromo: false,
                     enterprise: {
                         monthlyCredits: creditPool,
-                        maxAgents: agentCount, // purchased count, not unlimited — re-run checkout to scale up
+                        maxAgents: agentCount,
                         maxSeats: seatCount,
                         integrations: {
                             firebase: true, supabase: true, canva: true, figma: true,
-                            google_calendar: true, push_alerts: true,
+                            google_calendar: true, push_alerts: true, email_agent: true,
                         },
                         status: 'active',
                         whopMembershipId: data.id || null,
@@ -1453,7 +1323,7 @@ async function handleWhopWebhook(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// ADVANCED ANALYTICS — fallback rate, sentiment, drop-off, topic clustering
+// ADVANCED ANALYTICS
 // ════════════════════════════════════════════════════════════════════════════
 
 const PERIOD_MS = {
@@ -1482,8 +1352,6 @@ function detectFallback(answer) {
     return FALLBACK_PATTERNS.test(String(answer || ''));
 }
 
-// Lightweight lexicon-based sentiment scorer (no extra LLM call per message —
-// keeps chat logging fast/cheap). Score range: -1 (negative) .. 1 (positive).
 const SENTIMENT_NEG = ['angry','frustrat','terrible','worst','hate','awful','useless','broken','disappoint','annoyed','not working',"doesn't work","isn't working",'bad experience','waste of time','horrible','stupid','ridiculous','unacceptable','confusing','complicated','slow','never works','give up','done with this','so bad','no help','not helpful','ridiculous','scam','rude'];
 const SENTIMENT_POS = ['thank','thanks','great','awesome','perfect','love','excellent','helpful','amazing','good job','appreciate','wonderful','fantastic','nice','cool','works great','exactly what','solved','sorted','happy','glad'];
 
@@ -1492,7 +1360,7 @@ function computeSentiment(text) {
     let score = 0;
     SENTIMENT_NEG.forEach(w => { if (t.includes(w)) score -= 1; });
     SENTIMENT_POS.forEach(w => { if (t.includes(w)) score += 1; });
-    if (t.includes('!') && score < 0) score -= 0.5; // exclamation amplifies frustration
+    if (t.includes('!') && score < 0) score -= 0.5;
     const clamped = Math.max(-1, Math.min(1, score / 3));
     let label = 'neutral';
     if (clamped > 0.12) label = 'positive';
@@ -1545,11 +1413,9 @@ async function handleAdvancedAnalytics(req, res) {
             });
         }
 
-        // ── Fallback rate ──
         const fallbackCount = chats.filter(c => c.fallback === true || (c.fallback === undefined && detectFallback(c.answer))).length;
         const fallbackRate = Math.round((fallbackCount / chats.length) * 1000) / 10;
 
-        // ── Sentiment (day-bucketed trend) ──
         const bucketMap = {};
         let posCount = 0, negCount = 0, neuCount = 0, sentSum = 0;
         chats.forEach(c => {
@@ -1568,7 +1434,6 @@ async function handleAdvancedAnalytics(req, res) {
             .sort((a, b) => a.day.localeCompare(b.day))
             .map(b => ({ day: b.day, avgSentiment: Math.round((b.sum / b.count) * 100) / 100, count: b.count }));
 
-        // ── Drop-off funnel: last message of each conversation ──
         const convMap = {};
         chats.forEach(c => {
             if (!convMap[c.conversationId]) convMap[c.conversationId] = [];
@@ -1579,7 +1444,6 @@ async function handleAdvancedAnalytics(req, res) {
             .filter(Boolean);
         const dropOffClusters = clusterByKeyword(dropOffMessages);
 
-        // ── Topic clustering across all questions in period ──
         const allQuestions = chats.map(c => c.question).filter(Boolean);
         const topicClusters = clusterByKeyword(allQuestions);
 
@@ -1771,7 +1635,6 @@ async function fetchSupabaseProjectSnapshot(ownerEmail, db, projectRef) {
     return sections.join('\n\n');
 }
 
-// Cached on the bot doc so every chat message doesn't re-hit the live backend.
 async function getDbSourceSnapshot(db, businessId, source, ownerEmail) {
     const cacheKey = `${source.service}:${source.projectId}`;
     const botRef = db.collection('user_bots').doc(businessId);
@@ -1790,7 +1653,7 @@ async function getDbSourceSnapshot(db, businessId, source, ownerEmail) {
         else return null;
     } catch (err) {
         console.error(`[DbSource:${cacheKey}]`, err.message);
-        if (cached?.text) return cached.text; // serve stale data over nothing
+        if (cached?.text) return cached.text;
         return `(Could not read live data from this ${source.service} project right now: ${err.message})`;
     }
 
@@ -1820,7 +1683,7 @@ async function wipeBotCompletely(db, botId) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// POST /api/bot/delete-cascade  — permanently wipes a bot and ALL of its data
+// POST /api/bot/delete-cascade
 // ════════════════════════════════════════════════════════════════════════════
 async function handleBotDeleteCascade(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -1847,8 +1710,6 @@ async function handleBotDeleteCascade(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // POST /api/bot/restore  { businessId, ownerEmail }
-// Restoring from the recycle bin re-activates an agent, so it has to respect
-// the plan's agent cap exactly like creating a new one does.
 // ════════════════════════════════════════════════════════════════════════════
 async function handleBotRestore(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -1888,7 +1749,7 @@ async function handleBotRestore(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// POST /api/account/delete-cascade — permanently wipes a user + everything they own
+// POST /api/account/delete-cascade
 // ════════════════════════════════════════════════════════════════════════════
 async function handleAccountDeleteCascade(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -1925,6 +1786,336 @@ async function handleAccountDeleteCascade(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// EMAIL AGENT — IMAP/SMTP CONNECTION (Team+ and above)
+// feature: emailAgent
+// ════════════════════════════════════════════════════════════════════════════
+
+function getEmailCipherKey() {
+    const raw = process.env.EMAIL_CRED_KEY;
+    if (!raw) throw new Error('Missing EMAIL_CRED_KEY env var (used to encrypt inbox passwords).');
+    return crypto.createHash('sha256').update(raw).digest();
+}
+
+function encryptEmailPassword(plain) {
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', getEmailCipherKey(), iv);
+    const enc = Buffer.concat([cipher.update(String(plain), 'utf8'), cipher.final()]);
+    const tag = cipher.getAuthTag();
+    return Buffer.concat([iv, tag, enc]).toString('base64');
+}
+
+function decryptEmailPassword(blob) {
+    const buf = Buffer.from(blob, 'base64');
+    const iv  = buf.subarray(0, 12);
+    const tag = buf.subarray(12, 28);
+    const enc = buf.subarray(28);
+    const decipher = crypto.createDecipheriv('aes-256-gcm', getEmailCipherKey(), iv);
+    decipher.setAuthTag(tag);
+    return Buffer.concat([decipher.update(enc), decipher.final()]).toString('utf8');
+}
+
+async function testImapLogin({ host, port, useSSL, address, password }) {
+    const client = new ImapFlow({
+        host,
+        port: Number(port),
+        secure: !!useSSL,
+        auth: { user: address, pass: password },
+        logger: false,
+        tls: { rejectUnauthorized: false },
+    });
+    try {
+        await client.connect();
+        await client.logout();
+        return true;
+    } catch (err) {
+        try { await client.close(); } catch {}
+        throw new Error(err?.responseText || err?.message || 'IMAP login failed.');
+    }
+}
+
+async function testSmtpLogin({ host, port, useSSL, address, password }) {
+    const transporter = nodemailer.createTransport({
+        host,
+        port: Number(port),
+        secure: !!useSSL,
+        auth: { user: address, pass: password },
+        tls: { rejectUnauthorized: false },
+        connectionTimeout: 8000,
+        greetingTimeout: 8000,
+        socketTimeout: 8000,
+    });
+    try {
+        await transporter.verify();
+        return true;
+    } catch (err) {
+        throw new Error(err?.response || err?.message || 'SMTP login failed.');
+    }
+}
+
+// POST /api/email/connect
+async function handleEmailConnect(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const {
+        ownerEmail, address, password,
+        imapHost, imapPort, smtpHost, smtpPort, useSSL,
+    } = req.body || {};
+
+    if (!ownerEmail || !address || !password || !imapHost || !imapPort || !smtpHost || !smtpPort) {
+        return res.status(400).json({ success: false, message: 'Missing required email connection fields.' });
+    }
+
+    try {
+        const db = getDb();
+
+        // Plan gate — Email Agent is Team+ and above.
+        if (await denyIfFeatureLocked(res, db, ownerEmail, 'emailAgent')) return;
+
+        // 1. IMAP handshake
+        try {
+            await testImapLogin({ host: imapHost, port: imapPort, useSSL, address, password });
+        } catch (err) {
+            return res.status(400).json({
+                success: false,
+                failureStage: 'imap',
+                message: `IMAP login failed: ${err.message}`,
+            });
+        }
+
+        // 2. SMTP handshake
+        try {
+            await testSmtpLogin({ host: smtpHost, port: smtpPort, useSSL, address, password });
+        } catch (err) {
+            return res.status(400).json({
+                success: false,
+                failureStage: 'smtp',
+                message: `SMTP login failed: ${err.message}`,
+            });
+        }
+
+        // 3. Save encrypted credentials + settings
+        await db.collection('users').doc(ownerEmail).set({
+            integrations: {
+                email: {
+                    connected: true,
+                    address,
+                    imapHost,
+                    imapPort: Number(imapPort),
+                    smtpHost,
+                    smtpPort: Number(smtpPort),
+                    useSSL: !!useSSL,
+                    passwordEnc: encryptEmailPassword(password),
+                    connectedAt: new Date().toISOString(),
+                    lastPollAt: null,
+                    lastPollError: null,
+                },
+            },
+        }, { merge: true });
+
+        return res.json({ success: true, message: 'Inbox connected.' });
+    } catch (err) {
+        console.error('[Email/Connect]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// POST /api/email/disconnect
+async function handleEmailDisconnect(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { ownerEmail } = req.body || {};
+    if (!ownerEmail) return res.status(400).json({ success: false, message: 'Missing ownerEmail.' });
+
+    try {
+        const db = getDb();
+        await db.collection('users').doc(ownerEmail).set({
+            integrations: { email: null },
+        }, { merge: true });
+        return res.json({ success: true, message: 'Inbox disconnected.' });
+    } catch (err) {
+        console.error('[Email/Disconnect]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// GET /api/email/status?ownerEmail=
+async function handleEmailStatus(req, res) {
+    const { ownerEmail } = req.query;
+    if (!ownerEmail) return res.status(400).json({ success: false, message: 'Missing ownerEmail.' });
+    try {
+        const db = getDb();
+        const snap = await db.collection('users').doc(ownerEmail).get();
+        const email = snap.exists ? (snap.data()?.integrations?.email || null) : null;
+        if (!email?.connected) return res.json({ success: true, connected: false });
+        return res.json({
+            success: true,
+            connected: true,
+            address: email.address,
+            lastPollAt: email.lastPollAt || null,
+            lastPollError: email.lastPollError || null,
+        });
+    } catch (err) {
+        console.error('[Email/Status]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/email/poll-worker
+// Trigger via a Vercel Cron Job (see vercel.json — schedule "* * * * *").
+// Polls every connected inbox for unread messages, dispatches each one to the
+// owner's email-mode agent via callLLM, replies via SMTP, marks as seen.
+// ════════════════════════════════════════════════════════════════════════════
+async function handleEmailPollWorker(req, res) {
+    const cronSecret = process.env.EMAIL_WORKER_SECRET;
+    if (cronSecret && req.headers['x-worker-secret'] !== cronSecret) {
+        return res.status(401).json({ success: false, message: 'Unauthorized.' });
+    }
+
+    try {
+        const db = getDb();
+        const usersSnap = await db.collection('users').get();
+        const targets = [];
+        usersSnap.forEach(d => {
+            const em = d.data()?.integrations?.email;
+            if (em?.connected) targets.push({ email: d.id, config: em });
+        });
+
+        const results = [];
+        for (const t of targets) {
+            try {
+                const r = await pollOneInbox(db, t.email, t.config);
+                results.push({ email: t.email, ...r });
+            } catch (err) {
+                console.error('[Email/Worker]', t.email, err.message);
+                results.push({ email: t.email, error: err.message });
+                try {
+                    await db.collection('users').doc(t.email).set({
+                        integrations: { email: { lastPollError: err.message, lastPollAt: new Date().toISOString() } },
+                    }, { merge: true });
+                } catch {}
+            }
+        }
+        return res.json({ success: true, polled: results.length, results });
+    } catch (err) {
+        console.error('[Email/Worker]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+async function pollOneInbox(db, ownerEmail, config) {
+    const password = decryptEmailPassword(config.passwordEnc);
+
+    // Find the first email-capable agent owned by this account.
+    const botsSnap = await db.collection('user_bots').where('owner', '==', ownerEmail).get();
+    let emailAgent = null;
+    botsSnap.forEach(d => {
+        const b = d.data();
+        if (b.deletedAt) return;
+        if ((b.agentBuildMode === 'email' || b.agentBuildMode === 'both') && !emailAgent) {
+            emailAgent = { id: d.id, ...b };
+        }
+    });
+    if (!emailAgent) return { skipped: 'no-email-agent' };
+
+    // Plan check — emailAgent must still be allowed.
+    const ctx = await resolveOwnerContext(db, ownerEmail);
+    const limits = resolvePlanLimits(ctx.ownerProfile);
+    if (!limits.features.emailAgent) return { skipped: 'plan' };
+
+    const client = new ImapFlow({
+        host: config.imapHost,
+        port: config.imapPort,
+        secure: !!config.useSSL,
+        auth: { user: config.address, pass: password },
+        logger: false,
+        tls: { rejectUnauthorized: false },
+    });
+    await client.connect();
+    const lock = await client.getMailboxLock('INBOX');
+
+    const transporter = nodemailer.createTransport({
+        host: config.smtpHost,
+        port: config.smtpPort,
+        secure: !!config.useSSL,
+        auth: { user: config.address, pass: password },
+        tls: { rejectUnauthorized: false },
+    });
+
+    let handled = 0;
+    try {
+        for await (const msg of client.fetch({ seen: false }, { envelope: true, source: true })) {
+            try {
+                const fromEmail = msg.envelope?.from?.[0]?.address;
+                if (!fromEmail) continue;
+
+                const rawBody = msg.source.toString('utf8');
+                const textBody = extractEmailBody(rawBody);
+
+                const credit = await consumeCredits(db, ownerEmail, CREDIT_COSTS.message);
+                if (!credit.allowed) break;
+
+                const sysPrompt = emailAgent.knowledgeContext?.systemPrompt
+                    || `You are a helpful assistant replying to an email. Keep replies concise and professional.`;
+
+                const webContext = emailAgent.context
+                    ? `\n\n[WEBSITE CONTENT]:\n${emailAgent.context}`
+                    : '';
+
+                const choice = await callLLM({
+                    modelKey: emailAgent.modelKey || DEFAULT_MODEL_KEY,
+                    messages: [
+                        { role: 'system', content: sysPrompt + webContext + `\n\nTHIS IS AN EMAIL REPLY. Write a clear, professional reply. Do NOT mention chat, widgets, or "typing". Include a brief sign-off.` },
+                        { role: 'user', content: textBody },
+                    ],
+                    enableBookingTool: false,
+                });
+                const replyText = choice?.content?.trim() || 'Thanks for your message.';
+
+                await transporter.sendMail({
+                    from: config.address,
+                    to: fromEmail,
+                    subject: `Re: ${msg.envelope?.subject || '(no subject)'}`,
+                    text: replyText,
+                });
+
+                await client.messageFlagsAdd(msg.uid, ['\\Seen'], { uid: true });
+                handled++;
+
+                await logChat(db, emailAgent.id, `email-${msg.uid}`, textBody, replyText, true, false, { source: 'email' });
+            } catch (inner) {
+                console.error('[Email/Worker/Message]', inner.message);
+            }
+        }
+    } finally {
+        try { await lock.release(); } catch {}
+        try { await client.logout(); } catch {}
+    }
+
+    await db.collection('users').doc(ownerEmail).set({
+        integrations: {
+            email: {
+                lastPollAt: new Date().toISOString(),
+                lastPollError: null,
+            },
+        },
+    }, { merge: true });
+
+    return { handled };
+}
+
+function extractEmailBody(raw) {
+    const idx = raw.indexOf('\r\n\r\n') >= 0 ? raw.indexOf('\r\n\r\n') : raw.indexOf('\n\n');
+    const body = idx >= 0 ? raw.substring(idx + 4) : raw;
+    if (/content-type:\s*multipart/i.test(raw)) {
+        const parts = body.split(/--[^\r\n]+/);
+        const texts = parts.filter(p => /content-type:\s*text\/plain/i.test(p));
+        if (texts.length) return texts[0].replace(/content-type:[^\n]+\n/i, '').replace(/content-transfer-encoding:[^\n]+\n/i, '').trim();
+        const htmlParts = parts.filter(p => /content-type:\s*text\/html/i.test(p));
+        if (htmlParts.length) return htmlParts[0].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    }
+    return body.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().substring(0, 8000);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // FCM — PUSH NOTIFICATION HELPERS
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -1933,9 +2124,6 @@ async function sendFCMToUser(ownerEmail, { title, body, url, tag }) {
 
     const db = getDb();
 
-    // Plan gate: push notifications are a paid feature. Even if a device token
-    // is sitting in Firestore (e.g. after a downgrade, or written by hand),
-    // nothing is delivered unless the account's plan includes the feature.
     try {
         const ctx = await resolveOwnerContext(db, ownerEmail);
         const limits = resolvePlanLimits(ctx.ownerProfile);
@@ -2080,7 +2268,6 @@ function buildCreditExhaustedNotification(limit) {
     };
 }
 
-// Fires each threshold alert at most once per billing period.
 async function maybeNotifyCreditThreshold(db, ownerEmail, state) {
     if (!ownerEmail || !state || state.skipped) return;
     try {
@@ -2206,7 +2393,6 @@ async function handleFCMRegisterToken(req, res) {
     try {
         const db      = getDb();
 
-        // Plan gate — Free accounts can't register a device for push alerts.
         if (await denyIfFeatureLocked(res, db, userEmail, 'pushNotifications')) return;
 
         const userRef  = db.collection('users').doc(userEmail);
@@ -2278,8 +2464,7 @@ async function handleFCMTestNotification(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// DEPLOY — enforces the plan's agent cap for NEW agents (edits always allowed)
-// and strips any feature the plan doesn't include from the saved config.
+// DEPLOY
 // ════════════════════════════════════════════════════════════════════════════
 async function handleDeploy(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -2320,14 +2505,16 @@ async function handleDeploy(req, res) {
             }
         }
 
-        // Validate the incoming modelKey against the registry so a tampered
-        // request can't pin the bot doc to an arbitrary string. Falls back to
-        // the registry's default rather than rejecting the whole deploy.
         if (!botData.modelKey || !MODEL_REGISTRY[botData.modelKey]) {
             botData.modelKey = DEFAULT_MODEL_KEY;
         }
 
-        // FEATURE GATE: whatever the browser sent, locked features never reach the bot doc.
+        // Normalize agentBuildMode — anything but widget/email/both becomes widget.
+        const VALID_MODES = ['widget', 'email', 'both'];
+        if (!VALID_MODES.includes(botData.agentBuildMode)) {
+            botData.agentBuildMode = 'widget';
+        }
+
         const featuresStripped = sanitizeBotDataForPlan(botData, limits);
 
         botData.owner     = ctx.ownerEmail;
@@ -2343,6 +2530,7 @@ async function handleDeploy(req, res) {
             agents: { used: agentsUsed, limit: limits.maxAgents, remaining: Math.max(0, limits.maxAgents - agentsUsed) },
             plan: { tier: limits.tier, label: limits.label },
             modelKey: botData.modelKey,
+            agentBuildMode: botData.agentBuildMode,
             ...(featuresStripped.length ? {
                 featuresStripped,
                 featureWarnings: featuresStripped.map(k => ({
@@ -2400,8 +2588,6 @@ async function handleConfig(req, res) {
         if (!snap.exists) return res.status(404).json({ success: false, error: 'Bot not found.' });
         const b = snap.data();
 
-        // Widget-facing availability flag — purely informational; the real
-        // enforcement happens in /api/chat.
         let serviceAvailable = true;
         let planFeatures = null;
         try {
@@ -2421,13 +2607,13 @@ async function handleConfig(req, res) {
             allowAppointmentBooking: false,
             allowHumanHandoff:    true,
         }, b.behaviorConfig || {});
-        // Never advertise a feature the owner's plan doesn't include.
         if (planFeatures && !planFeatures.appointmentBooking) behaviorConfig.allowAppointmentBooking = false;
 
         return res.status(200).json({
             success:         true,
             name:            b.displayName || b.name    || 'AI Assistant',
             internalName:    b.name                     || null,
+            agentBuildMode:  b.agentBuildMode           || 'widget',
             position:        b.position                 || 'bottom-right',
             logoBase64:      b.logoBase64               || null,
             themeColor:      b.designConfig?.themeColor || '#0f172a',
@@ -2447,24 +2633,14 @@ async function handleConfig(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// CHAT — credit-metered, with CANCEL / EDIT / multi-model / multi-agent /
-// autonomous actions support. Every LLM call routes through OpenRouter.
-//
-// The credit check below is the hard spend ceiling: no LLM provider is ever
-// called until a credit has been successfully reserved against the owner's
-// monthly pool, so tampering with the dashboard or the embed snippet cannot
-// run up the OpenRouter bill.
-//
-// The plan's feature flags are re-applied here on EVERY message: appointment
-// booking, Google Calendar, and live database sources are switched off at
-// runtime if the owner's plan doesn't include them, regardless of what the
-// bot document says.
+// CHAT
 // ════════════════════════════════════════════════════════════════════════════
 async function handleChat(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
 
     const { businessId, message, question, history = [], conversationId: inId } = req.body || {};
     const userMsg = message || question;
+    const source = req.body?.source === 'email' ? 'email' : 'web';
 
     if (!businessId || !userMsg)
         return res.status(400).json({ success: false, answer: 'Missing businessId or message.' });
@@ -2479,8 +2655,6 @@ async function handleChat(req, res) {
         let modelKey   = DEFAULT_MODEL_KEY;
         let subAgents  = [];
         let agentActionsList = [];
-        // Most restrictive (Free) by default — only replaced once the owner's
-        // real plan has been resolved below.
         let planLimits = resolvePlanLimits({});
         let behaviorConfig = {
             allowOutOfTopic: true,
@@ -2499,24 +2673,21 @@ async function handleChat(req, res) {
             agentActionsList = Array.isArray(b.agentActions) ? b.agentActions.filter(a => a?.name && a?.url) : [];
             behaviorConfig = Object.assign(behaviorConfig, b.behaviorConfig || {});
 
-            // A soft-deleted (recycle bin) agent must not keep answering or burning credits.
             if (b.deletedAt) {
                 const reply = 'This assistant is not available right now. Please contact the business directly.';
                 return res.json({ success: true, answer: reply, reply, _unavailable: true });
             }
 
-            // ── PLAN FEATURE GATE ──────────────────────────────────────────
             if (ownerEmail) {
                 try {
                     const ownerPlanSnap = await db.collection('users').doc(ownerEmail).get();
                     planLimits = resolvePlanLimits(ownerPlanSnap.exists ? ownerPlanSnap.data() : {});
                 } catch (e) {
-                    console.error('[Chat/PlanLookup]', e.message); // stays on the Free defaults
+                    console.error('[Chat/PlanLookup]', e.message);
                 }
             }
             if (!planLimits.features.appointmentBooking) behaviorConfig.allowAppointmentBooking = false;
 
-                        // ── Live website auto-sync (throttled; only re-fetches when stale) ──
             try { await syncBotWebsite(db, businessId, b); }
             catch (e) { console.warn('[Chat/Sync]', e.message); }
 
@@ -2535,14 +2706,12 @@ async function handleChat(req, res) {
                 sysPrompt += `\n\n[REFERENCE DOCUMENTS]:\n${String(kc.fileContents).substring(0, 6000)}`;
             }
 
-            // ── Database sources (Firebase Project / Supabase) ──────────────
-            // Only sources whose feature is included in the owner's plan are read.
             const dbSources = (kc.databaseSources || []).filter(s => {
                 const featureKey = DB_SERVICE_FEATURE[s?.service];
                 return featureKey && planLimits.features[featureKey];
             });
             if (dbSources.length) {
-                const limitedSources = dbSources.slice(0, 3); // cap latency/cost
+                const limitedSources = dbSources.slice(0, 3);
                 const snapshots = await Promise.all(limitedSources.map(async s => {
                     try {
                         return { s, text: await getDbSourceSnapshot(db, businessId, s, ownerEmail) };
@@ -2557,7 +2726,6 @@ async function handleChat(req, res) {
             }
         }
 
-        // ── Behavior toggles: out-of-topic / web search / hallucination ────
         sysPrompt += `\n\nBEHAVIOR SETTINGS:`;
         sysPrompt += behaviorConfig.allowOutOfTopic
             ? `\n- You MAY answer casual, general-knowledge, or out-of-topic questions (e.g. "What is Google?") in a friendly way, even if unrelated to the business.`
@@ -2581,15 +2749,14 @@ async function handleChat(req, res) {
             ? `\n\n- If the user asks to speak with a human/person/agent, that request will be routed automatically by the system — you don't need to say anything special about it yourself.`
             : `\n\n- Human agent handoff is DISABLED for this agent. If the user asks to speak with a human, a real person, or a live agent, politely explain that live handoff isn't available here right now, and offer to keep helping them yourself.`;
 
-        // ── Autonomous actions — tell the model these tools exist and when to use them ──
         if (agentActionsList.length) {
             sysPrompt += `\n\nAUTONOMOUS ACTIONS:\n- You have access to real, live tools/actions that call external systems on this business's behalf (e.g. checking an order status, updating a record, triggering a webhook).\n- Call the matching tool whenever the user's request matches what that tool does, using the AI Description of each tool to decide when it applies.\n- Extract every required parameter directly from the conversation. If a required parameter is missing, ask the user for it before calling the tool.\n- After a tool result comes back, use it to give a clear, natural-language answer — never show the user raw JSON.\n- If a tool call fails or times out, apologize briefly and let the user know the action could not be completed right now.`;
         }
 
-        // ── HUMAN HANDOFF — checked before anything else (only when enabled).
-        // Deliberately placed BEFORE the credit gate: a visitor asking for a
-        // real person costs no LLM tokens and must keep working even after the
-        // month's credits run out.
+        if (source === 'email') {
+            sysPrompt += `\n\nTHIS IS AN EMAIL REPLY. The user's message arrived via email. Write a clear, professional reply. Do NOT mention chat, widgets, or "typing". Include a brief sign-off.`;
+        }
+
         const wantsHuman = humanHandoffEnabled && /speak to human support|connect (me )?(to )?(a )?human|talk to (a )?(human|person|someone|agent|representative)|(human|real) (agent|person)|customer service rep|talk to (someone|somebody) real/i.test(userMsg);
         if (wantsHuman) {
             try {
@@ -2606,9 +2773,6 @@ async function handleChat(req, res) {
             }
         }
 
-        // ══════════════ CREDIT GATE ══════════════
-        // Reserve a credit BEFORE any provider call. At 100% the bot goes quiet
-        // for the rest of the billing period.
         const creditState = await consumeCredits(db, ownerEmail, CREDIT_COSTS.message);
         if (!creditState.allowed) {
             const reply = creditState.reason === 'exhausted'
@@ -2776,7 +2940,6 @@ async function handleChat(req, res) {
         const isBookingConversation = bookingEnabled && /\b(book|schedule|appointment|slot|reserve|set up|fix a)\b/i.test(allTextLow);
         const allFieldsPresent      = isBookingConversation && hasName && hasContact && hasDay && hasTime;
 
-        // ── MULTI-AGENT ROUTING — classify + hand off to a specialized sub-agent, if any are configured ──
         let routedAgent = null;
         if (subAgents.length) {
             routedAgent = await routeToSubAgent(modelKey, userMsg, subAgents);
@@ -2786,7 +2949,6 @@ async function handleChat(req, res) {
             }
         }
 
-        // ── Build tool definitions for any configured autonomous actions ──
         const agentActionToolDefs = buildAgentActionToolDefs(agentActionsList);
 
         const baseMessages = [
@@ -2841,8 +3003,6 @@ async function handleChat(req, res) {
 
             const dateISO = resolveDay(appointmentDay);
 
-            // Google Calendar is its own plan feature — without it the booking is
-            // still recorded, but no calendar is ever read from or written to.
             let bookingAccounts = [];
             if (ownerEmail && planLimits.features.googleCalendar) {
                 bookingAccounts = bookingEnabledAccounts(await getGoogleCalendarAccounts(db, ownerEmail));
@@ -2899,7 +3059,6 @@ async function handleChat(req, res) {
             return res.json({ success: true, answer, reply: answer, _credits: creditMeta });
         }
 
-        // ── AUTONOMOUS ACTIONS — execute any non-booking tool calls the model requested ──
         if (agentActionToolDefs.length && Array.isArray(choice?.tool_calls) && choice.tool_calls.length) {
             const nonBookingCalls = choice.tool_calls.filter(tc => tc.function?.name !== 'appointmentBooking');
 
@@ -3000,7 +3159,7 @@ async function handleROI(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// PROMO CODES — dev-phase plan unlocks (writes a real backend entitlement)
+// PROMO CODES
 // ════════════════════════════════════════════════════════════════════════════
 async function handlePromoValidate(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -3066,8 +3225,6 @@ async function handlePromoValidate(req, res) {
             return res.status(400).json({ success: false, message: 'This promo code is misconfigured. Please contact support.' });
         }
 
-        // Grant the entitlement server-side — this is what actually raises the
-        // account's agent / seat / credit / feature ceilings.
         const entitlement = await writeEntitlement(
             db, email, result.planKey, 'promo', result.promoLimits || null, { promoCode: normalizedCode }
         );
@@ -3147,13 +3304,12 @@ async function handleReportSubmit(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// GOOGLE OAUTH (Calendar) — feature: googleCalendar
+// GOOGLE OAUTH (Calendar)
 // ════════════════════════════════════════════════════════════════════════════
 async function handleGoogleOAuth(req, res) {
     const { email, origin } = req.query;
     if (!email) return res.status(400).send('Missing email.');
 
-    // Plan gate — checked on the server before Google is ever contacted.
     if (await gateOAuthFeature(req, res, email, origin, 'googleCalendar')) return;
 
     const clientId    = process.env.GOOGLE_CLIENT_ID;
@@ -3186,7 +3342,6 @@ async function handleGoogleCallback(req, res) {
         origin = parsed.origin;
     } catch { return res.status(400).send('Invalid state parameter.'); }
 
-    // Re-check the plan here too, so a hand-crafted callback URL can't store tokens.
     if (await gateOAuthFeature(req, res, email, origin, 'googleCalendar')) return;
 
     const clientId     = process.env.GOOGLE_CLIENT_ID;
@@ -3259,10 +3414,6 @@ async function handleGoogleCallback(req, res) {
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// POST /api/disconnect-calendar  { userEmail, calendarId? , all? }
-// (Always allowed — disconnecting is never gated.)
-// ════════════════════════════════════════════════════════════════════════════
 async function handleDisconnectCalendar(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
     const { userEmail, calendarId, all } = req.body || {};
@@ -3307,10 +3458,6 @@ async function handleDisconnectCalendar(req, res) {
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// POST /api/integrations/toggle-calendar-account  { userEmail, calendarId, enabled }
-// Turns booking on/off for one connected Google account, without disconnecting it.
-// ════════════════════════════════════════════════════════════════════════════
 async function handleToggleCalendarAccount(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
     const { userEmail, calendarId, enabled } = req.body || {};
@@ -3339,8 +3486,7 @@ async function handleToggleCalendarAccount(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// FIREBASE PROJECT OAUTH (data source, NOT the calendar flow above)
-// feature: firebaseDatabase
+// FIREBASE PROJECT OAUTH (data source)
 // ════════════════════════════════════════════════════════════════════════════
 async function handleFirebaseProjectOAuth(req, res) {
     const { email, origin } = req.query;
@@ -3436,7 +3582,7 @@ async function handleFirebaseProjectCallback(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// SUPABASE OAUTH (data source) — feature: supabaseDatabase
+// SUPABASE OAUTH
 // ════════════════════════════════════════════════════════════════════════════
 async function handleSupabaseOAuth(req, res) {
     const { email, origin } = req.query;
@@ -3518,8 +3664,7 @@ async function handleSupabaseCallback(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// FIGMA OAUTH (design source — standard authorization-code flow)
-// feature: figmaDesign
+// FIGMA OAUTH
 // ════════════════════════════════════════════════════════════════════════════
 async function handleFigmaOAuth(req, res) {
     const { email, origin } = req.query;
@@ -3602,11 +3747,7 @@ async function handleFigmaCallback(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// CANVA OAUTH (design source — Connect API, REQUIRES PKCE)
-// feature: canvaDesign
-// The code_verifier can't survive in memory across the redirect on a
-// serverless function, so it's parked in a short-lived Firestore doc keyed
-// by a random state id, then deleted once the callback consumes it.
+// CANVA OAUTH (PKCE)
 // ════════════════════════════════════════════════════════════════════════════
 function base64url(buffer) {
     return buffer.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -3727,7 +3868,6 @@ async function handleDesignImport(req, res) {
     try {
         const db = getDb();
 
-        // Plan gate — Canva / Figma imports are Team+ and above.
         if (await denyIfFeatureLocked(res, db, ownerEmail, DESIGN_SERVICE_FEATURE[service])) return;
 
         const userSnap = await db.collection('users').doc(ownerEmail).get();
@@ -3755,7 +3895,7 @@ async function handleDesignImport(req, res) {
                     extracted.themeColor = rgbToHex(c.r, c.g, c.b);
                 }
                 if (/avatar|logo/i.test(name) && node.type === 'IMAGE') {
-                    extracted.logoUrl = 'figma-image-ref'; // to fully resolve: call POST /v1/images/:key with node id
+                    extracted.logoUrl = 'figma-image-ref';
                 }
                 (node.children || []).forEach(walk);
             };
@@ -3789,7 +3929,7 @@ async function handleDesignImport(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// GET /api/integrations/list-projects?service=firebase|supabase&ownerEmail=...
+// GET /api/integrations/list-projects
 // ════════════════════════════════════════════════════════════════════════════
 async function handleListProjects(req, res) {
     const { service, ownerEmail } = req.query;
@@ -3799,7 +3939,6 @@ async function handleListProjects(req, res) {
     try {
         const db = getDb();
 
-        // Plan gate — live database sources are Team+ and above.
         const featureKey = DB_SERVICE_FEATURE[service];
         if (featureKey && await denyIfFeatureLocked(res, db, ownerEmail, featureKey)) return;
 
@@ -3853,8 +3992,7 @@ async function handleListProjects(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// POST /api/integrations/disconnect-database  { ownerEmail, service }
-// (Always allowed — disconnecting is never gated.)
+// POST /api/integrations/disconnect-database
 // ════════════════════════════════════════════════════════════════════════════
 async function handleDisconnectDatabase(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -3948,7 +4086,7 @@ async function ensureValidJoinCode(db, key, secret) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// GET /api/company/check-username?username=
+// GET /api/company/check-username
 // ════════════════════════════════════════════════════════════════════════════
 async function handleCompanyCheckUsername(req, res) {
     const { username } = req.query;
@@ -3965,9 +4103,7 @@ async function handleCompanyCheckUsername(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// GET /api/company/capacity?companyUsername=
-// Powers the greyed-out / unclickable company entry on the employee sign-up
-// screen when a workspace has no seats left on its plan.
+// GET /api/company/capacity
 // ════════════════════════════════════════════════════════════════════════════
 async function handleCompanyCapacity(req, res) {
     const { companyUsername } = req.query;
@@ -3984,9 +4120,7 @@ async function handleCompanyCapacity(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// GET /api/company/search?q=
-// Same prefix search the employee wizard does, but each result already carries
-// its seat capacity so the UI can render full companies as disabled.
+// GET /api/company/search
 // ════════════════════════════════════════════════════════════════════════════
 async function handleCompanySearch(req, res) {
     const q = companyKeyFrom(req.query?.q || '');
@@ -4027,7 +4161,7 @@ async function handleCompanySearch(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// POST /api/company/setup  { username, ownerEmail, logoBase64 }
+// POST /api/company/setup
 // ════════════════════════════════════════════════════════════════════════════
 async function handleCompanySetup(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -4042,10 +4176,6 @@ async function handleCompanySetup(req, res) {
     try {
         const db = getDb();
 
-        // Guard against ever creating a second company for an account that
-        // already has one — this is what protects against the onboarding
-        // wizard accidentally re-running for a returning user (e.g. a stale
-        // pendingSetup flag) and silently spawning an orphaned duplicate.
         const existingUserSnap = await db.collection('users').doc(ownerEmail).get();
         const existingCompanyUsername = existingUserSnap.exists ? existingUserSnap.data()?.companyUsername : null;
         if (existingCompanyUsername) {
@@ -4083,7 +4213,6 @@ async function handleCompanySetup(req, res) {
             pendingSetup: false,
         }, { merge: true });
 
-        // Brand-new workspaces start on the Free plan until a plan is chosen.
         const existing = existingUserSnap.exists ? existingUserSnap.data() : {};
         if (!existing.entitlement) {
             await writeEntitlement(db, ownerEmail, 'free', 'signup');
@@ -4097,7 +4226,7 @@ async function handleCompanySetup(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// GET /api/company/join-code?companyUsername=&requestedBy=
+// GET /api/company/join-code
 // ════════════════════════════════════════════════════════════════════════════
 async function handleCompanyJoinCode(req, res) {
     const { companyUsername, requestedBy } = req.query;
@@ -4132,7 +4261,7 @@ async function handleCompanyJoinCode(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// POST /api/company/join-code/regenerate  { companyUsername, requestedBy }
+// POST /api/company/join-code/regenerate
 // ════════════════════════════════════════════════════════════════════════════
 async function handleCompanyJoinCodeRegenerate(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -4157,9 +4286,7 @@ async function handleCompanyJoinCodeRegenerate(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// POST /api/employee/verify-and-connect  { companyUsername, joinCode, employeeEmail, logoBase64? }
-// Seat cap is checked BEFORE the join code is validated/rotated, so a rejected
-// join never burns the company's current code.
+// POST /api/employee/verify-and-connect
 // ════════════════════════════════════════════════════════════════════════════
 async function handleEmployeeVerifyAndConnect(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -4179,7 +4306,6 @@ async function handleEmployeeVerifyAndConnect(req, res) {
 
         const secret = secretSnap.data();
 
-        // ── SEAT CAP ──
         const employeeSnap = await db.collection('users').doc(employeeEmail).get();
         const employeeProfile = employeeSnap.exists ? employeeSnap.data() : {};
         const isRejoin = employeeProfile.employeeOf === key && (employeeProfile.employeeStatus || 'active') !== 'removed';
@@ -4233,7 +4359,7 @@ async function handleEmployeeVerifyAndConnect(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// GET /api/company/employees/list?companyUsername=&requestedBy=
+// GET /api/company/employees/list
 // ════════════════════════════════════════════════════════════════════════════
 async function handleCompanyEmployeesList(req, res) {
     const { companyUsername, requestedBy } = req.query;
@@ -4278,7 +4404,7 @@ async function handleCompanyEmployeesList(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// POST /api/company/employees/remove  { companyUsername, employeeEmail, requestedBy }
+// POST /api/company/employees/remove
 // ════════════════════════════════════════════════════════════════════════════
 async function handleCompanyEmployeeRemove(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -4304,7 +4430,7 @@ async function handleCompanyEmployeeRemove(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// POST /api/company/employees/disable  { companyUsername, employeeEmail, requestedBy, disable }
+// POST /api/company/employees/disable
 // ════════════════════════════════════════════════════════════════════════════
 async function handleCompanyEmployeeDisable(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -4338,7 +4464,7 @@ async function handleCompanyEmployeeDisable(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// POST /api/company/employees/delete  { companyUsername, employeeEmail, requestedBy }
+// POST /api/company/employees/delete
 // ════════════════════════════════════════════════════════════════════════════
 async function handleCompanyEmployeeDelete(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -4412,7 +4538,7 @@ async function ensureHumanRequest(db, { businessId, botName, ownerEmail, convers
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// GET /api/human/list?ownerEmail=
+// GET /api/human/list
 // ════════════════════════════════════════════════════════════════════════════
 async function handleHumanList(req, res) {
     const { ownerEmail } = req.query;
@@ -4449,7 +4575,7 @@ async function handleHumanList(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// POST /api/human/connect  { requestId, agentEmail }
+// POST /api/human/connect
 // ════════════════════════════════════════════════════════════════════════════
 async function handleHumanConnect(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -4475,7 +4601,7 @@ async function handleHumanConnect(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// POST /api/human/send-message  { requestId, sender: 'user'|'agent', text, agentEmail? }
+// POST /api/human/send-message
 // ════════════════════════════════════════════════════════════════════════════
 async function handleHumanSendMessage(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -4505,7 +4631,7 @@ async function handleHumanSendMessage(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// GET /api/human/poll?requestId=&sinceTs=
+// GET /api/human/poll
 // ════════════════════════════════════════════════════════════════════════════
 async function handleHumanPoll(req, res) {
     const { requestId, sinceTs } = req.query;
@@ -4532,7 +4658,7 @@ async function handleHumanPoll(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// POST /api/human/close  { requestId, agentEmail?, closedBy? }
+// POST /api/human/close
 // ════════════════════════════════════════════════════════════════════════════
 async function handleHumanClose(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -4560,7 +4686,7 @@ async function handleHumanClose(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// POST /api/account/update-photo  { email, logoBase64 }
+// POST /api/account/update-photo
 // ════════════════════════════════════════════════════════════════════════════
 async function handleUpdateProfilePhoto(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -4597,6 +4723,7 @@ async function logChat(db, businessId, convId, question, answer, isGenuineQuery,
             fallback: !!fallback,
             humanRequested: !!opts.humanRequested,
             creditBlocked: !!opts.creditBlocked,
+            source: opts.source || 'web',
             sentimentLabel: sentiment.label,
             sentimentScore: sentiment.score,
             createdAt: new Date().toISOString(),
@@ -4680,10 +4807,7 @@ function parseTime(timeStr) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// POST /api/account/check-exists  { email }
-// Note: this intentionally reveals whether an email is registered, which is
-// a mild email-enumeration tradeoff — acceptable here since it's explicitly
-// part of the requested UX. Consider rate-limiting this endpoint.
+// POST /api/account/check-exists
 // ════════════════════════════════════════════════════════════════════════════
 async function handleCheckAccountExists(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -4746,17 +4870,15 @@ async function handleAccountChangeEmail(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// PASSWORD RESET — fully custom, bypasses Firebase's oobCode/hosted page
-// entirely so the whole flow (and auto-login afterward) stays on our domain.
+// PASSWORD RESET
 // ════════════════════════════════════════════════════════════════════════════
-const PASSWORD_RESET_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
+const PASSWORD_RESET_TOKEN_TTL_MS = 60 * 60 * 1000;
 
 function getResend() {
     if (!process.env.RESEND_API_KEY) throw new Error('Missing RESEND_API_KEY env var.');
     return new Resend(process.env.RESEND_API_KEY);
 }
 
-// POST /api/password-reset/request  { email, origin }
 async function handlePasswordResetRequest(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
     const { email, origin } = req.body || {};
@@ -4796,14 +4918,12 @@ async function handlePasswordResetRequest(req, res) {
             html: `
                 <div style="max-width: 520px; margin: 0 auto; font-family: 'Google Sans Flex', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #0f172a; background-color: #ffffff; border: 1px solid #e2e8f0; border-radius: 20px; padding: 40px 36px; box-shadow: 0 10px 25px -5px rgba(15, 23, 42, 0.05); box-sizing: border-box;">
 
-  <!-- Mebor AI Brand Header -->
   <div style="display: flex; align-items: center; margin-bottom: 28px;">
     <span style="margin-left: 12px; font-size: 22px; font-weight: 800; color: #0f172a; letter-spacing: -0.5px;">
       Mebor<span style="color: #5b3df5;"> AI</span>
     </span>
   </div>
 
-  <!-- Title & Description -->
   <h2 style="margin: 0 0 16px 0; font-size: 24px; font-weight: 700; color: #0f172a; letter-spacing: -0.3px; line-height: 1.3;">
     Reset your password
   </h2>
@@ -4815,21 +4935,18 @@ async function handlePasswordResetRequest(req, res) {
     </span>.
   </p>
 
-  <!-- Action Button -->
   <div style="text-align: center; margin-bottom: 28px;">
     <a href="${resetLink}" target="_blank" style="display: inline-block; padding: 14px 32px; background: linear-gradient(135deg, #5b3df5 0%, #7c3aed 100%); color: #ffffff; text-decoration: none; font-weight: 700; font-size: 15px; border-radius: 100px; box-shadow: 0 6px 20px rgba(91, 61, 245, 0.35); letter-spacing: 0.2px;">
       Reset Password &rarr;
     </a>
   </div>
 
-  <!-- Security Notice -->
   <div style="background-color: #f8fafc; border-left: 4px solid #5b3df5; border-radius: 8px; padding: 14px 16px; margin-bottom: 24px;">
     <p style="margin: 0; font-size: 13px; line-height: 1.5; color: #64748b;">
       <strong style="color: #0f172a; font-weight: 600;">Security Note:</strong> This reset link will expire in <strong style="color: #5b3df5;">1 hour</strong>. If you did not request a password reset, no action is required and you can safely ignore this email.
     </p>
   </div>
 
-  <!-- Fallback Link Area -->
   <div style="border-top: 1px solid #f1f5f9; padding-top: 20px;">
     <p style="margin: 0 0 8px 0; font-size: 12px; color: #94a3b8; line-height: 1.4;">
       Having trouble with the button? Copy and paste this link into your web browser:
@@ -4851,7 +4968,6 @@ async function handlePasswordResetRequest(req, res) {
     }
 }
 
-// GET /api/password-reset/verify?token=...
 async function handlePasswordResetVerify(req, res) {
     const { token } = req.query;
     if (!token) return res.status(400).json({ success: false, message: 'Missing token.' });
@@ -4874,7 +4990,6 @@ async function handlePasswordResetVerify(req, res) {
     }
 }
 
-// POST /api/password-reset/confirm  { token, newPassword }
 async function handlePasswordResetConfirm(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
     const { token, newPassword } = req.body || {};
@@ -4885,8 +5000,6 @@ async function handlePasswordResetConfirm(req, res) {
         const db = getDb();
         const tokenRef = db.collection('password_reset_tokens').doc(token);
 
-        // Transaction guards against the same token being redeemed twice
-        // (e.g. a double-click or the request firing twice in flight).
         const result = await db.runTransaction(async (tx) => {
             const snap = await tx.get(tokenRef);
             if (!snap.exists) return { success: false, message: 'This reset link is invalid.' };
@@ -4920,7 +5033,6 @@ async function getCalendarTimezone(accessToken) {
     } catch { return 'UTC'; }
 }
 
-// ── Multi-account Google Calendar helpers ──────────────────────────────────
 async function getGoogleCalendarAccounts(db, ownerEmail) {
     if (!ownerEmail) return [];
     const snap = await db.collection('users').doc(ownerEmail).get();
