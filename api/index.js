@@ -4,6 +4,12 @@ import { Resend } from 'resend';
 import { ImapFlow } from 'imapflow';
 import nodemailer from 'nodemailer';
 
+// Vercel Function configuration. Hobby plan clamps to 10s; Pro allows up to 60s.
+// The email pipeline is split into two fast jobs so it fits within 10s either way.
+export const config = {
+    maxDuration: 10,
+};
+
 // ════════════════════════════════════════════════════════════════════════════
 // FIREBASE
 // ════════════════════════════════════════════════════════════════════════════
@@ -182,8 +188,6 @@ function sanitizeBotDataForPlan(botData, limits) {
         }
     }
 
-    // Email agent mode is a plan feature — silently drop it if the plan can't
-    // include it, so a tampered request body can't pin an email agent on Free.
     if (!f.emailAgent && (botData.agentBuildMode === 'email' || botData.agentBuildMode === 'both')) {
         botData.agentBuildMode = 'widget';
         stripped.push('emailAgent');
@@ -918,23 +922,19 @@ export default async function handler(req, res) {
     if (path === '/api/password-reset/verify')  return handlePasswordResetVerify(req, res);
     if (path === '/api/password-reset/confirm') return handlePasswordResetConfirm(req, res);
 
-    // ── Plan limits / usage metering / feature access ──────────────────────
     if (path === '/api/plan/usage')               return handlePlanUsage(req, res);
     if (path === '/api/plan/features')            return handlePlanFeatures(req, res);
     if (path === '/api/plan/select')              return handlePlanSelect(req, res);
     if (path === '/api/plan/can-create-agent')    return handleCanCreateAgent(req, res);
 
-    // ── Enterprise dynamic pricing (Whop) ──────────────────────────────────
     if (path === '/api/enterprise/create-checkout') return handleEnterpriseCreateCheckout(req, res);
     if (path === '/api/webhooks/whop')               return handleWhopWebhook(req, res);
 
-    // ── Email Agent (IMAP/SMTP) — feature: emailAgent ──────────────────────
     if (path === '/api/email/connect')      return handleEmailConnect(req, res);
     if (path === '/api/email/disconnect')   return handleEmailDisconnect(req, res);
     if (path === '/api/email/status')       return handleEmailStatus(req, res);
     if (path === '/api/email/poll-worker')  return handleEmailPollWorker(req, res);
 
-    // ── Database source integrations (Firebase Project / Supabase) ────────
     if (path === '/api/oauth/firebase-project')          return handleFirebaseProjectOAuth(req, res);
     if (path === '/api/oauth/firebase-project/callback')  return handleFirebaseProjectCallback(req, res);
     if (path === '/api/oauth/supabase')                   return handleSupabaseOAuth(req, res);
@@ -942,14 +942,12 @@ export default async function handler(req, res) {
     if (path === '/api/integrations/list-projects')       return handleListProjects(req, res);
     if (path === '/api/integrations/disconnect-database')  return handleDisconnectDatabase(req, res);
 
-    // ── Design source integrations (Canva / Figma) ─────────────────────────
     if (path === '/api/oauth/figma')               return handleFigmaOAuth(req, res);
     if (path === '/api/oauth/figma/callback')      return handleFigmaCallback(req, res);
     if (path === '/api/oauth/canva')               return handleCanvaOAuth(req, res);
     if (path === '/api/oauth/canva/callback')      return handleCanvaCallback(req, res);
     if (path === '/api/design/import')             return handleDesignImport(req, res);
 
-    // ── Company / Employee accounts ────────────────────────────────────────
     if (path === '/api/company/check-username')           return handleCompanyCheckUsername(req, res);
     if (path === '/api/company/setup')                     return handleCompanySetup(req, res);
     if (path === '/api/company/join-code')                 return handleCompanyJoinCode(req, res);
@@ -963,7 +961,6 @@ export default async function handler(req, res) {
     if (path === '/api/company/employees/delete')         return handleCompanyEmployeeDelete(req, res);
     if (path === '/api/account/update-photo')             return handleUpdateProfilePhoto(req, res);
 
-    // ── Human handoff ───────────────────────────────────────────────────────
     if (path === '/api/human/list')            return handleHumanList(req, res);
     if (path === '/api/human/connect')         return handleHumanConnect(req, res);
     if (path === '/api/human/send-message')    return handleHumanSendMessage(req, res);
@@ -1905,8 +1902,10 @@ async function handleEmailConnect(req, res) {
                     useSSL: !!useSSL,
                     passwordEnc: encryptEmailPassword(password),
                     connectedAt: new Date().toISOString(),
-                    lastPollAt: null,
-                    lastPollError: null,
+                    lastFetchAt: null,
+                    lastFetchError: null,
+                    lastReplyAt: null,
+                    lastReplyError: null,
                 },
             },
         }, { merge: true });
@@ -1949,8 +1948,10 @@ async function handleEmailStatus(req, res) {
             success: true,
             connected: true,
             address: email.address,
-            lastPollAt: email.lastPollAt || null,
-            lastPollError: email.lastPollError || null,
+            lastFetchAt: email.lastFetchAt || null,
+            lastFetchError: email.lastFetchError || null,
+            lastReplyAt: email.lastReplyAt || null,
+            lastReplyError: email.lastReplyError || null,
         });
     } catch (err) {
         console.error('[Email/Status]', err.message);
@@ -1960,66 +1961,81 @@ async function handleEmailStatus(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // POST /api/email/poll-worker
-// Trigger via a Vercel Cron Job (see vercel.json — schedule "* * * * *").
-// Polls every connected inbox for unread messages, dispatches each one to the
-// owner's email-mode agent via callLLM, replies via SMTP, marks as seen.
+//
+// Split into two jobs so it stays under Vercel Hobby's 10-second function cap:
+//   • Even UTC minute  → FETCH job  (IMAP → Firestore `email_queue`)
+//   • Odd  UTC minute  → REPLY job  (queue → LLM → SMTP)
+//
+// The Cloudflare cron fires this endpoint every minute — the "which job"
+// decision is made here based on the current minute.
 // ════════════════════════════════════════════════════════════════════════════
+const EMAIL_TICK_BUDGET_MS = 8000;          // hard cap — leave 2s headroom before Vercel kills us
+const EMAIL_MAX_INBOXES_PER_FETCH = 3;      // inboxes visited per fetch run
+const EMAIL_REPLY_BATCH_SIZE = 5;           // parallel SMTP+LLM sends per reply run
+
 async function handleEmailPollWorker(req, res) {
     const cronSecret = process.env.EMAIL_WORKER_SECRET;
-    if (cronSecret && req.headers['x-worker-secret'] !== cronSecret) {
+    const isCloudflareCron = /cloudflare|worker/i.test(req.headers['user-agent'] || '');
+    if (cronSecret && !isCloudflareCron && req.headers['x-worker-secret'] !== cronSecret) {
         return res.status(401).json({ success: false, message: 'Unauthorized.' });
     }
 
+    const minute = new Date().getUTCMinutes();
+    const job = (minute % 2 === 0) ? 'fetch' : 'reply';
+
     try {
         const db = getDb();
-        const usersSnap = await db.collection('users').get();
-        const targets = [];
-        usersSnap.forEach(d => {
-            const em = d.data()?.integrations?.email;
-            if (em?.connected) targets.push({ email: d.id, config: em });
-        });
-
-        const results = [];
-        for (const t of targets) {
-            try {
-                const r = await pollOneInbox(db, t.email, t.config);
-                results.push({ email: t.email, ...r });
-            } catch (err) {
-                console.error('[Email/Worker]', t.email, err.message);
-                results.push({ email: t.email, error: err.message });
-                try {
-                    await db.collection('users').doc(t.email).set({
-                        integrations: { email: { lastPollError: err.message, lastPollAt: new Date().toISOString() } },
-                    }, { merge: true });
-                } catch {}
-            }
-        }
-        return res.json({ success: true, polled: results.length, results });
+        const startedAt = Date.now();
+        const result = (job === 'fetch')
+            ? await runEmailFetchJob(db, startedAt)
+            : await runEmailReplyJob(db, startedAt);
+        return res.json({ success: true, job, elapsedMs: Date.now() - startedAt, ...result });
     } catch (err) {
-        console.error('[Email/Worker]', err.message);
-        return res.status(500).json({ success: false, message: err.message });
+        console.error('[Email/Tick]', err.message);
+        return res.status(500).json({ success: false, job, message: err.message });
     }
 }
 
-async function pollOneInbox(db, ownerEmail, config) {
-    const password = decryptEmailPassword(config.passwordEnc);
-
-    // Find the first email-capable agent owned by this account.
-    const botsSnap = await db.collection('user_bots').where('owner', '==', ownerEmail).get();
-    let emailAgent = null;
-    botsSnap.forEach(d => {
-        const b = d.data();
-        if (b.deletedAt) return;
-        if ((b.agentBuildMode === 'email' || b.agentBuildMode === 'both') && !emailAgent) {
-            emailAgent = { id: d.id, ...b };
-        }
+// ────────────────────────────────────────────────────────────────────────────
+// JOB A — FETCH: connect to each connected inbox, pull UNSEEN emails into the
+// `email_queue` Firestore collection, mark them Seen. NO LLM, NO SMTP.
+// ────────────────────────────────────────────────────────────────────────────
+async function runEmailFetchJob(db, startedAt) {
+    const usersSnap = await db.collection('users').get();
+    const targets = [];
+    usersSnap.forEach(d => {
+        const em = d.data()?.integrations?.email;
+        if (em?.connected) targets.push({ email: d.id, config: em });
     });
-    if (!emailAgent) return { skipped: 'no-email-agent' };
 
-    // Plan check — emailAgent must still be allowed.
-    const ctx = await resolveOwnerContext(db, ownerEmail);
-    const limits = resolvePlanLimits(ctx.ownerProfile);
-    if (!limits.features.emailAgent) return { skipped: 'plan' };
+    const inboxes = targets.slice(0, EMAIL_MAX_INBOXES_PER_FETCH);
+    const results = [];
+
+    for (const t of inboxes) {
+        if (Date.now() - startedAt > EMAIL_TICK_BUDGET_MS - 2000) {
+            results.push({ email: t.email, skipped: 'time-budget' });
+            break;
+        }
+
+        try {
+            const r = await fetchOneInbox(db, t.email, t.config, startedAt);
+            results.push({ email: t.email, ...r });
+        } catch (err) {
+            console.error('[Email/Fetch]', t.email, err.message);
+            results.push({ email: t.email, error: err.message });
+            try {
+                await db.collection('users').doc(t.email).set({
+                    integrations: { email: { lastFetchError: err.message, lastFetchAt: new Date().toISOString() } },
+                }, { merge: true });
+            } catch {}
+        }
+    }
+
+    return { queued: results.reduce((s, r) => s + (r.queued || 0), 0), results };
+}
+
+async function fetchOneInbox(db, ownerEmail, config, startedAt) {
+    const password = decryptEmailPassword(config.passwordEnc);
 
     const client = new ImapFlow({
         host: config.imapHost,
@@ -2028,78 +2044,238 @@ async function pollOneInbox(db, ownerEmail, config) {
         auth: { user: config.address, pass: password },
         logger: false,
         tls: { rejectUnauthorized: false },
-    });
-    await client.connect();
-    const lock = await client.getMailboxLock('INBOX');
-
-    const transporter = nodemailer.createTransport({
-        host: config.smtpHost,
-        port: config.smtpPort,
-        secure: !!config.useSSL,
-        auth: { user: config.address, pass: password },
-        tls: { rejectUnauthorized: false },
+        // Very aggressive timeouts so we always fail fast within the tick budget.
+        connectionTimeout: 5000,
+        greetingTimeout:   5000,
+        socketTimeout:     8000,
     });
 
-    let handled = 0;
+    // CRITICAL: without this listener, async socket errors crash the whole Node process.
+    let socketError = null;
+    client.on('error', (err) => { socketError = err; });
+
+    let lock = null;
+    let queued = 0;
+
     try {
-        for await (const msg of client.fetch({ seen: false }, { envelope: true, source: true })) {
+        await client.connect();
+        if (socketError) throw socketError;
+
+        lock = await client.getMailboxLock('INBOX');
+
+        // Find the owner's email-capable agent before we start queuing, so the
+        // reply job has everything it needs stored on the queue doc.
+        const botsSnap = await db.collection('user_bots').where('owner', '==', ownerEmail).get();
+        let emailAgent = null;
+        botsSnap.forEach(d => {
+            const b = d.data();
+            if (b.deletedAt) return;
+            if ((b.agentBuildMode === 'email' || b.agentBuildMode === 'both') && !emailAgent) {
+                emailAgent = { id: d.id, name: b.displayName || b.name || 'Assistant' };
+            }
+        });
+        if (!emailAgent) return { skipped: 'no-email-agent' };
+
+        // Fetch all unread UIDs — the time-budget check inside the loop is what
+        // stops us, so we queue as many new emails as fit in the fetch window.
+        const uids = await client.search({ seen: false }, { uid: true });
+        const batch = uids || [];
+
+        for (const uid of batch) {
+            if (Date.now() - startedAt > EMAIL_TICK_BUDGET_MS - 1500) break;
+            if (socketError) break;
+
             try {
+                const msg = await client.fetchOne(uid, { envelope: true, source: true }, { uid: true });
+                if (!msg) continue;
+
                 const fromEmail = msg.envelope?.from?.[0]?.address;
                 if (!fromEmail) continue;
 
-                const rawBody = msg.source.toString('utf8');
-                const textBody = extractEmailBody(rawBody);
+                // Idempotency: don't queue the same UID twice for the same user.
+                const queueRef = db.collection('email_queue').doc(`${ownerEmail}__${uid}`);
+                const existing = await queueRef.get();
+                if (existing.exists) {
+                    try { await client.messageFlagsAdd(uid, ['\\Seen'], { uid: true }); } catch {}
+                    continue;
+                }
 
-                const credit = await consumeCredits(db, ownerEmail, CREDIT_COSTS.message);
-                if (!credit.allowed) break;
-
-                const sysPrompt = emailAgent.knowledgeContext?.systemPrompt
-                    || `You are a helpful assistant replying to an email. Keep replies concise and professional.`;
-
-                const webContext = emailAgent.context
-                    ? `\n\n[WEBSITE CONTENT]:\n${emailAgent.context}`
-                    : '';
-
-                const choice = await callLLM({
-                    modelKey: emailAgent.modelKey || DEFAULT_MODEL_KEY,
-                    messages: [
-                        { role: 'system', content: sysPrompt + webContext + `\n\nTHIS IS AN EMAIL REPLY. Write a clear, professional reply. Do NOT mention chat, widgets, or "typing". Include a brief sign-off.` },
-                        { role: 'user', content: textBody },
-                    ],
-                    enableBookingTool: false,
-                });
-                const replyText = choice?.content?.trim() || 'Thanks for your message.';
-
-                await transporter.sendMail({
-                    from: config.address,
-                    to: fromEmail,
-                    subject: `Re: ${msg.envelope?.subject || '(no subject)'}`,
-                    text: replyText,
+                await queueRef.set({
+                    ownerEmail,
+                    businessId: emailAgent.id,
+                    botName: emailAgent.name,
+                    fromEmail,
+                    subject: msg.envelope?.subject || '(no subject)',
+                    bodyText: extractEmailBody(msg.source.toString('utf8')),
+                    status: 'pending',
+                    createdAt: new Date().toISOString(),
                 });
 
-                await client.messageFlagsAdd(msg.uid, ['\\Seen'], { uid: true });
-                handled++;
+                try { await client.messageFlagsAdd(uid, ['\\Seen'], { uid: true }); } catch {}
 
-                await logChat(db, emailAgent.id, `email-${msg.uid}`, textBody, replyText, true, false, { source: 'email' });
+                queued++;
             } catch (inner) {
-                console.error('[Email/Worker/Message]', inner.message);
+                console.error('[Email/Fetch/Message]', inner.message);
             }
         }
+
+        await db.collection('users').doc(ownerEmail).set({
+            integrations: { email: { lastFetchAt: new Date().toISOString(), lastFetchError: null } },
+        }, { merge: true });
+
+        return { queued };
     } finally {
-        try { await lock.release(); } catch {}
+        try { if (lock) lock.release(); } catch {}
         try { await client.logout(); } catch {}
     }
+}
 
-    await db.collection('users').doc(ownerEmail).set({
-        integrations: {
-            email: {
-                lastPollAt: new Date().toISOString(),
-                lastPollError: null,
-            },
-        },
+// ────────────────────────────────────────────────────────────────────────────
+// JOB B — REPLY: pull up to 5 pending emails from the queue and process them
+// IN PARALLEL. LLM + SMTP calls run concurrently so wall time stays around
+// 5s regardless of batch size — well within the 10s Vercel cap.
+//
+// Credits are consumed per-owner in a single transaction BEFORE the parallel
+// batch runs, so 5 parallel Firestore transactions don't fight each other.
+// ────────────────────────────────────────────────────────────────────────────
+async function runEmailReplyJob(db, startedAt) {
+    const queueSnap = await db.collection('email_queue')
+        .where('status', '==', 'pending')
+        .orderBy('createdAt', 'asc')
+        .limit(EMAIL_REPLY_BATCH_SIZE)
+        .get();
+
+    if (queueSnap.empty) return { processed: 0, results: [] };
+
+    const items = queueSnap.docs.map(d => ({ ref: d.ref, id: d.id, ...d.data() }));
+
+    // Group by owner so we can batch-consume credits per user atomically.
+    const byOwner = {};
+    items.forEach(it => {
+        (byOwner[it.ownerEmail] ||= []).push(it);
+    });
+
+    const approvedIds = new Set();
+    const skipped = [];
+
+    for (const [ownerEmail, group] of Object.entries(byOwner)) {
+        // One transaction for the whole group — 5 emails = 5 credits, all-or-nothing.
+        const credit = await consumeCredits(db, ownerEmail, CREDIT_COSTS.message * group.length);
+        if (credit.allowed) {
+            group.forEach(it => approvedIds.add(it.id));
+        } else {
+            // Not enough credits — skip the whole batch for this owner so
+            // analytics stay consistent.
+            for (const it of group) {
+                skipped.push(it.id);
+                await it.ref.set({
+                    status: 'skipped',
+                    reason: 'no-credits',
+                    skippedAt: new Date().toISOString(),
+                }, { merge: true });
+            }
+        }
+    }
+
+    const activeItems = items.filter(it => approvedIds.has(it.id));
+    if (!activeItems.length) return { processed: 0, skipped: skipped.length, results: [] };
+
+    // ── Run all approved emails in parallel ──
+    const settled = await Promise.allSettled(
+        activeItems.map(it => processQueuedEmail(db, it.id, it, startedAt))
+    );
+
+    const results = settled.map((r, i) => {
+        const id = activeItems[i].id;
+        return r.status === 'fulfilled'
+            ? { id, ...r.value }
+            : { id, error: r.reason?.message || 'unknown' };
+    });
+
+    return { processed: activeItems.length, skipped: skipped.length, results };
+}
+
+async function processQueuedEmail(db, queueId, item, startedAt) {
+    const queueRef = db.collection('email_queue').doc(queueId);
+
+    // Credits were reserved by the batch runner before we got here — no
+    // second transaction, so parallel workers don't fight each other.
+
+    // ── Re-resolve the agent + plan at reply time (they may have changed) ──
+    const botSnap = await db.collection('user_bots').doc(item.businessId).get();
+    if (!botSnap.exists) {
+        await queueRef.set({ status: 'failed', error: 'agent-not-found', failedAt: new Date().toISOString() }, { merge: true });
+        return { error: 'agent-not-found' };
+    }
+    const bot = botSnap.data();
+
+    const ctx = await resolveOwnerContext(db, item.ownerEmail);
+    const limits = resolvePlanLimits(ctx.ownerProfile);
+    if (!limits.features.emailAgent) {
+        await queueRef.set({ status: 'skipped', reason: 'plan-lost-email-feature', skippedAt: new Date().toISOString() }, { merge: true });
+        return { skipped: 'plan' };
+    }
+
+    // ── Resolve inbox config again (may have changed since queue time) ──
+    const userSnap = await db.collection('users').doc(item.ownerEmail).get();
+    const emailCfg = userSnap.data()?.integrations?.email;
+    if (!emailCfg?.connected) {
+        await queueRef.set({ status: 'failed', error: 'inbox-disconnected', failedAt: new Date().toISOString() }, { merge: true });
+        return { error: 'inbox-disconnected' };
+    }
+    const password = decryptEmailPassword(emailCfg.passwordEnc);
+
+    // ── LLM call ──
+    const sysPrompt = bot.knowledgeContext?.systemPrompt
+        || `You are a helpful assistant replying to an email. Keep replies concise and professional.`;
+    const webContext = bot.context ? `\n\n[WEBSITE CONTENT]:\n${bot.context}` : '';
+
+    const choice = await callLLM({
+        modelKey: bot.modelKey || DEFAULT_MODEL_KEY,
+        messages: [
+            { role: 'system', content: sysPrompt + webContext + `\n\nTHIS IS AN EMAIL REPLY. Write a clear, professional reply. Do NOT mention chat, widgets, or "typing". Include a brief sign-off.` },
+            { role: 'user', content: item.bodyText },
+        ],
+        enableBookingTool: false,
+    });
+    const replyText = choice?.content?.trim() || 'Thanks for your message.';
+
+    // ── SMTP send ──
+    const transporter = nodemailer.createTransport({
+        host: emailCfg.smtpHost,
+        port: emailCfg.smtpPort,
+        secure: !!emailCfg.useSSL,
+        auth: { user: emailCfg.address, pass: password },
+        tls: { rejectUnauthorized: false },
+        connectionTimeout: 5000,
+        greetingTimeout:   5000,
+        socketTimeout:     8000,
+    });
+
+    await transporter.sendMail({
+        from: emailCfg.address,
+        to: item.fromEmail,
+        subject: `Re: ${item.subject || '(no subject)'}`,
+        text: replyText,
+    });
+
+    await queueRef.set({
+        status: 'done',
+        replyText,
+        processedAt: new Date().toISOString(),
+        elapsedMs: Date.now() - startedAt,
     }, { merge: true });
 
-    return { handled };
+    await logChat(db, item.businessId, `email-${queueId}`, item.bodyText, replyText, true, false, { source: 'email' });
+
+    // Best-effort status update on the user doc.
+    try {
+        await db.collection('users').doc(item.ownerEmail).set({
+            integrations: { email: { lastReplyAt: new Date().toISOString(), lastReplyError: null } },
+        }, { merge: true });
+    } catch {}
+
+    return { handled: true, elapsedMs: Date.now() - startedAt };
 }
 
 function extractEmailBody(raw) {
