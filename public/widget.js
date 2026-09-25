@@ -76,12 +76,15 @@
             bot:  { showTime: true, copy: true, regenerate: true, report: true }
         }
     };
-
     try {
         const r = await fetch(`https://comex-backend.vercel.app/api/config?businessId=${encodeURIComponent(businessId)}`);
         if (r.ok) {
             const result = await r.json();
             if (result.success) {
+                // ── Email-only agent: do not render the widget on the website ──
+                if (result.agentBuildMode === 'email') {
+                    return;
+                }
                 config.name        = result.name        || config.name;
                 config.position    = result.position    || config.position;
                 config.logoBase64  = result.logoBase64  || config.logoBase64;
