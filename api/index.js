@@ -935,6 +935,12 @@ export default async function handler(req, res) {
     if (path === '/api/email/status')       return handleEmailStatus(req, res);
     if (path === '/api/email/poll-worker')  return handleEmailPollWorker(req, res);
 
+    // ── NEW: Email approval / dashboard endpoints ──
+    if (path === '/api/email/pending')       return handleEmailPending(req, res);
+    if (path === '/api/email/approve')       return handleEmailApprove(req, res);
+    if (path === '/api/email/reject')        return handleEmailReject(req, res);
+    if (path === '/api/email/agent-stats')   return handleEmailAgentStats(req, res);
+
     if (path === '/api/oauth/firebase-project')          return handleFirebaseProjectOAuth(req, res);
     if (path === '/api/oauth/firebase-project/callback')  return handleFirebaseProjectCallback(req, res);
     if (path === '/api/oauth/supabase')                   return handleSupabaseOAuth(req, res);
@@ -1676,6 +1682,10 @@ async function wipeBotCompletely(db, botId) {
     await deleteQueryBatch(db, db.collection('reports').where('businessId', '==', botId));
     await deleteQueryBatch(db, db.collection('leads').where('businessId', '==', botId));
 
+    // Clean up email drafts + queued email for this agent
+    await deleteQueryBatch(db, db.collection('email_drafts').where('businessId', '==', botId));
+    await deleteQueryBatch(db, db.collection('email_queue').where('businessId', '==', botId));
+
     await botRef.delete().catch(() => {});
 }
 
@@ -1764,6 +1774,8 @@ async function handleAccountDeleteCascade(req, res) {
         await deleteQueryBatch(db, db.collection('appointments').where('owner', '==', email));
         await deleteQueryBatch(db, db.collection('reports').where('owner', '==', email));
         await deleteQueryBatch(db, db.collection('leads').where('owner', '==', email));
+        await deleteQueryBatch(db, db.collection('email_drafts').where('ownerEmail', '==', email));
+        await deleteQueryBatch(db, db.collection('email_queue').where('ownerEmail', '==', email));
 
         await db.collection('users').doc(email).delete().catch(() => {});
 
@@ -1849,6 +1861,39 @@ async function testSmtpLogin({ host, port, useSSL, address, password }) {
     }
 }
 
+// Shared helper: sends an outbound email through the owner's connected inbox
+async function sendEmailViaSMTP(emailCfg, password, { to, subject, text }) {
+    const transporter = nodemailer.createTransport({
+        host: emailCfg.smtpHost,
+        port: emailCfg.smtpPort,
+        secure: !!emailCfg.useSSL,
+        auth: { user: emailCfg.address, pass: password },
+        tls: { rejectUnauthorized: false },
+        connectionTimeout: 5000,
+        greetingTimeout:   5000,
+        socketTimeout:     8000,
+    });
+    return transporter.sendMail({
+        from: emailCfg.address,
+        to,
+        subject,
+        text,
+    });
+}
+
+// Parse the "DD:HH:MM" auto-send delay string into milliseconds.
+// Defaults to 2 minutes when missing/invalid.
+function parseAutoSendDelay(delayStr) {
+    const s = String(delayStr || '').trim();
+    const m = s.match(/^(\d{1,3}):(\d{2}):(\d{2})$/);
+    if (!m) return 2 * 60 * 1000;
+    const days  = parseInt(m[1], 10);
+    const hours = parseInt(m[2], 10);
+    const mins  = parseInt(m[3], 10);
+    const totalMinutes = ((days * 24 + hours) * 60 + mins);
+    return totalMinutes * 60 * 1000;
+}
+
 // POST /api/email/connect
 async function handleEmailConnect(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -1928,6 +1973,22 @@ async function handleEmailDisconnect(req, res) {
         await db.collection('users').doc(ownerEmail).set({
             integrations: { email: null },
         }, { merge: true });
+
+        // Clear any dangling pending/scheduled drafts so the dashboard doesn't
+        // show orphans after the inbox is gone.
+        try {
+            const draftsSnap = await db.collection('email_drafts')
+                .where('ownerEmail', '==', ownerEmail)
+                .where('status', 'in', ['pending', 'scheduled'])
+                .get();
+            const batch = db.batch();
+            draftsSnap.docs.forEach(d => batch.update(d.ref, {
+                status: 'abandoned',
+                abandonedAt: new Date().toISOString(),
+            }));
+            if (!draftsSnap.empty) await batch.commit();
+        } catch (e) { console.warn('[Email/Disconnect/Drafts]', e.message); }
+
         return res.json({ success: true, message: 'Inbox disconnected.' });
     } catch (err) {
         console.error('[Email/Disconnect]', err.message);
@@ -1960,18 +2021,227 @@ async function handleEmailStatus(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// EMAIL DASHBOARD ENDPOINTS (pending / approve / reject / stats)
+// ════════════════════════════════════════════════════════════════════════════
+
+// GET /api/email/pending?ownerEmail=
+async function handleEmailPending(req, res) {
+    const { ownerEmail } = req.query;
+    if (!ownerEmail) return res.status(400).json({ success: false, message: 'Missing ownerEmail.' });
+    try {
+        const db = getDb();
+        const snap = await db.collection('email_drafts')
+            .where('ownerEmail', '==', ownerEmail)
+            .where('status', '==', 'pending')
+            .get();
+
+        const pending = [];
+        snap.forEach(d => pending.push({ id: d.id, ...d.data() }));
+
+        // Newest first
+        pending.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+
+        return res.json({ success: true, pending });
+    } catch (err) {
+        console.error('[Email/Pending]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// POST /api/email/approve  { draftId, businessId?, ownerEmail, finalResponse }
+async function handleEmailApprove(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { draftId, ownerEmail, finalResponse } = req.body || {};
+    if (!draftId || !ownerEmail || !finalResponse) {
+        return res.status(400).json({ success: false, message: 'Missing draftId, ownerEmail, or finalResponse.' });
+    }
+
+    try {
+        const db = getDb();
+        const draftRef = db.collection('email_drafts').doc(draftId);
+        const draftSnap = await draftRef.get();
+        if (!draftSnap.exists) return res.status(404).json({ success: false, message: 'Draft not found.' });
+
+        const draft = draftSnap.data();
+        if (draft.ownerEmail !== ownerEmail) {
+            return res.status(403).json({ success: false, message: 'You do not own this draft.' });
+        }
+        if (draft.status !== 'pending') {
+            return res.status(409).json({ success: false, message: `This draft is already ${draft.status}.` });
+        }
+
+        // Load inbox config
+        const userSnap = await db.collection('users').doc(ownerEmail).get();
+        const emailCfg = userSnap.data()?.integrations?.email;
+        if (!emailCfg?.connected) {
+            return res.status(400).json({ success: false, message: 'Your email inbox is disconnected. Reconnect it before approving.' });
+        }
+        const password = decryptEmailPassword(emailCfg.passwordEnc);
+
+        // Send via SMTP
+        await sendEmailViaSMTP(emailCfg, password, {
+            to: draft.fromEmail,
+            subject: `Re: ${draft.subject || '(no subject)'}`,
+            text: finalResponse,
+        });
+
+        // Mark as sent
+        const now = new Date().toISOString();
+        await draftRef.set({
+            status: 'sent',
+            finalResponse,
+            approvedAt: now,
+            sentAt: now,
+            approvedBy: ownerEmail,
+        }, { merge: true });
+
+        // Also mark the corresponding queue item as done, if it exists
+        if (draft.queueId) {
+            try {
+                await db.collection('email_queue').doc(draft.queueId).set({
+                    status: 'done',
+                    replyText: finalResponse,
+                    processedAt: now,
+                    approvedBy: ownerEmail,
+                }, { merge: true });
+            } catch (e) { /* best-effort */ }
+        }
+
+        // Log it in the agent's chat history for analytics
+        if (draft.businessId) {
+            await logChat(db, draft.businessId, `email-${draftId}`, draft.originalQuery || '', finalResponse, true, false, { source: 'email' });
+        }
+
+        // Best-effort status update on the user doc
+        try {
+            await db.collection('users').doc(ownerEmail).set({
+                integrations: { email: { lastReplyAt: now, lastReplyError: null } },
+            }, { merge: true });
+        } catch {}
+
+        return res.json({ success: true, message: 'Reply approved and sent.' });
+    } catch (err) {
+        console.error('[Email/Approve]', err.message);
+
+        // Try to persist the failure so the dashboard can surface it
+        try {
+            if (req.body?.draftId) {
+                await getDb().collection('email_drafts').doc(req.body.draftId).set({
+                    status: 'failed',
+                    error: err.message,
+                    failedAt: new Date().toISOString(),
+                }, { merge: true });
+            }
+        } catch {}
+
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// POST /api/email/reject  { draftId, ownerEmail }
+async function handleEmailReject(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { draftId, ownerEmail } = req.body || {};
+    if (!draftId || !ownerEmail) {
+        return res.status(400).json({ success: false, message: 'Missing draftId or ownerEmail.' });
+    }
+
+    try {
+        const db = getDb();
+        const draftRef = db.collection('email_drafts').doc(draftId);
+        const snap = await draftRef.get();
+        if (!snap.exists) return res.status(404).json({ success: false, message: 'Draft not found.' });
+
+        const draft = snap.data();
+        if (draft.ownerEmail !== ownerEmail) {
+            return res.status(403).json({ success: false, message: 'You do not own this draft.' });
+        }
+        if (draft.status !== 'pending') {
+            return res.status(409).json({ success: false, message: `This draft is already ${draft.status}.` });
+        }
+
+        const now = new Date().toISOString();
+        await draftRef.set({
+            status: 'rejected',
+            rejectedAt: now,
+            rejectedBy: ownerEmail,
+        }, { merge: true });
+
+        // Mark queue item so it doesn't get picked up again
+        if (draft.queueId) {
+            try {
+                await db.collection('email_queue').doc(draft.queueId).set({
+                    status: 'rejected',
+                    rejectedAt: now,
+                }, { merge: true });
+            } catch (e) { /* best-effort */ }
+        }
+
+        return res.json({ success: true });
+    } catch (err) {
+        console.error('[Email/Reject]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// GET /api/email/agent-stats?businessId=&ownerEmail=
+async function handleEmailAgentStats(req, res) {
+    const { businessId, ownerEmail } = req.query;
+    if (!businessId || !ownerEmail) {
+        return res.status(400).json({ success: false, message: 'Missing businessId or ownerEmail.' });
+    }
+    try {
+        const db = getDb();
+
+        // Verify ownership
+        const botSnap = await db.collection('user_bots').doc(businessId).get();
+        if (!botSnap.exists) return res.status(404).json({ success: false, message: 'Agent not found.' });
+        if (botSnap.data()?.owner !== ownerEmail) {
+            return res.status(403).json({ success: false, message: 'You do not own this agent.' });
+        }
+
+        // Pending = drafts waiting for approval
+        // Sent = drafts that were sent (approved) — auto-sent ones counted via queue below
+        const [pendingSnap, sentSnap, queueSentSnap] = await Promise.all([
+            db.collection('email_drafts')
+                .where('businessId', '==', businessId)
+                .where('status', '==', 'pending')
+                .get(),
+            db.collection('email_drafts')
+                .where('businessId', '==', businessId)
+                .where('status', '==', 'sent')
+                .get(),
+            db.collection('email_queue')
+                .where('businessId', '==', businessId)
+                .where('status', '==', 'done')
+                .get(),
+        ]);
+
+        return res.json({
+            success: true,
+            pending: pendingSnap.size,
+            sent: sentSnap.size + queueSentSnap.size,
+        });
+    } catch (err) {
+        console.error('[Email/AgentStats]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // POST /api/email/poll-worker
 //
 // Split into two jobs so it stays under Vercel Hobby's 10-second function cap:
 //   • Even UTC minute  → FETCH job  (IMAP → Firestore `email_queue`)
-//   • Odd  UTC minute  → REPLY job  (queue → LLM → SMTP)
+//   • Odd  UTC minute  → REPLY job  (queue → LLM → SMTP or email_drafts)
 //
-// The Cloudflare cron fires this endpoint every minute — the "which job"
-// decision is made here based on the current minute.
+// The REPLY job also first sends any `scheduled` drafts whose scheduledAt has
+// already passed (from agents where auto-send is ON but with a delay).
 // ════════════════════════════════════════════════════════════════════════════
 const EMAIL_TICK_BUDGET_MS = 8000;          // hard cap — leave 2s headroom before Vercel kills us
 const EMAIL_MAX_INBOXES_PER_FETCH = 3;      // inboxes visited per fetch run
 const EMAIL_REPLY_BATCH_SIZE = 5;           // parallel SMTP+LLM sends per reply run
+const EMAIL_SCHEDULED_BATCH_SIZE = 5;       // scheduled drafts processed per reply run
 
 async function handleEmailPollWorker(req, res) {
     const cronSecret = process.env.EMAIL_WORKER_SECRET;
@@ -2044,13 +2314,11 @@ async function fetchOneInbox(db, ownerEmail, config, startedAt) {
         auth: { user: config.address, pass: password },
         logger: false,
         tls: { rejectUnauthorized: false },
-        // Very aggressive timeouts so we always fail fast within the tick budget.
         connectionTimeout: 5000,
         greetingTimeout:   5000,
         socketTimeout:     8000,
     });
 
-    // CRITICAL: without this listener, async socket errors crash the whole Node process.
     let socketError = null;
     client.on('error', (err) => { socketError = err; });
 
@@ -2063,8 +2331,6 @@ async function fetchOneInbox(db, ownerEmail, config, startedAt) {
 
         lock = await client.getMailboxLock('INBOX');
 
-        // Find the owner's email-capable agent before we start queuing, so the
-        // reply job has everything it needs stored on the queue doc.
         const botsSnap = await db.collection('user_bots').where('owner', '==', ownerEmail).get();
         let emailAgent = null;
         botsSnap.forEach(d => {
@@ -2076,8 +2342,6 @@ async function fetchOneInbox(db, ownerEmail, config, startedAt) {
         });
         if (!emailAgent) return { skipped: 'no-email-agent' };
 
-        // Fetch all unread UIDs — the time-budget check inside the loop is what
-        // stops us, so we queue as many new emails as fit in the fetch window.
         const uids = await client.search({ seen: false }, { uid: true });
         const batch = uids || [];
 
@@ -2092,7 +2356,6 @@ async function fetchOneInbox(db, ownerEmail, config, startedAt) {
                 const fromEmail = msg.envelope?.from?.[0]?.address;
                 if (!fromEmail) continue;
 
-                // Idempotency: don't queue the same UID twice for the same user.
                 const queueRef = db.collection('email_queue').doc(`${ownerEmail}__${uid}`);
                 const existing = await queueRef.get();
                 if (existing.exists) {
@@ -2131,21 +2394,30 @@ async function fetchOneInbox(db, ownerEmail, config, startedAt) {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// JOB B — REPLY: pull up to 5 pending emails from the queue and process them
-// IN PARALLEL. LLM + SMTP calls run concurrently so wall time stays around
-// 5s regardless of batch size — well within the 10s Vercel cap.
+// JOB B — REPLY:
+//   1. First: send any `scheduled` drafts whose scheduledAt has passed.
+//   2. Then: pull up to 5 pending emails from the queue and process them
+//      IN PARALLEL. LLM + (SMTP OR draft-write) calls run concurrently.
 //
-// Credits are consumed per-owner in a single transaction BEFORE the parallel
-// batch runs, so 5 parallel Firestore transactions don't fight each other.
+// Branch on emailConfig.requireHumanApproval:
+//   • TRUE  → write email_drafts { status: 'pending' } + FCM push, no send.
+//   • FALSE → if delay > 0: write email_drafts { status: 'scheduled' };
+//             else send now and mark queue done.
 // ────────────────────────────────────────────────────────────────────────────
 async function runEmailReplyJob(db, startedAt) {
+    // Step 1 — send due scheduled drafts
+    const scheduledResult = await processDueScheduledDrafts(db, startedAt);
+
+    // Step 2 — process new queue items
     const queueSnap = await db.collection('email_queue')
         .where('status', '==', 'pending')
         .orderBy('createdAt', 'asc')
         .limit(EMAIL_REPLY_BATCH_SIZE)
         .get();
 
-    if (queueSnap.empty) return { processed: 0, results: [] };
+    if (queueSnap.empty) {
+        return { processed: 0, results: [], scheduledSent: scheduledResult.sent || 0 };
+    }
 
     const items = queueSnap.docs.map(d => ({ ref: d.ref, id: d.id, ...d.data() }));
 
@@ -2159,13 +2431,10 @@ async function runEmailReplyJob(db, startedAt) {
     const skipped = [];
 
     for (const [ownerEmail, group] of Object.entries(byOwner)) {
-        // One transaction for the whole group — 5 emails = 5 credits, all-or-nothing.
         const credit = await consumeCredits(db, ownerEmail, CREDIT_COSTS.message * group.length);
         if (credit.allowed) {
             group.forEach(it => approvedIds.add(it.id));
         } else {
-            // Not enough credits — skip the whole batch for this owner so
-            // analytics stay consistent.
             for (const it of group) {
                 skipped.push(it.id);
                 await it.ref.set({
@@ -2178,9 +2447,15 @@ async function runEmailReplyJob(db, startedAt) {
     }
 
     const activeItems = items.filter(it => approvedIds.has(it.id));
-    if (!activeItems.length) return { processed: 0, skipped: skipped.length, results: [] };
+    if (!activeItems.length) {
+        return {
+            processed: 0,
+            skipped: skipped.length,
+            results: [],
+            scheduledSent: scheduledResult.sent || 0,
+        };
+    }
 
-    // ── Run all approved emails in parallel ──
     const settled = await Promise.allSettled(
         activeItems.map(it => processQueuedEmail(db, it.id, it, startedAt))
     );
@@ -2192,22 +2467,117 @@ async function runEmailReplyJob(db, startedAt) {
             : { id, error: r.reason?.message || 'unknown' };
     });
 
-    return { processed: activeItems.length, skipped: skipped.length, results };
+    return {
+        processed: activeItems.length,
+        skipped: skipped.length,
+        results,
+        scheduledSent: scheduledResult.sent || 0,
+    };
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Process drafts whose scheduledAt has passed and send them via SMTP.
+// ────────────────────────────────────────────────────────────────────────────
+async function processDueScheduledDrafts(db, startedAt) {
+    try {
+        const nowISO = new Date().toISOString();
+        const snap = await db.collection('email_drafts')
+            .where('status', '==', 'scheduled')
+            .where('scheduledAt', '<=', nowISO)
+            .limit(EMAIL_SCHEDULED_BATCH_SIZE)
+            .get();
+
+        if (snap.empty) return { sent: 0, failed: 0 };
+
+        const results = await Promise.allSettled(
+            snap.docs.map(d => sendScheduledDraft(db, d.id, d.data()))
+        );
+
+        let sent = 0, failed = 0;
+        results.forEach(r => {
+            if (r.status === 'fulfilled' && r.value?.sent) sent++;
+            else failed++;
+        });
+
+        return { sent, failed };
+    } catch (e) {
+        console.error('[Email/ScheduledSend]', e.message);
+        return { sent: 0, failed: 0, error: e.message };
+    }
+}
+
+async function sendScheduledDraft(db, draftId, draft) {
+    const draftRef = db.collection('email_drafts').doc(draftId);
+
+    // Reload to make sure status hasn't changed (e.g. user approved/rejected)
+    const fresh = await draftRef.get();
+    if (!fresh.exists) return { skipped: 'not-found' };
+    const d = fresh.data();
+    if (d.status !== 'scheduled') return { skipped: 'not-scheduled' };
+
+    // Load email config
+    const userSnap = await db.collection('users').doc(d.ownerEmail).get();
+    const emailCfg = userSnap.data()?.integrations?.email;
+    if (!emailCfg?.connected) {
+        await draftRef.set({
+            status: 'failed',
+            error: 'inbox-disconnected',
+            failedAt: new Date().toISOString(),
+        }, { merge: true });
+        return { error: 'inbox-disconnected' };
+    }
+    const password = decryptEmailPassword(emailCfg.passwordEnc);
+
+    try {
+        await sendEmailViaSMTP(emailCfg, password, {
+            to: d.fromEmail,
+            subject: `Re: ${d.subject || '(no subject)'}`,
+            text: d.draftedResponse,
+        });
+
+        const now = new Date().toISOString();
+        await draftRef.set({
+            status: 'sent',
+            sentAt: now,
+            autoSent: true,
+        }, { merge: true });
+
+        if (d.businessId) {
+            await logChat(db, d.businessId, `email-${draftId}`, d.originalQuery || '', d.draftedResponse, true, false, { source: 'email' });
+        }
+
+        try {
+            await db.collection('users').doc(d.ownerEmail).set({
+                integrations: { email: { lastReplyAt: now, lastReplyError: null } },
+            }, { merge: true });
+        } catch {}
+
+        return { sent: true };
+    } catch (err) {
+        console.error('[Email/ScheduledSend/Draft]', draftId, err.message);
+        await draftRef.set({
+            status: 'failed',
+            error: err.message,
+            failedAt: new Date().toISOString(),
+        }, { merge: true });
+        return { error: err.message };
+    }
 }
 
 async function processQueuedEmail(db, queueId, item, startedAt) {
     const queueRef = db.collection('email_queue').doc(queueId);
 
-    // Credits were reserved by the batch runner before we got here — no
-    // second transaction, so parallel workers don't fight each other.
-
-    // ── Re-resolve the agent + plan at reply time (they may have changed) ──
     const botSnap = await db.collection('user_bots').doc(item.businessId).get();
     if (!botSnap.exists) {
         await queueRef.set({ status: 'failed', error: 'agent-not-found', failedAt: new Date().toISOString() }, { merge: true });
         return { error: 'agent-not-found' };
     }
     const bot = botSnap.data();
+
+    // ── Email-specific config: approval + auto-send delay ──
+    const emailConfig = bot.emailConfig || {};
+    const requireHumanApproval = emailConfig.requireHumanApproval !== false;   // default: ON
+    const autoSendDelay = emailConfig.autoSendDelay || '00:00:02';
 
     const ctx = await resolveOwnerContext(db, item.ownerEmail);
     const limits = resolvePlanLimits(ctx.ownerProfile);
@@ -2216,7 +2586,7 @@ async function processQueuedEmail(db, queueId, item, startedAt) {
         return { skipped: 'plan' };
     }
 
-    // ── Resolve inbox config again (may have changed since queue time) ──
+    // Resolve inbox config again (may have changed since queue time)
     const userSnap = await db.collection('users').doc(item.ownerEmail).get();
     const emailCfg = userSnap.data()?.integrations?.email;
     if (!emailCfg?.connected) {
@@ -2225,7 +2595,7 @@ async function processQueuedEmail(db, queueId, item, startedAt) {
     }
     const password = decryptEmailPassword(emailCfg.passwordEnc);
 
-    // ── LLM call ──
+    // ── LLM call to draft the reply ──
     const sysPrompt = bot.knowledgeContext?.systemPrompt
         || `You are a helpful assistant replying to an email. Keep replies concise and professional.`;
     const webContext = bot.context ? `\n\n[WEBSITE CONTENT]:\n${bot.context}` : '';
@@ -2240,42 +2610,96 @@ async function processQueuedEmail(db, queueId, item, startedAt) {
     });
     const replyText = choice?.content?.trim() || 'Thanks for your message.';
 
-    // ── SMTP send ──
-    const transporter = nodemailer.createTransport({
-        host: emailCfg.smtpHost,
-        port: emailCfg.smtpPort,
-        secure: !!emailCfg.useSSL,
-        auth: { user: emailCfg.address, pass: password },
-        tls: { rejectUnauthorized: false },
-        connectionTimeout: 5000,
-        greetingTimeout:   5000,
-        socketTimeout:     8000,
-    });
+    const nowISO = new Date().toISOString();
 
-    await transporter.sendMail({
-        from: emailCfg.address,
-        to: item.fromEmail,
-        subject: `Re: ${item.subject || '(no subject)'}`,
-        text: replyText,
+    // ── BRANCH 1: Human approval required → stage as pending draft ──
+    if (requireHumanApproval) {
+        const draftRef = await db.collection('email_drafts').add({
+            ownerEmail: item.ownerEmail,
+            businessId: item.businessId,
+            botName: item.botName || bot.displayName || bot.name || 'Email Agent',
+            fromEmail: item.fromEmail,
+            subject: item.subject || '(no subject)',
+            originalQuery: item.bodyText,
+            draftedResponse: replyText,
+            status: 'pending',
+            queueId,
+            createdAt: nowISO,
+        });
+
+        // Fire a push notification so the owner can review quickly
+        try {
+            await sendFCMToUser(item.ownerEmail, buildEmailApprovalNotification({
+                id: draftRef.id,
+                fromEmail: item.fromEmail,
+                originalQuery: item.bodyText,
+                botName: item.botName || bot.name || 'Email Agent',
+            }));
+        } catch (e) {
+            console.error('[Email/ApprovalFCM]', e.message);
+        }
+
+        await queueRef.set({
+            status: 'awaiting-approval',
+            draftId: draftRef.id,
+            approvalRequestedAt: nowISO,
+        }, { merge: true });
+
+        return { awaitingApproval: true, draftId: draftRef.id };
+    }
+
+    // ── BRANCH 2: Auto-send (with optional delay) ──
+    const delayMs = parseAutoSendDelay(autoSendDelay);
+
+    // Immediate send (delay = 0)
+    if (delayMs <= 0) {
+        await sendEmailViaSMTP(emailCfg, password, {
+            to: item.fromEmail,
+            subject: `Re: ${item.subject || '(no subject)'}`,
+            text: replyText,
+        });
+
+        await queueRef.set({
+            status: 'done',
+            replyText,
+            processedAt: nowISO,
+            elapsedMs: Date.now() - startedAt,
+        }, { merge: true });
+
+        await logChat(db, item.businessId, `email-${queueId}`, item.bodyText, replyText, true, false, { source: 'email' });
+
+        try {
+            await db.collection('users').doc(item.ownerEmail).set({
+                integrations: { email: { lastReplyAt: nowISO, lastReplyError: null } },
+            }, { merge: true });
+        } catch {}
+
+        return { handled: true, elapsedMs: Date.now() - startedAt };
+    }
+
+    // Scheduled send
+    const scheduledAt = new Date(Date.now() + delayMs).toISOString();
+    const draftRef = await db.collection('email_drafts').add({
+        ownerEmail: item.ownerEmail,
+        businessId: item.businessId,
+        botName: item.botName || bot.displayName || bot.name || 'Email Agent',
+        fromEmail: item.fromEmail,
+        subject: item.subject || '(no subject)',
+        originalQuery: item.bodyText,
+        draftedResponse: replyText,
+        status: 'scheduled',
+        scheduledAt,
+        queueId,
+        createdAt: nowISO,
     });
 
     await queueRef.set({
-        status: 'done',
-        replyText,
-        processedAt: new Date().toISOString(),
-        elapsedMs: Date.now() - startedAt,
+        status: 'scheduled',
+        draftId: draftRef.id,
+        scheduledAt,
     }, { merge: true });
 
-    await logChat(db, item.businessId, `email-${queueId}`, item.bodyText, replyText, true, false, { source: 'email' });
-
-    // Best-effort status update on the user doc.
-    try {
-        await db.collection('users').doc(item.ownerEmail).set({
-            integrations: { email: { lastReplyAt: new Date().toISOString(), lastReplyError: null } },
-        }, { merge: true });
-    } catch {}
-
-    return { handled: true, elapsedMs: Date.now() - startedAt };
+    return { scheduled: true, draftId: draftRef.id, scheduledAt };
 }
 
 function extractEmailBody(raw) {
@@ -2295,7 +2719,7 @@ function extractEmailBody(raw) {
 // FCM — PUSH NOTIFICATION HELPERS
 // ════════════════════════════════════════════════════════════════════════════
 
-async function sendFCMToUser(ownerEmail, { title, body, url, tag }) {
+async function sendFCMToUser(ownerEmail, { title, body, url, tag, type }) {
     if (!ownerEmail) return { sent: 0, failed: 0 };
 
     const db = getDb();
@@ -2324,6 +2748,7 @@ async function sendFCMToUser(ownerEmail, { title, body, url, tag }) {
             body:  body  || '',
             url:   url   || '/',
             tag:   tag   || 'comex-general',
+            ...(type ? { type } : {}),
         },
         webpush: { fcmOptions: { link: url || '/' } },
     };
@@ -2441,6 +2866,19 @@ function buildCreditExhaustedNotification(limit) {
         body:  `All ${limit.toLocaleString()} credits for this month have been used. Your agents are paused until the next cycle or an upgrade.`,
         url:   '/?view=pricing',
         tag:   'comex-credit-exhausted',
+    };
+}
+
+// ── NEW: Email approval push notification ────────────────────────────────
+function buildEmailApprovalNotification(draft) {
+    const preview = String(draft.originalQuery || '').replace(/\s+/g, ' ').trim().substring(0, 110);
+    const from = draft.fromEmail || 'someone';
+    return {
+        title: `✉️ New email draft from ${from}`,
+        body:  `${preview}${preview.length >= 110 ? '…' : ''} — open your Email Dashboard to approve or edit.`,
+        url:   '/email-dashboard',
+        tag:   `email-approval-${draft.id || Date.now()}`,
+        type:  'email_approval',
     };
 }
 
@@ -2689,6 +3127,17 @@ async function handleDeploy(req, res) {
         const VALID_MODES = ['widget', 'email', 'both'];
         if (!VALID_MODES.includes(botData.agentBuildMode)) {
             botData.agentBuildMode = 'widget';
+        }
+
+        // Normalize emailConfig so the reply job always reads a sane value.
+        if (botData.agentBuildMode === 'email' || botData.agentBuildMode === 'both') {
+            const ec = botData.emailConfig || {};
+            botData.emailConfig = {
+                requireHumanApproval: ec.requireHumanApproval !== false,
+                autoSendDelay: /^\d{1,3}:\d{2}:\d{2}$/.test(String(ec.autoSendDelay || ''))
+                    ? ec.autoSendDelay
+                    : '00:00:02',
+            };
         }
 
         const featuresStripped = sanitizeBotDataForPlan(botData, limits);
@@ -5021,6 +5470,15 @@ async function handleAccountChangeEmail(req, res) {
             if (snap.empty) continue;
             const batch = db.batch();
             snap.docs.forEach(d => batch.update(d.ref, { owner: newEmail }));
+            await batch.commit();
+        }
+
+        // Also migrate email drafts/queue ownership
+        for (const col of ['email_drafts', 'email_queue']) {
+            const snap = await db.collection(col).where('ownerEmail', '==', oldEmail).get();
+            if (snap.empty) continue;
+            const batch = db.batch();
+            snap.docs.forEach(d => batch.update(d.ref, { ownerEmail: newEmail }));
             await batch.commit();
         }
 
