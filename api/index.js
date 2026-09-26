@@ -935,7 +935,7 @@ export default async function handler(req, res) {
     if (path === '/api/email/status')       return handleEmailStatus(req, res);
     if (path === '/api/email/poll-worker')  return handleEmailPollWorker(req, res);
 
-    // ── NEW: Email approval / dashboard endpoints ──
+    // ── Email approval / dashboard endpoints ──
     if (path === '/api/email/pending')       return handleEmailPending(req, res);
     if (path === '/api/email/approve')       return handleEmailApprove(req, res);
     if (path === '/api/email/reject')        return handleEmailReject(req, res);
@@ -2319,6 +2319,7 @@ async function fetchOneInbox(db, ownerEmail, config, startedAt) {
         socketTimeout:     8000,
     });
 
+    // CRITICAL: without this listener, async socket errors crash the whole Node process.
     let socketError = null;
     client.on('error', (err) => { socketError = err; });
 
@@ -2331,6 +2332,8 @@ async function fetchOneInbox(db, ownerEmail, config, startedAt) {
 
         lock = await client.getMailboxLock('INBOX');
 
+        // Find the owner's email-capable agent before we start queuing, so the
+        // reply job has everything it needs stored on the queue doc.
         const botsSnap = await db.collection('user_bots').where('owner', '==', ownerEmail).get();
         let emailAgent = null;
         botsSnap.forEach(d => {
@@ -2342,6 +2345,15 @@ async function fetchOneInbox(db, ownerEmail, config, startedAt) {
         });
         if (!emailAgent) return { skipped: 'no-email-agent' };
 
+        // ── FIX: Only process emails that arrived AFTER the inbox was
+        // connected. Anything older is silently marked Seen and skipped, so
+        // a freshly-connected inbox full of historical unread mail doesn't
+        // get flooded with auto-replies. ──
+        const connectedAtMs = config.connectedAt ? new Date(config.connectedAt).getTime() : 0;
+        // If connectedAt is missing (legacy rows), fall back to 24h ago so we
+        // never accidentally process ancient mail.
+        const cutoffMs = connectedAtMs || (Date.now() - 24 * 60 * 60 * 1000);
+
         const uids = await client.search({ seen: false }, { uid: true });
         const batch = uids || [];
 
@@ -2350,12 +2362,25 @@ async function fetchOneInbox(db, ownerEmail, config, startedAt) {
             if (socketError) break;
 
             try {
-                const msg = await client.fetchOne(uid, { envelope: true, source: true }, { uid: true });
+                const msg = await client.fetchOne(
+                    uid,
+                    { envelope: true, source: true, internalDate: true },
+                    { uid: true }
+                );
                 if (!msg) continue;
 
                 const fromEmail = msg.envelope?.from?.[0]?.address;
                 if (!fromEmail) continue;
 
+                // ── Skip pre-connection emails (Bug 1 fix) ──
+                const receivedMs = msg.internalDate ? new Date(msg.internalDate).getTime() : 0;
+                if (receivedMs && receivedMs < cutoffMs - 60_000) {
+                    // Mark as Seen so it's never picked up again, but don't queue it.
+                    try { await client.messageFlagsAdd(uid, ['\\Seen'], { uid: true }); } catch {}
+                    continue;
+                }
+
+                // Idempotency: don't queue the same UID twice for the same user.
                 const queueRef = db.collection('email_queue').doc(`${ownerEmail}__${uid}`);
                 const existing = await queueRef.get();
                 if (existing.exists) {
@@ -2627,14 +2652,16 @@ async function processQueuedEmail(db, queueId, item, startedAt) {
             createdAt: nowISO,
         });
 
-        // Fire a push notification so the owner can review quickly
+        // Fire a push notification so the owner can review quickly.
+        // Purpose='email' so only devices connected to the Email Push card
+        // receive it (Bug 3 fix).
         try {
             await sendFCMToUser(item.ownerEmail, buildEmailApprovalNotification({
                 id: draftRef.id,
                 fromEmail: item.fromEmail,
                 originalQuery: item.bodyText,
                 botName: item.botName || bot.name || 'Email Agent',
-            }));
+            }), 'email');
         } catch (e) {
             console.error('[Email/ApprovalFCM]', e.message);
         }
@@ -2719,7 +2746,11 @@ function extractEmailBody(raw) {
 // FCM — PUSH NOTIFICATION HELPERS
 // ════════════════════════════════════════════════════════════════════════════
 
-async function sendFCMToUser(ownerEmail, { title, body, url, tag, type }) {
+// purpose: 'push'  → appointment / general notifications
+//          'email' → email-approval notifications
+// Each purpose maintains its own token array so the two integration cards
+// (Push Notifications vs Email Push Notifications) track independent state.
+async function sendFCMToUser(ownerEmail, { title, body, url, tag, type }, purpose = 'push') {
     if (!ownerEmail) return { sent: 0, failed: 0 };
 
     const db = getDb();
@@ -2737,10 +2768,21 @@ async function sendFCMToUser(ownerEmail, { title, body, url, tag, type }) {
     const userSnap = await userRef.get();
     if (!userSnap.exists) return { sent: 0, failed: 0 };
 
-    const tokens = userSnap.data()?.fcmTokens || [];
-    if (!tokens.length) return { sent: 0, failed: 0 };
+    const userData = userSnap.data();
+
+    // ── Pick tokens by purpose ──
+    const tokens = purpose === 'email'
+        ? (Array.isArray(userData.fcmEmailTokens) ? userData.fcmEmailTokens : [])
+        : (Array.isArray(userData.fcmPushTokens) ? userData.fcmPushTokens
+            : (Array.isArray(userData.fcmTokens) ? userData.fcmTokens : []));
+
+    if (!tokens.length) return { sent: 0, failed: 0, skipped: 'no-tokens-for-purpose' };
 
     const messaging = getMessaging();
+
+    // ── Include webpush.notification so the browser auto-displays the alert
+    // even when the tab is in the background and even if the service worker
+    // isn't manually handling background messages. (Bug 2 fix.) ──
     const message = {
         tokens,
         data: {
@@ -2748,9 +2790,23 @@ async function sendFCMToUser(ownerEmail, { title, body, url, tag, type }) {
             body:  body  || '',
             url:   url   || '/',
             tag:   tag   || 'comex-general',
+            purpose,
             ...(type ? { type } : {}),
         },
-        webpush: { fcmOptions: { link: url || '/' } },
+        notification: {
+            title: title || 'Mebor AI Notification',
+            body:  body  || '',
+        },
+        webpush: {
+            notification: {
+                title: title || 'Mebor AI Notification',
+                body:  body  || '',
+                icon:  '/media/mebor_logo.png',
+                badge: '/media/mebor_logo.png',
+                tag:   tag || 'comex-general',
+            },
+            fcmOptions: { link: url || '/' },
+        },
     };
 
     let result;
@@ -2758,7 +2814,7 @@ async function sendFCMToUser(ownerEmail, { title, body, url, tag, type }) {
         result = await messaging.sendEachForMulticast(message);
     } catch (err) {
         console.error('[FCM] sendEachForMulticast failed:', err.message);
-        return { sent: 0, failed: tokens.length };
+        return { sent: 0, failed: tokens.length, error: err.message };
     }
 
     const deadTokens = [];
@@ -2773,8 +2829,14 @@ async function sendFCMToUser(ownerEmail, { title, body, url, tag, type }) {
     });
 
     if (deadTokens.length) {
-        const remaining = tokens.filter(t => !deadTokens.includes(t));
-        await userRef.update({ fcmTokens: remaining });
+        if (purpose === 'email') {
+            const remaining = (userData.fcmEmailTokens || []).filter(t => !deadTokens.includes(t));
+            await userRef.update({ fcmEmailTokens: remaining });
+        } else {
+            const remainingPush = (userData.fcmPushTokens || userData.fcmTokens || []).filter(t => !deadTokens.includes(t));
+            const remainingLegacy = (userData.fcmTokens || []).filter(t => !deadTokens.includes(t));
+            await userRef.update({ fcmPushTokens: remainingPush, fcmTokens: remainingLegacy });
+        }
     }
 
     return { sent: result.successCount, failed: result.failureCount };
@@ -2869,7 +2931,6 @@ function buildCreditExhaustedNotification(limit) {
     };
 }
 
-// ── NEW: Email approval push notification ────────────────────────────────
 function buildEmailApprovalNotification(draft) {
     const preview = String(draft.originalQuery || '').replace(/\s+/g, ' ').trim().substring(0, 110);
     const from = draft.fromEmail || 'someone';
@@ -3000,9 +3061,12 @@ async function handleAppointmentEdit(req, res) {
 
 async function handleFCMRegisterToken(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
-    const { userEmail, fcmToken } = req.body || {};
+    const { userEmail, fcmToken, purpose = 'push' } = req.body || {};
     if (!userEmail || !fcmToken)
         return res.status(400).json({ success: false, message: 'Missing userEmail or fcmToken.' });
+
+    if (!['push', 'email'].includes(purpose))
+        return res.status(400).json({ success: false, message: 'purpose must be "push" or "email".' });
 
     try {
         const db      = getDb();
@@ -3011,19 +3075,23 @@ async function handleFCMRegisterToken(req, res) {
 
         const userRef  = db.collection('users').doc(userEmail);
         const snap     = await userRef.get();
-        const existing = snap.exists ? (snap.data()?.fcmTokens || []) : [];
+        const data     = snap.exists ? snap.data() : {};
 
-        if (!existing.includes(fcmToken)) {
-            await userRef.set({
-                fcmTokens: [...existing, fcmToken],
-                notificationsEnabled: true,
-                notificationsConnectedAt: new Date().toISOString(),
-            }, { merge: true });
-        } else {
-            await userRef.set({ notificationsEnabled: true }, { merge: true });
-        }
+        const field          = purpose === 'email' ? 'fcmEmailTokens' : 'fcmPushTokens';
+        const existing       = Array.isArray(data[field]) ? data[field] : [];
+        const legacyExisting = Array.isArray(data.fcmTokens) ? data.fcmTokens : [];
 
-        return res.json({ success: true, message: 'Device registered for notifications.' });
+        const newTokens = existing.includes(fcmToken) ? existing : [...existing, fcmToken];
+        const newLegacy = legacyExisting.includes(fcmToken) ? legacyExisting : [...legacyExisting, fcmToken];
+
+        await userRef.set({
+            [field]:  newTokens,
+            fcmTokens: newLegacy,                        // keep legacy array in sync
+            notificationsEnabled: true,
+            notificationsConnectedAt: new Date().toISOString(),
+        }, { merge: true });
+
+        return res.json({ success: true, message: 'Device registered for notifications.', purpose });
     } catch (err) {
         console.error('[FCM-Register]', err.message);
         return res.status(500).json({ success: false, message: err.message });
@@ -3032,8 +3100,11 @@ async function handleFCMRegisterToken(req, res) {
 
 async function handleFCMRemoveToken(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
-    const { userEmail, fcmToken } = req.body || {};
+    const { userEmail, fcmToken, purpose = 'push' } = req.body || {};
     if (!userEmail) return res.status(400).json({ success: false, message: 'Missing userEmail.' });
+
+    if (!['push', 'email'].includes(purpose))
+        return res.status(400).json({ success: false, message: 'purpose must be "push" or "email".' });
 
     try {
         const db      = getDb();
@@ -3041,11 +3112,22 @@ async function handleFCMRemoveToken(req, res) {
         const snap     = await userRef.get();
         if (!snap.exists) return res.json({ success: true });
 
-        const existing  = snap.data()?.fcmTokens || [];
+        const data = snap.data();
+        const field = purpose === 'email' ? 'fcmEmailTokens' : 'fcmPushTokens';
+        const existing = Array.isArray(data[field]) ? data[field] : [];
         const remaining = fcmToken ? existing.filter(t => t !== fcmToken) : [];
-        await userRef.update({ fcmTokens: remaining, notificationsEnabled: remaining.length > 0 });
 
-        return res.json({ success: true, message: 'Notifications disconnected.' });
+        // Keep legacy array in sync by recomputing from both purpose arrays.
+        const emailTokens = purpose === 'email' ? remaining : (data.fcmEmailTokens || []);
+        const pushTokens  = purpose === 'push'  ? remaining : (data.fcmPushTokens  || []);
+        const legacy = [...new Set([...emailTokens, ...pushTokens])];
+
+        await userRef.update({
+            [field]: remaining,
+            fcmTokens: legacy,
+        });
+
+        return res.json({ success: true, message: 'Notifications disconnected.', purpose });
     } catch (err) {
         console.error('[FCM-Remove]', err.message);
         return res.status(500).json({ success: false, message: err.message });
@@ -3054,23 +3136,42 @@ async function handleFCMRemoveToken(req, res) {
 
 async function handleFCMTestNotification(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
-    const { userEmail } = req.body || {};
+    const { userEmail, purpose = 'push' } = req.body || {};
     if (!userEmail) return res.status(400).json({ success: false, message: 'Missing userEmail.' });
+
+    if (!['push', 'email'].includes(purpose))
+        return res.status(400).json({ success: false, message: 'purpose must be "push" or "email".' });
 
     try {
         if (await denyIfFeatureLocked(res, getDb(), userEmail, 'pushNotifications')) return;
 
         const result = await sendFCMToUser(userEmail, {
-            title: '✅ Notifications Connected!',
-            body:  'This is a test alert from Mebor AI. You will receive one like this for every new appointment.',
+            title: purpose === 'email' ? '✅ Email Alerts Connected!' : '✅ Notifications Connected!',
+            body:  purpose === 'email'
+                ? 'This is a test alert from Mebor AI. You will receive one like this for every email draft that needs approval.'
+                : 'This is a test alert from Mebor AI. You will receive one like this for every new appointment.',
             url:   '/?view=integrations',
             tag:   'comex-test',
-        });
+            type:  'test',
+        }, purpose);
 
-        if (result.sent === 0)
-            return res.status(400).json({ success: false, message: 'No active devices found. Try reconnecting.' });
+        if (result.skipped) {
+            return res.status(400).json({
+                success: false,
+                message: `Test notification skipped: ${result.skipped}.`,
+                skipped: result.skipped,
+            });
+        }
+        if (result.sent === 0) {
+            return res.status(400).json({
+                success: false,
+                message: `No active devices found. (${result.failed || 0} failed, ${result.error || 'no error details'})`,
+                failed: result.failed,
+                error:  result.error,
+            });
+        }
 
-        return res.json({ success: true, message: `Test notification sent to ${result.sent} device(s).` });
+        return res.json({ success: true, message: `Test notification sent to ${result.sent} device(s).`, sent: result.sent });
     } catch (err) {
         console.error('[FCM-Test]', err.message);
         return res.status(500).json({ success: false, message: err.message });
