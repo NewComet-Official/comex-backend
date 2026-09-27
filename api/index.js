@@ -1861,8 +1861,79 @@ async function testSmtpLogin({ host, port, useSSL, address, password }) {
     }
 }
 
-// Shared helper: sends an outbound email through the owner's connected inbox
-async function sendEmailViaSMTP(emailCfg, password, { to, subject, text }) {
+// ── Email HTML formatting: markdown-style AI replies → styled HTML email ──
+// Mirrors the frontend's window.formatEmailBodyHtml() so bold/italic/lists
+// that render correctly in the Email Dashboard preview also render correctly
+// in the actual email the customer receives, plus an "Auto-replied with AI" badge.
+function escapeHtmlForEmail(str) {
+    return String(str || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
+function markdownToEmailHtml(raw) {
+    let text = escapeHtmlForEmail(raw || '').trim();
+    if (!text) return '<p style="margin:0 0 10px 0;">(empty)</p>';
+
+    text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    text = text.replace(/(^|[^*])\*(?!\*)([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
+    text = text.replace(/`([^`]+)`/g, '<code style="background:#f1f5f9;padding:1px 5px;border-radius:4px;">$1</code>');
+
+    const lines = text.split('\n');
+    let html = '';
+    let listBuffer = [];
+    let listType = null;
+
+    const flushList = () => {
+        if (!listBuffer.length) return;
+        const tag = listType === 'ol' ? 'ol' : 'ul';
+        html += `<${tag} style="margin:0 0 12px 20px; padding:0;">` +
+            listBuffer.map(li => `<li style="margin-bottom:5px;">${li}</li>`).join('') +
+            `</${tag}>`;
+        listBuffer = [];
+        listType = null;
+    };
+
+    lines.forEach(line => {
+        const trimmed = line.trim();
+        const bulletMatch = trimmed.match(/^[-*•]\s+(.*)/);
+        const numberMatch = trimmed.match(/^\d+[.)]\s+(.*)/);
+
+        if (bulletMatch) {
+            if (listType && listType !== 'ul') flushList();
+            listType = 'ul';
+            listBuffer.push(bulletMatch[1]);
+        } else if (numberMatch) {
+            if (listType && listType !== 'ol') flushList();
+            listType = 'ol';
+            listBuffer.push(numberMatch[1]);
+        } else if (!trimmed) {
+            flushList();
+        } else {
+            flushList();
+            html += `<p style="margin:0 0 12px 0;">${trimmed}</p>`;
+        }
+    });
+    flushList();
+    return html || `<p style="margin:0 0 12px 0;">${text}</p>`;
+}
+
+function buildAiEmailBadgeHtml() {
+    return `<div style="display:inline-block; padding:6px 14px; border-radius:100px; background:#EAF8F0; color:#16A34A; font-size:12px; font-weight:800; font-family:'Segoe UI', Arial, sans-serif; letter-spacing:0.01em; margin-top:16px;">&#10022;&nbsp; Auto-replied with AI</div>`;
+}
+
+function buildEmailHtmlBody(replyText) {
+    return `<div style="font-family:'Segoe UI', Helvetica, Arial, sans-serif; font-size:14px; line-height:1.65; color:#334155; max-width:600px;">
+        ${markdownToEmailHtml(replyText)}
+        ${buildAiEmailBadgeHtml()}
+    </div>`;
+}
+
+// Shared helper: sends an outbound email through the owner's connected inbox.
+// `html` is auto-generated from `text` (markdown → styled HTML + AI badge)
+// unless an explicit `html` override is passed in.
+async function sendEmailViaSMTP(emailCfg, password, { to, subject, text, html }) {
     const transporter = nodemailer.createTransport({
         host: emailCfg.smtpHost,
         port: emailCfg.smtpPort,
@@ -1878,6 +1949,7 @@ async function sendEmailViaSMTP(emailCfg, password, { to, subject, text }) {
         to,
         subject,
         text,
+        html: html || buildEmailHtmlBody(text),
     });
 }
 
@@ -2078,7 +2150,7 @@ async function handleEmailApprove(req, res) {
         }
         const password = decryptEmailPassword(emailCfg.passwordEnc);
 
-        // Send via SMTP
+        // Send via SMTP (HTML formatting + AI badge auto-applied)
         await sendEmailViaSMTP(emailCfg, password, {
             to: draft.fromEmail,
             subject: `Re: ${draft.subject || '(no subject)'}`,
@@ -2628,7 +2700,7 @@ async function processQueuedEmail(db, queueId, item, startedAt) {
     const choice = await callLLM({
         modelKey: bot.modelKey || DEFAULT_MODEL_KEY,
         messages: [
-            { role: 'system', content: sysPrompt + webContext + `\n\nTHIS IS AN EMAIL REPLY. Write a clear, professional reply. Do NOT mention chat, widgets, or "typing". Include a brief sign-off.` },
+            { role: 'system', content: sysPrompt + webContext + `\n\nTHIS IS AN EMAIL REPLY. Write a clear, professional reply. Do NOT mention chat, widgets, or "typing". Include a brief sign-off. Format your response using Markdown where it improves clarity — use **bold** for key terms, names, or important values, and use "-" bullet points or "1." numbered lists for multi-part answers — since this reply is rendered as a richly formatted HTML email.` },
             { role: 'user', content: item.bodyText },
         ],
         enableBookingTool: false,
@@ -3480,7 +3552,7 @@ async function handleChat(req, res) {
         }
 
         if (source === 'email') {
-            sysPrompt += `\n\nTHIS IS AN EMAIL REPLY. The user's message arrived via email. Write a clear, professional reply. Do NOT mention chat, widgets, or "typing". Include a brief sign-off.`;
+            sysPrompt += `\n\nTHIS IS AN EMAIL REPLY. The user's message arrived via email. Write a clear, professional reply. Do NOT mention chat, widgets, or "typing". Include a brief sign-off. Format your response using Markdown where it improves clarity — use **bold** for key terms, names, or important values, and use "-" bullet points or "1." numbered lists for multi-part answers — since this reply is rendered as a richly formatted HTML email.`;
         }
 
         const wantsHuman = humanHandoffEnabled && /speak to human support|connect (me )?(to )?(a )?human|talk to (a )?(human|person|someone|agent|representative)|(human|real) (agent|person)|customer service rep|talk to (someone|somebody) real/i.test(userMsg);
