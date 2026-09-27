@@ -1923,8 +1923,14 @@ function buildAiEmailBadgeHtml() {
     return `<div style="display:inline-block; padding:6px 14px; border-radius:100px; background:#EAF8F0; color:#16A34A; font-size:12px; font-weight:800; font-family:'Segoe UI', Arial, sans-serif; letter-spacing:0.01em; margin-top:16px;">&#10022;&nbsp; Auto-replied with AI</div>`;
 }
 
-function buildEmailHtmlBody(replyText) {
-    return `<div style="font-family:'Segoe UI', Helvetica, Arial, sans-serif; font-size:14px; line-height:1.65; color:#334155; max-width:600px;">
+function buildEmailHtmlBody(replyText, botName) {
+    const safeName = (botName || 'Support Bot').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const initial = safeName.trim().charAt(0).toUpperCase() || 'A';
+    return `<div style="font-family:'Google Sans Flex', 'Google Sans', 'Segoe UI', Helvetica, Arial, sans-serif; font-size:14px; line-height:1.65; color:#334155; max-width:600px; background:#ffffff; border:1px solid #e2e8f0; border-radius:18px; padding:20px 22px; box-shadow:0 10px 28px -8px rgba(15,23,42,0.08); box-sizing:border-box;">
+        <div style="display:flex; align-items:center; gap:12px; margin-bottom:14px;">
+            <div style="width:38px;height:38px;border-radius:50%;background:#e2e8f0;color:#475569;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:15px;font-family:'Google Sans Flex', 'Google Sans', 'Segoe UI', Arial, sans-serif;">${initial}</div>
+            <div style="font-weight:800;color:#0f172a;font-size:15px;">${safeName}</div>
+        </div>
         ${markdownToEmailHtml(replyText)}
         ${buildAiEmailBadgeHtml()}
     </div>`;
@@ -1933,7 +1939,7 @@ function buildEmailHtmlBody(replyText) {
 // Shared helper: sends an outbound email through the owner's connected inbox.
 // `html` is auto-generated from `text` (markdown → styled HTML + AI badge)
 // unless an explicit `html` override is passed in.
-async function sendEmailViaSMTP(emailCfg, password, { to, subject, text, html }) {
+async function sendEmailViaSMTP(emailCfg, password, { to, subject, text, html, botName }) {
     const transporter = nodemailer.createTransport({
         host: emailCfg.smtpHost,
         port: emailCfg.smtpPort,
@@ -1949,7 +1955,7 @@ async function sendEmailViaSMTP(emailCfg, password, { to, subject, text, html })
         to,
         subject,
         text,
-        html: html || buildEmailHtmlBody(text),
+        html: html || buildEmailHtmlBody(text, botName),
     });
 }
 
@@ -2150,11 +2156,12 @@ async function handleEmailApprove(req, res) {
         }
         const password = decryptEmailPassword(emailCfg.passwordEnc);
 
-        // Send via SMTP (HTML formatting + AI badge auto-applied)
+                // Send via SMTP (HTML formatting + AI badge auto-applied)
         await sendEmailViaSMTP(emailCfg, password, {
             to: draft.fromEmail,
             subject: `Re: ${draft.subject || '(no subject)'}`,
             text: finalResponse,
+            botName: draft.botName,
         });
 
         // Mark as sent
@@ -2625,11 +2632,12 @@ async function sendScheduledDraft(db, draftId, draft) {
     }
     const password = decryptEmailPassword(emailCfg.passwordEnc);
 
-    try {
+        try {
         await sendEmailViaSMTP(emailCfg, password, {
             to: d.fromEmail,
             subject: `Re: ${d.subject || '(no subject)'}`,
             text: d.draftedResponse,
+            botName: d.botName,
         });
 
         const now = new Date().toISOString();
@@ -2751,11 +2759,12 @@ async function processQueuedEmail(db, queueId, item, startedAt) {
     const delayMs = parseAutoSendDelay(autoSendDelay);
 
     // Immediate send (delay = 0)
-    if (delayMs <= 0) {
+        if (delayMs <= 0) {
         await sendEmailViaSMTP(emailCfg, password, {
             to: item.fromEmail,
             subject: `Re: ${item.subject || '(no subject)'}`,
             text: replyText,
+            botName: item.botName || bot.displayName || bot.name,
         });
 
         await queueRef.set({
