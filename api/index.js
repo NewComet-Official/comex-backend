@@ -5,7 +5,6 @@ import { ImapFlow } from 'imapflow';
 import nodemailer from 'nodemailer';
 
 // Vercel Function configuration. Hobby plan clamps to 10s; Pro allows up to 60s.
-// The email pipeline is split into two fast jobs so it fits within 10s either way.
 export const config = {
     maxDuration: 10,
 };
@@ -59,6 +58,7 @@ const FEATURE_CATALOG = {
     pushNotifications:  { label: 'Desktop Push Notifications',              plans: ['team', 'teamplus', 'enterprise'] },
     emailAgent:         { label: 'Email Agent (IMAP/SMTP Inbox)',           plans: ['team', 'teamplus', 'enterprise'] },
     telegramAgent:      { label: 'Telegram Channel',                        plans: ['teamplus', 'enterprise'] },
+    whatsappAgent:      { label: 'WhatsApp Channel (QR Device Link)',       plans: ['teamplus', 'enterprise'] },
     firebaseDatabase:   { label: 'Firebase Live Database Source',           plans: ['teamplus', 'enterprise'] },
     supabaseDatabase:   { label: 'Supabase Live Database Source',           plans: ['teamplus', 'enterprise'] },
     canvaDesign:        { label: 'Canva Design Import',                     plans: ['teamplus', 'enterprise'] },
@@ -69,28 +69,24 @@ const FEATURE_CATALOG = {
 const DB_SERVICE_FEATURE = { firebase: 'firebaseDatabase', supabase: 'supabaseDatabase' };
 const DESIGN_SERVICE_FEATURE = { canva: 'canvaDesign', figma: 'figmaDesign' };
 
-// ── Channel helpers (Website / Email / Telegram) ─────────────────────────────
-const ALL_CHANNELS = ['widget', 'email', 'telegram'];
+// ── Channel helpers (Website / Email / Telegram / WhatsApp) ──────────────────
+const ALL_CHANNELS = ['widget', 'email', 'telegram', 'whatsapp'];
+
+/** Turn a legacy/derived build-mode string ("widget+email+whatsapp", "both", "all"…) into channels. */
+function channelsFromBuildMode(mode) {
+    const m = String(mode || 'widget').toLowerCase();
+    if (m === 'all')  return ALL_CHANNELS.slice();
+    if (m === 'both') return ['widget', 'email'];
+    const out = m.split('+').map(s => s.trim()).filter(c => ALL_CHANNELS.includes(c));
+    return out.length ? out : ['widget'];
+}
 
 function normalizeChannels(botData) {
     let channels = Array.isArray(botData?.channels)
         ? botData.channels.filter(c => ALL_CHANNELS.includes(c))
         : [];
 
-    if (!channels.length) {
-        // Derive from legacy agentBuildMode
-        const m = botData?.agentBuildMode || 'widget';
-        const map = {
-            widget:            ['widget'],
-            email:             ['email'],
-            telegram:          ['telegram'],
-            both:              ['widget', 'email'],
-            'widget+telegram': ['widget', 'telegram'],
-            'email+telegram':  ['email', 'telegram'],
-            all:               ['widget', 'email', 'telegram'],
-        };
-        channels = map[m] || ['widget'];
-    }
+    if (!channels.length) channels = channelsFromBuildMode(botData?.agentBuildMode);
 
     channels = [...new Set(channels)].sort(
         (a, b) => ALL_CHANNELS.indexOf(a) - ALL_CHANNELS.indexOf(b)
@@ -99,16 +95,24 @@ function normalizeChannels(botData) {
     return channels;
 }
 
+// Must stay in sync with window.deriveBuildMode() in index.html
 function deriveBuildMode(channels) {
     const c = channels || [];
-    const w = c.includes('widget'), e = c.includes('email'), t = c.includes('telegram');
-    if (w && e && t) return 'all';
-    if (w && e)      return 'both';
-    if (w && t)      return 'widget+telegram';
-    if (e && t)      return 'email+telegram';
-    if (e)           return 'email';
-    if (t)           return 'telegram';
-    return 'widget';
+    const w = c.includes('widget'), e = c.includes('email'),
+          t = c.includes('telegram'), wa = c.includes('whatsapp');
+
+    if (w && e && t && wa) return 'all';
+    if (w && e && !t && !wa) return 'both';
+
+    const parts = [];
+    if (w) parts.push('widget');
+    if (e) parts.push('email');
+    if (t) parts.push('telegram');
+    if (wa) parts.push('whatsapp');
+
+    if (!parts.length) return 'widget';
+    if (parts.length === 1) return parts[0];
+    return parts.join('+');
 }
 
 function requiredPlanTiers(featureKey) {
@@ -241,6 +245,10 @@ function sanitizeBotDataForPlan(botData, limits) {
     if (!f.telegramAgent && filtered.includes('telegram')) {
         filtered = filtered.filter(c => c !== 'telegram');
         stripped.push('telegramAgent');
+    }
+    if (!f.whatsappAgent && filtered.includes('whatsapp')) {
+        filtered = filtered.filter(c => c !== 'whatsapp');
+        stripped.push('whatsappAgent');
     }
     if (!filtered.length) filtered = ['widget'];
 
@@ -998,6 +1006,14 @@ export default async function handler(req, res) {
     // ── Telegram webhook receiver ──
     if (path.startsWith('/api/telegram/webhook/')) return handleTelegramWebhook(req, res, path);
 
+    // ── WhatsApp (linked device) — browser-facing ──
+    if (path === '/api/whatsapp/session/start')  return handleWhatsAppSessionStart(req, res);
+    if (path === '/api/whatsapp/session/status') return handleWhatsAppSessionStatus(req, res);
+    if (path === '/api/whatsapp/disconnect')     return handleWhatsAppDisconnect(req, res);
+    // ── WhatsApp (linked device) — called by the external WhatsApp worker ──
+    if (path === '/api/whatsapp/session/update') return handleWhatsAppSessionUpdate(req, res);
+    if (path === '/api/whatsapp/incoming')       return handleWhatsAppIncoming(req, res);
+
     if (path === '/api/oauth/firebase-project')          return handleFirebaseProjectOAuth(req, res);
     if (path === '/api/oauth/firebase-project/callback')  return handleFirebaseProjectCallback(req, res);
     if (path === '/api/oauth/supabase')                   return handleSupabaseOAuth(req, res);
@@ -1154,6 +1170,8 @@ async function handlePlanSelect(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // ENTERPRISE DYNAMIC PRICING (WHOP)
+// NOTE: index.html uses agentOverageRate 7 and seatOverageRate 4 — these two
+// values (15 / 10) disagree with what the calculator shows the customer.
 // ════════════════════════════════════════════════════════════════════════════
 
 const ENTERPRISE_PRICING = {
@@ -1345,7 +1363,8 @@ async function handleWhopWebhook(req, res) {
                         maxSeats: seatCount,
                         integrations: {
                             firebase: true, supabase: true, canva: true, figma: true,
-                            google_calendar: true, push_alerts: true, email_agent: true, telegram_agent: true,
+                            google_calendar: true, push_alerts: true, email_agent: true,
+                            telegram_agent: true, whatsapp_agent: true,
                         },
                         status: 'active',
                         whopMembershipId: data.id || null,
@@ -1751,10 +1770,11 @@ async function wipeBotCompletely(db, botId) {
     await deleteQueryBatch(db, db.collection('reports').where('businessId', '==', botId));
     await deleteQueryBatch(db, db.collection('leads').where('businessId', '==', botId));
 
-    // Clean up email drafts + queued email + telegram sessions for this agent
+    // Clean up email drafts + queued email + telegram / whatsapp threads for this agent
     await deleteQueryBatch(db, db.collection('email_drafts').where('businessId', '==', botId));
     await deleteQueryBatch(db, db.collection('email_queue').where('businessId', '==', botId));
     await deleteQueryBatch(db, db.collection('telegram_sessions').where('businessId', '==', botId));
+    await deleteQueryBatch(db, db.collection('whatsapp_chats').where('businessId', '==', botId));
 
     await botRef.delete().catch(() => {});
 }
@@ -1847,6 +1867,11 @@ async function handleAccountDeleteCascade(req, res) {
         await deleteQueryBatch(db, db.collection('email_drafts').where('ownerEmail', '==', email));
         await deleteQueryBatch(db, db.collection('email_queue').where('ownerEmail', '==', email));
         await deleteQueryBatch(db, db.collection('telegram_sessions').where('ownerEmail', '==', email));
+        await deleteQueryBatch(db, db.collection('whatsapp_chats').where('ownerEmail', '==', email));
+
+        // Unlink the WhatsApp device (best-effort) and drop the pairing state
+        try { await callWhatsAppWorker('/session/logout', { ownerEmail: email }); } catch (e) { /* worker may be offline */ }
+        await db.collection('whatsapp_sessions').doc(email).delete().catch(() => {});
 
         await db.collection('users').doc(email).delete().catch(() => {});
 
@@ -1904,10 +1929,6 @@ function decryptEmailPassword(blob) { return decryptCredential(blob); }
 
 const TELEGRAM_API_BASE = 'https://api.telegram.org';
 
-/**
- * POST a JSON body to a Telegram Bot API method.
- * `token` is the plaintext bot token (never persisted in that form).
- */
 async function callTelegramApi(token, method, body, { timeoutMs = 8000 } = {}) {
     const url = `${TELEGRAM_API_BASE}/bot${token}/${method}`;
     const r = await fetch(url, {
@@ -1925,10 +1946,6 @@ async function callTelegramApi(token, method, body, { timeoutMs = 8000 } = {}) {
     return parsed?.result;
 }
 
-/**
- * Register (or update) the webhook that Telegram will POST updates to.
- * We generate a per-agent secret token so the receiver can verify the call.
- */
 async function registerTelegramWebhook({ token, businessId, secret, publicBaseUrl }) {
     const url = `${publicBaseUrl.replace(/\/+$/, '')}/api/telegram/webhook/${encodeURIComponent(businessId)}`;
     return callTelegramApi(token, 'setWebhook', {
@@ -1948,7 +1965,6 @@ async function deleteTelegramWebhook(token) {
     }
 }
 
-/** Send a plain-text reply back to the user. Telegram's Markdown is finicky, so we send as-is. */
 async function sendTelegramMessage(token, chatId, text) {
     const safe = String(text || '').substring(0, 4000) || '(empty reply)';
     return callTelegramApi(token, 'sendMessage', {
@@ -1966,8 +1982,6 @@ function getPublicBaseUrl(req) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // POST /api/telegram/webhook/:businessId
-// Telegram posts every message here. We validate the secret header, look up
-// the agent, run the SAME AI pipeline used by the web widget, and reply back.
 // ════════════════════════════════════════════════════════════════════════════
 async function handleTelegramWebhook(req, res, path) {
     if (req.method !== 'POST') return res.status(405).json({ ok: false });
@@ -1990,7 +2004,6 @@ async function handleTelegramWebhook(req, res, path) {
             return res.status(200).json({ ok: true });
         }
 
-        // Verify the shared secret Telegram sends on every request
         const incomingSecret = req.headers['x-telegram-bot-api-secret-token'];
         if (tg.webhookSecret && incomingSecret !== tg.webhookSecret) {
             console.warn('[Telegram/Webhook] Secret mismatch for', businessId);
@@ -2006,28 +2019,24 @@ async function handleTelegramWebhook(req, res, path) {
         const chatId = message.chat.id;
         const userText = (message.text || message.caption || '').trim();
         if (!userText) {
-            // Non-text messages (stickers/photos): politely tell them only text is supported
             try {
                 await sendTelegramMessage(token, chatId, "I can only read text messages right now — could you type your question?");
             } catch {}
             return res.status(200).json({ ok: true });
         }
 
-        // Ignore obvious Telegram commands
         if (/^\/(start|help|settings|stop)\b/i.test(userText)) {
             const greeting = `Hi! I'm ${bot.displayName || bot.name || 'the assistant'}. Ask me anything about this business.`;
             try { await sendTelegramMessage(token, chatId, greeting); } catch {}
             return res.status(200).json({ ok: true });
         }
 
-        // ── Session history is keyed by (businessId, chatId) so each user has their own thread ──
         const sessionId = `${businessId}__${chatId}`;
         const sessionRef = db.collection('telegram_sessions').doc(sessionId);
         const sessionSnap = await sessionRef.get();
         const session = sessionSnap.exists ? sessionSnap.data() : {};
         const history = Array.isArray(session.history) ? session.history.slice(-12) : [];
 
-        // ── Run the same AI pipeline used by the web widget ──
         const result = await generateBotReply({
             db,
             businessId,
@@ -2039,7 +2048,6 @@ async function handleTelegramWebhook(req, res, path) {
 
         const replyText = result?.answer || "Sorry, I couldn't respond just now.";
 
-        // Persist updated history (cap to last 24 entries for storage hygiene)
         const newHistory = [
             ...history,
             { role: 'user', content: userText },
@@ -2054,7 +2062,6 @@ async function handleTelegramWebhook(req, res, path) {
             updatedAt: new Date().toISOString(),
         }, { merge: true });
 
-        // Reply on Telegram
         try {
             await sendTelegramMessage(token, chatId, replyText);
         } catch (e) {
@@ -2064,13 +2071,321 @@ async function handleTelegramWebhook(req, res, path) {
         return res.status(200).json({ ok: true });
     } catch (err) {
         console.error('[Telegram/Webhook]', err.message);
-        // Always 200 so Telegram doesn't retry the same update forever
         return res.status(200).json({ ok: true });
     }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// EMAIL AGENT — IMAP/SMTP CONNECTION (Team+ and above)
+// WHATSAPP — LINKED DEVICE (QR) CHANNEL
+//
+// Vercel functions cannot hold a WhatsApp Web socket open, so the actual
+// connection lives in a small always-on worker (Baileys / whatsapp-web.js on
+// Railway, Fly, a VPS, etc.). This file is the bridge:
+//
+//   Browser ──► /api/whatsapp/session/start ──► worker POST /session/start
+//   Worker  ──► /api/whatsapp/session/update   (QR strings + connection status)
+//   Browser ──► /api/whatsapp/session/status   (polls Firestore state)
+//   Worker  ──► /api/whatsapp/incoming         (each message) ◄── returns { reply }
+//   Browser ──► /api/whatsapp/disconnect ──► worker POST /session/logout
+//
+// Env vars:  WHATSAPP_WORKER_URL     base URL of the worker (no trailing slash)
+//            WHATSAPP_WORKER_SECRET  shared secret, sent as `x-worker-secret` both ways
+//
+// Firestore:  whatsapp_sessions/{ownerEmail}   pairing/connection state (+ QR)
+//             whatsapp_chats/{bizId__chatId}   per-conversation history
+//             users/{email}.integrations.whatsapp = { connected, phoneNumber, pushName, label, connectedAt }
+// ════════════════════════════════════════════════════════════════════════════
+
+const WHATSAPP_START_WAIT_MS   = 5500;      // how long /session/start waits for the first QR
+const WHATSAPP_POLL_STEP_MS    = 600;
+const WHATSAPP_PAIRING_TTL_MS  = 3 * 60 * 1000;   // a pairing attempt with no scan is dead after this
+
+function whatsappWorkerAuthOk(req) {
+    const secret = process.env.WHATSAPP_WORKER_SECRET;
+    if (!secret) return false;
+    const given = String(req.headers['x-worker-secret'] || '');
+    const a = Buffer.from(given);
+    const b = Buffer.from(secret);
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+async function callWhatsAppWorker(path, body) {
+    const base = process.env.WHATSAPP_WORKER_URL;
+    if (!base) throw new Error('WhatsApp service is not configured (missing WHATSAPP_WORKER_URL).');
+
+    const r = await fetch(`${base.replace(/\/+$/, '')}${path}`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'x-worker-secret': process.env.WHATSAPP_WORKER_SECRET || '',
+        },
+        body: JSON.stringify(body || {}),
+        signal: AbortSignal.timeout(8000),
+    });
+
+    let parsed = null;
+    try { parsed = await r.json(); } catch { /* non-JSON */ }
+    if (!r.ok || (parsed && parsed.success === false)) {
+        throw new Error(parsed?.message || `WhatsApp worker returned HTTP ${r.status}.`);
+    }
+    return parsed || {};
+}
+
+function whatsappSessionView(s) {
+    const status = s?.status || 'idle';
+    const updatedMs = s?.updatedAt ? new Date(s.updatedAt).getTime() : 0;
+
+    // A pairing attempt nobody scanned should not poll forever
+    if ((status === 'starting' || status === 'qr') && updatedMs && Date.now() - updatedMs > WHATSAPP_PAIRING_TTL_MS) {
+        return { status: 'failed', message: 'The pairing session timed out before the code was scanned. Refresh to get a new QR code.' };
+    }
+
+    return {
+        status: status === 'starting' ? 'pending' : status,
+        qr: status === 'qr' ? (s.qr || null) : null,
+        phoneNumber: s?.phoneNumber || null,
+        pushName: s?.pushName || null,
+        message: s?.message || null,
+    };
+}
+
+// POST /api/whatsapp/session/start  { ownerEmail }
+async function handleWhatsAppSessionStart(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { ownerEmail } = req.body || {};
+    if (!ownerEmail) return res.status(400).json({ success: false, message: 'Missing ownerEmail.' });
+
+    try {
+        const db = getDb();
+
+        const ctx = await resolveOwnerContext(db, ownerEmail);
+        if (ctx.isEmployee)
+            return res.status(403).json({ success: false, message: 'Only the company owner can link WhatsApp.' });
+        if (await denyIfFeatureLocked(res, db, ownerEmail, 'whatsappAgent')) return;
+
+        const sessionRef = db.collection('whatsapp_sessions').doc(ownerEmail);
+
+        // Already linked? Nothing to pair.
+        const existing = await sessionRef.get();
+        if (existing.exists && existing.data()?.status === 'connected') {
+            const s = existing.data();
+            return res.json({ success: true, status: 'connected', phoneNumber: s.phoneNumber || null, pushName: s.pushName || null });
+        }
+
+        await sessionRef.set({
+            ownerEmail,
+            status: 'starting',
+            qr: null,
+            message: null,
+            startedAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+        }, { merge: true });
+
+        try {
+            await callWhatsAppWorker('/session/start', { ownerEmail });
+        } catch (err) {
+            await sessionRef.set({ status: 'failed', message: err.message, updatedAt: new Date().toISOString() }, { merge: true });
+            return res.status(502).json({ success: false, message: err.message });
+        }
+
+        // Give the worker a moment to push the first QR so the modal has something to show
+        const deadline = Date.now() + WHATSAPP_START_WAIT_MS;
+        let view = { status: 'pending' };
+        while (Date.now() < deadline) {
+            const snap = await sessionRef.get();
+            view = whatsappSessionView(snap.data());
+            if (view.status === 'connected' || view.status === 'failed' || view.qr) break;
+            await new Promise(r => setTimeout(r, WHATSAPP_POLL_STEP_MS));
+        }
+
+        return res.json({ success: true, ...view });
+    } catch (err) {
+        console.error('[WhatsApp/Start]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// GET /api/whatsapp/session/status?ownerEmail=
+async function handleWhatsAppSessionStatus(req, res) {
+    const { ownerEmail } = req.query || {};
+    if (!ownerEmail) return res.status(400).json({ success: false, message: 'Missing ownerEmail.' });
+    try {
+        const db = getDb();
+        const snap = await db.collection('whatsapp_sessions').doc(ownerEmail).get();
+        if (!snap.exists) return res.json({ success: true, status: 'idle' });
+        return res.json({ success: true, ...whatsappSessionView(snap.data()) });
+    } catch (err) {
+        console.error('[WhatsApp/Status]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// POST /api/whatsapp/disconnect  { ownerEmail }
+async function handleWhatsAppDisconnect(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { ownerEmail } = req.body || {};
+    if (!ownerEmail) return res.status(400).json({ success: false, message: 'Missing ownerEmail.' });
+
+    try {
+        const db = getDb();
+        const ctx = await resolveOwnerContext(db, ownerEmail);
+        if (ctx.isEmployee)
+            return res.status(403).json({ success: false, message: 'Only the company owner can manage integrations.' });
+
+        // Best-effort: ask the worker to log the linked device out. We still clear our
+        // own state if the worker is unreachable so the UI never gets stuck "connected".
+        let workerWarning = null;
+        try { await callWhatsAppWorker('/session/logout', { ownerEmail }); }
+        catch (e) { workerWarning = e.message; }
+
+        await db.collection('whatsapp_sessions').doc(ownerEmail).set({
+            status: 'disconnected', qr: null, phoneNumber: null, pushName: null,
+            updatedAt: new Date().toISOString(),
+        }, { merge: true });
+        await db.collection('users').doc(ownerEmail).set({ integrations: { whatsapp: null } }, { merge: true });
+
+        return res.json({
+            success: true,
+            message: 'WhatsApp disconnected.',
+            ...(workerWarning ? { warning: `Local link cleared, but the worker reported: ${workerWarning}` } : {}),
+        });
+    } catch (err) {
+        console.error('[WhatsApp/Disconnect]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// POST /api/whatsapp/session/update   (worker → backend)
+// body: { ownerEmail, status: 'qr'|'connected'|'logged_out'|'failed', qr?, phoneNumber?, pushName?, message? }
+async function handleWhatsAppSessionUpdate(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    if (!whatsappWorkerAuthOk(req)) return res.status(401).json({ success: false, message: 'Unauthorized.' });
+
+    const { ownerEmail, status, qr, phoneNumber, pushName, message } = req.body || {};
+    const ALLOWED = ['qr', 'connected', 'logged_out', 'failed', 'disconnected'];
+    if (!ownerEmail || !ALLOWED.includes(status))
+        return res.status(400).json({ success: false, message: 'Missing ownerEmail or invalid status.' });
+
+    try {
+        const db = getDb();
+        const now = new Date().toISOString();
+        const sessionRef = db.collection('whatsapp_sessions').doc(ownerEmail);
+
+        await sessionRef.set({
+            ownerEmail,
+            status,
+            qr: status === 'qr' ? (qr || null) : null,
+            phoneNumber: phoneNumber || null,
+            pushName: pushName || null,
+            message: message || null,
+            updatedAt: now,
+            ...(status === 'connected' ? { connectedAt: now } : {}),
+        }, { merge: true });
+
+        if (status === 'connected') {
+            await db.collection('users').doc(ownerEmail).set({
+                integrations: {
+                    whatsapp: {
+                        connected: true,
+                        phoneNumber: phoneNumber || null,
+                        pushName: pushName || null,
+                        label: phoneNumber ? `+${String(phoneNumber).replace(/^\+/, '')}` : (pushName || 'Linked device'),
+                        connectedAt: now,
+                    },
+                },
+            }, { merge: true });
+        } else if (status === 'logged_out' || status === 'disconnected') {
+            // The user unlinked from their phone (or we logged out) — the link is gone for good
+            await db.collection('users').doc(ownerEmail).set({ integrations: { whatsapp: null } }, { merge: true });
+        }
+
+        return res.json({ success: true });
+    } catch (err) {
+        console.error('[WhatsApp/Update]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// POST /api/whatsapp/incoming   (worker → backend → { reply })
+// body: { ownerEmail, chatId, isGroup, text, pushName?, senderId? }
+// The worker sends `reply` back through the linked device. reply === null means "stay silent".
+async function handleWhatsAppIncoming(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    if (!whatsappWorkerAuthOk(req)) return res.status(401).json({ success: false, message: 'Unauthorized.' });
+
+    const { ownerEmail, chatId, isGroup, text, pushName } = req.body || {};
+    const userText = String(text || '').trim();
+    if (!ownerEmail || !chatId) return res.status(400).json({ success: false, message: 'Missing ownerEmail or chatId.' });
+    if (!userText) return res.json({ success: true, reply: null });
+
+    try {
+        const db = getDb();
+
+        // Plan gate — a downgraded account stops answering on WhatsApp
+        const ctx = await resolveOwnerContext(db, ownerEmail);
+        const limits = resolvePlanLimits(ctx.ownerProfile);
+        if (!limits.features.whatsappAgent) return res.json({ success: true, reply: null, skipped: 'plan' });
+
+        // The first live agent that has WhatsApp turned on answers for this number
+        const botsSnap = await db.collection('user_bots').where('owner', '==', ownerEmail).get();
+        let agent = null;
+        botsSnap.forEach(d => {
+            const b = d.data();
+            if (agent || b.deletedAt) return;
+            if (normalizeChannels(b).includes('whatsapp')) agent = { id: d.id, data: b };
+        });
+        if (!agent) return res.json({ success: true, reply: null, skipped: 'no-whatsapp-agent' });
+
+        const wac = agent.data.whatsappConfig || {};
+        if (wac.enabled === false) return res.json({ success: true, reply: null, skipped: 'disabled' });
+        if (isGroup && !wac.respondToGroups) return res.json({ success: true, reply: null, skipped: 'groups-off' });
+
+        const chatKey = `${agent.id}__${String(chatId).replace(/\//g, '_')}`;
+        const chatRef = db.collection('whatsapp_chats').doc(chatKey);
+        const chatSnap = await chatRef.get();
+        const history = chatSnap.exists && Array.isArray(chatSnap.data().history)
+            ? chatSnap.data().history.slice(-12)
+            : [];
+
+        const result = await generateBotReply({
+            db,
+            businessId: agent.id,
+            userMsg: userText,
+            history,
+            conversationId: `wa-${agent.id}-${chatId}`,
+            source: 'whatsapp',
+        });
+
+        let replyText = String(result?.answer || "Sorry, I couldn't respond just now.");
+        // WhatsApp uses single-asterisk bold
+        replyText = replyText.replace(/\*\*(.+?)\*\*/g, '*$1*').substring(0, 4000);
+
+        const newHistory = [
+            ...history,
+            { role: 'user', content: userText },
+            { role: 'assistant', content: replyText },
+        ].slice(-24);
+
+        await chatRef.set({
+            businessId: agent.id,
+            ownerEmail,
+            whatsappChatId: chatId,
+            isGroup: !!isGroup,
+            contactName: pushName || null,
+            history: newHistory,
+            updatedAt: new Date().toISOString(),
+        }, { merge: true });
+
+        return res.json({ success: true, reply: replyText });
+    } catch (err) {
+        console.error('[WhatsApp/Incoming]', err.message);
+        // 200 + null reply so the worker doesn't retry-loop the same message
+        return res.json({ success: false, reply: null, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// EMAIL AGENT — IMAP/SMTP CONNECTION (Team and above)
 // feature: emailAgent
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -3468,7 +3783,6 @@ async function handleDeploy(req, res) {
         // ── Normalize channels (accepts both the new array and legacy strings) ──
         const incomingChannels = normalizeChannels(botData);
 
-        // Save the previous Telegram config so we can decide whether to re-register
         const priorTg = existingSnap.exists ? (existingSnap.data()?.telegramConfig || {}) : {};
 
         // ── Encrypt the Telegram bot token before persisting ──
@@ -3476,11 +3790,9 @@ async function handleDeploy(req, res) {
         const rawToken = typeof rawTg.botToken === 'string' ? rawTg.botToken.trim() : '';
         const incomingTgEnabled = incomingChannels.includes('telegram');
 
-        // If the client sent a token in the clear, encrypt it now. Otherwise preserve the old one.
         let botTokenEnc = priorTg.botTokenEnc || null;
         if (rawToken) botTokenEnc = encryptCredential(rawToken);
 
-        // A per-agent secret so the webhook receiver can verify Telegram's calls
         let webhookSecret = priorTg.webhookSecret || crypto.randomBytes(24).toString('hex');
 
         botData.channels = incomingChannels;
@@ -3493,7 +3805,14 @@ async function handleDeploy(req, res) {
             lastRegisteredAt: priorTg.lastRegisteredAt || null,
         };
 
-        // Normalize emailConfig so the reply job always reads a sane value.
+        // ── WhatsApp config: only ever store the fields we understand ──
+        const rawWa = botData.whatsappConfig || {};
+        botData.whatsappConfig = {
+            enabled: incomingChannels.includes('whatsapp'),
+            respondToGroups: !!rawWa.respondToGroups,
+            linkedNumber: rawWa.linkedNumber || null,
+        };
+
         if (incomingChannels.includes('email')) {
             const ec = botData.emailConfig || {};
             botData.emailConfig = {
@@ -3505,6 +3824,9 @@ async function handleDeploy(req, res) {
         }
 
         const featuresStripped = sanitizeBotDataForPlan(botData, limits);
+
+        // If the plan stripped WhatsApp, reflect that in the stored config too
+        if (!botData.channels.includes('whatsapp')) botData.whatsappConfig.enabled = false;
 
         botData.owner     = ctx.ownerEmail;
         botData.deletedAt = null;
@@ -3535,11 +3857,9 @@ async function handleDeploy(req, res) {
                 await botRef.set({
                     'telegramConfig.lastRegisterError': tgErr.message,
                 }, { merge: true });
-                // Don't fail the whole deploy — surface a warning to the client
                 if (!featuresStripped.includes('telegramWebhook')) featuresStripped.push('telegramWebhook');
             }
         } else if (!botData.telegramConfig.enabled && priorTg.botTokenEnc) {
-            // Channel was turned off — best-effort deleteWebhook
             try {
                 const token = decryptCredential(priorTg.botTokenEnc);
                 await deleteTelegramWebhook(token);
@@ -3665,20 +3985,9 @@ async function handleConfig(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// SHARED CHAT ENGINE — used by both /api/chat and the Telegram webhook
+// SHARED CHAT ENGINE — used by /api/chat, the Telegram webhook and WhatsApp
 // ════════════════════════════════════════════════════════════════════════════
 
-/**
- * Generate a reply for a given bot + user message. Handles:
- *   • Behavior toggles (out-of-topic, web search, hallucination, booking, handoff)
- *   • Sub-agent routing
- *   • Autonomous actions (tool calling)
- *   • Appointment booking / cancel / edit flows
- *   • Human handoff requests
- *   • Credit consumption + analytics logging
- *
- * @returns {Promise<{answer: string, meta: object}>}
- */
 async function generateBotReply({ db, businessId, userMsg, history = [], conversationId, source = 'web' }) {
     const convId = conversationId || `conv-${Date.now()}`;
     const meta = {};
@@ -3793,6 +4102,8 @@ async function generateBotReply({ db, businessId, userMsg, history = [], convers
         sysPrompt += `\n\nTHIS IS AN EMAIL REPLY. The user's message arrived via email. Write a clear, professional reply. Do NOT mention chat, widgets, or "typing". Include a brief sign-off. Format your response using Markdown where it improves clarity — use **bold** for key terms, names, or important values, and use "-" bullet points or "1." numbered lists for multi-part answers — since this reply is rendered as a richly formatted HTML email.`;
     } else if (source === 'telegram') {
         sysPrompt += `\n\nTHIS IS A TELEGRAM CONVERSATION. Keep replies natural and concise. Avoid markdown that Telegram can't render — plain text with short paragraphs works best.`;
+    } else if (source === 'whatsapp') {
+        sysPrompt += `\n\nTHIS IS A WHATSAPP CONVERSATION. Keep replies short, natural and conversational, like a text message. Use *single asterisks* for bold, "-" for simple lists, and no headings, tables or HTML.`;
     }
 
     const wantsHuman = humanHandoffEnabled && /speak to human support|connect (me )?(to )?(a )?human|talk to (a )?(human|person|someone|agent|representative)|(human|real) (agent|person)|customer service rep|talk to (someone|somebody) real/i.test(userMsg);
@@ -4574,9 +4885,9 @@ async function handleFirebaseProjectOAuth(req, res) {
     url.searchParams.set('redirect_uri',  redirectUri);
     url.searchParams.set('response_type', 'code');
     url.searchParams.set('scope', [
-    'https://www.googleapis.com/auth/firebase.readonly',
-    'https://www.googleapis.com/auth/datastore',
-].join(' '));
+        'https://www.googleapis.com/auth/firebase.readonly',
+        'https://www.googleapis.com/auth/datastore',
+    ].join(' '));
     url.searchParams.set('access_type',   'offline');
     url.searchParams.set('prompt',        'consent');
     url.searchParams.set('state',         state);
@@ -5606,9 +5917,7 @@ async function ensureHumanRequest(db, { businessId, botName, ownerEmail, convers
     return { requestId: baseId };
 }
 
-// ════════════════════════════════════════════════════════════════════════════
 // GET /api/human/list
-// ════════════════════════════════════════════════════════════════════════════
 async function handleHumanList(req, res) {
     const { ownerEmail } = req.query;
     if (!ownerEmail) return res.status(400).json({ success: false, message: 'Missing ownerEmail.' });
@@ -5643,9 +5952,7 @@ async function handleHumanList(req, res) {
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
 // POST /api/human/connect
-// ════════════════════════════════════════════════════════════════════════════
 async function handleHumanConnect(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
     const { requestId, agentEmail } = req.body || {};
@@ -5669,9 +5976,7 @@ async function handleHumanConnect(req, res) {
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
 // POST /api/human/send-message
-// ════════════════════════════════════════════════════════════════════════════
 async function handleHumanSendMessage(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
     const { requestId, sender, text, agentEmail } = req.body || {};
@@ -5699,9 +6004,7 @@ async function handleHumanSendMessage(req, res) {
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
 // GET /api/human/poll
-// ════════════════════════════════════════════════════════════════════════════
 async function handleHumanPoll(req, res) {
     const { requestId, sinceTs } = req.query;
     if (!requestId) return res.status(400).json({ success: false, message: 'Missing requestId.' });
@@ -5726,9 +6029,7 @@ async function handleHumanPoll(req, res) {
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
 // POST /api/human/close
-// ════════════════════════════════════════════════════════════════════════════
 async function handleHumanClose(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
     const { requestId, agentEmail, closedBy } = req.body || {};
@@ -5908,6 +6209,12 @@ async function handleAccountChangeEmail(req, res) {
         await db.collection('users').doc(newEmail).set(profile, { merge: true });
         await db.collection('users').doc(oldEmail).delete().catch(() => {});
 
+        // The WhatsApp worker keys its linked session by owner email, so it can't follow an
+        // email change. Log the device out and make the user re-link under the new address.
+        try { await callWhatsAppWorker('/session/logout', { ownerEmail: oldEmail }); } catch (e) { /* worker may be offline */ }
+        await db.collection('whatsapp_sessions').doc(oldEmail).delete().catch(() => {});
+        await db.collection('users').doc(newEmail).set({ integrations: { whatsapp: null } }, { merge: true }).catch(() => {});
+
         const ownerCollections = ['user_bots', 'appointments', 'reports', 'leads'];
         for (const col of ownerCollections) {
             const snap = await db.collection(col).where('owner', '==', oldEmail).get();
@@ -5917,12 +6224,11 @@ async function handleAccountChangeEmail(req, res) {
             await batch.commit();
         }
 
-        for (const col of ['email_drafts', 'email_queue', 'telegram_sessions']) {
-            const field = col === 'telegram_sessions' ? 'ownerEmail' : 'ownerEmail';
-            const snap = await db.collection(col).where(field, '==', oldEmail).get();
+        for (const col of ['email_drafts', 'email_queue', 'telegram_sessions', 'whatsapp_chats']) {
+            const snap = await db.collection(col).where('ownerEmail', '==', oldEmail).get();
             if (snap.empty) continue;
             const batch = db.batch();
-            snap.docs.forEach(d => batch.update(d.ref, { [field]: newEmail }));
+            snap.docs.forEach(d => batch.update(d.ref, { ownerEmail: newEmail }));
             await batch.commit();
         }
 
