@@ -58,6 +58,7 @@ const FEATURE_CATALOG = {
     googleCalendar:     { label: 'Google Calendar Auto-Booking',            plans: ['team', 'teamplus', 'enterprise'] },
     pushNotifications:  { label: 'Desktop Push Notifications',              plans: ['team', 'teamplus', 'enterprise'] },
     emailAgent:         { label: 'Email Agent (IMAP/SMTP Inbox)',           plans: ['team', 'teamplus', 'enterprise'] },
+    telegramAgent:      { label: 'Telegram Channel',                        plans: ['teamplus', 'enterprise'] },
     firebaseDatabase:   { label: 'Firebase Live Database Source',           plans: ['teamplus', 'enterprise'] },
     supabaseDatabase:   { label: 'Supabase Live Database Source',           plans: ['teamplus', 'enterprise'] },
     canvaDesign:        { label: 'Canva Design Import',                     plans: ['teamplus', 'enterprise'] },
@@ -67,6 +68,48 @@ const FEATURE_CATALOG = {
 
 const DB_SERVICE_FEATURE = { firebase: 'firebaseDatabase', supabase: 'supabaseDatabase' };
 const DESIGN_SERVICE_FEATURE = { canva: 'canvaDesign', figma: 'figmaDesign' };
+
+// ── Channel helpers (Website / Email / Telegram) ─────────────────────────────
+const ALL_CHANNELS = ['widget', 'email', 'telegram'];
+
+function normalizeChannels(botData) {
+    let channels = Array.isArray(botData?.channels)
+        ? botData.channels.filter(c => ALL_CHANNELS.includes(c))
+        : [];
+
+    if (!channels.length) {
+        // Derive from legacy agentBuildMode
+        const m = botData?.agentBuildMode || 'widget';
+        const map = {
+            widget:            ['widget'],
+            email:             ['email'],
+            telegram:          ['telegram'],
+            both:              ['widget', 'email'],
+            'widget+telegram': ['widget', 'telegram'],
+            'email+telegram':  ['email', 'telegram'],
+            all:               ['widget', 'email', 'telegram'],
+        };
+        channels = map[m] || ['widget'];
+    }
+
+    channels = [...new Set(channels)].sort(
+        (a, b) => ALL_CHANNELS.indexOf(a) - ALL_CHANNELS.indexOf(b)
+    );
+    if (!channels.length) channels = ['widget'];
+    return channels;
+}
+
+function deriveBuildMode(channels) {
+    const c = channels || [];
+    const w = c.includes('widget'), e = c.includes('email'), t = c.includes('telegram');
+    if (w && e && t) return 'all';
+    if (w && e)      return 'both';
+    if (w && t)      return 'widget+telegram';
+    if (e && t)      return 'email+telegram';
+    if (e)           return 'email';
+    if (t)           return 'telegram';
+    return 'widget';
+}
 
 function requiredPlanTiers(featureKey) {
     const def = FEATURE_CATALOG[featureKey];
@@ -188,10 +231,21 @@ function sanitizeBotDataForPlan(botData, limits) {
         }
     }
 
-    if (!f.emailAgent && (botData.agentBuildMode === 'email' || botData.agentBuildMode === 'both')) {
-        botData.agentBuildMode = 'widget';
+    // ── Channel-level gating: strip any channel the plan doesn't include ──
+    const channels = normalizeChannels(botData);
+    let filtered = channels.slice();
+    if (!f.emailAgent && filtered.includes('email')) {
+        filtered = filtered.filter(c => c !== 'email');
         stripped.push('emailAgent');
     }
+    if (!f.telegramAgent && filtered.includes('telegram')) {
+        filtered = filtered.filter(c => c !== 'telegram');
+        stripped.push('telegramAgent');
+    }
+    if (!filtered.length) filtered = ['widget'];
+
+    botData.channels = filtered;
+    botData.agentBuildMode = deriveBuildMode(filtered);
 
     return [...new Set(stripped)];
 }
@@ -941,6 +995,9 @@ export default async function handler(req, res) {
     if (path === '/api/email/reject')        return handleEmailReject(req, res);
     if (path === '/api/email/agent-stats')   return handleEmailAgentStats(req, res);
 
+    // ── Telegram webhook receiver ──
+    if (path.startsWith('/api/telegram/webhook/')) return handleTelegramWebhook(req, res, path);
+
     if (path === '/api/oauth/firebase-project')          return handleFirebaseProjectOAuth(req, res);
     if (path === '/api/oauth/firebase-project/callback')  return handleFirebaseProjectCallback(req, res);
     if (path === '/api/oauth/supabase')                   return handleSupabaseOAuth(req, res);
@@ -1288,7 +1345,7 @@ async function handleWhopWebhook(req, res) {
                         maxSeats: seatCount,
                         integrations: {
                             firebase: true, supabase: true, canva: true, figma: true,
-                            google_calendar: true, push_alerts: true, email_agent: true,
+                            google_calendar: true, push_alerts: true, email_agent: true, telegram_agent: true,
                         },
                         status: 'active',
                         whopMembershipId: data.id || null,
@@ -1674,6 +1731,18 @@ async function deleteSubcollection(db, parentRef, subName) {
 async function wipeBotCompletely(db, botId) {
     const botRef = db.collection('user_bots').doc(botId);
 
+    // Best-effort: tear down the Telegram webhook if one was registered
+    try {
+        const snap = await botRef.get();
+        const tg = snap.exists ? snap.data()?.telegramConfig : null;
+        if (tg?.botTokenEnc) {
+            const token = decryptCredential(tg.botTokenEnc);
+            await callTelegramApi(token, 'deleteWebhook', {});
+        }
+    } catch (e) {
+        console.warn('[wipeBotCompletely/Telegram] deleteWebhook skipped:', e.message);
+    }
+
     await deleteSubcollection(db, botRef, 'chats');
     await deleteSubcollection(db, botRef, 'appointments');
     await deleteSubcollection(db, botRef, 'reports');
@@ -1682,9 +1751,10 @@ async function wipeBotCompletely(db, botId) {
     await deleteQueryBatch(db, db.collection('reports').where('businessId', '==', botId));
     await deleteQueryBatch(db, db.collection('leads').where('businessId', '==', botId));
 
-    // Clean up email drafts + queued email for this agent
+    // Clean up email drafts + queued email + telegram sessions for this agent
     await deleteQueryBatch(db, db.collection('email_drafts').where('businessId', '==', botId));
     await deleteQueryBatch(db, db.collection('email_queue').where('businessId', '==', botId));
+    await deleteQueryBatch(db, db.collection('telegram_sessions').where('businessId', '==', botId));
 
     await botRef.delete().catch(() => {});
 }
@@ -1776,6 +1846,7 @@ async function handleAccountDeleteCascade(req, res) {
         await deleteQueryBatch(db, db.collection('leads').where('owner', '==', email));
         await deleteQueryBatch(db, db.collection('email_drafts').where('ownerEmail', '==', email));
         await deleteQueryBatch(db, db.collection('email_queue').where('ownerEmail', '==', email));
+        await deleteQueryBatch(db, db.collection('telegram_sessions').where('ownerEmail', '==', email));
 
         await db.collection('users').doc(email).delete().catch(() => {});
 
@@ -1795,33 +1866,213 @@ async function handleAccountDeleteCascade(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// EMAIL AGENT — IMAP/SMTP CONNECTION (Team+ and above)
-// feature: emailAgent
+// CREDENTIAL CIPHER (shared by Email IMAP/SMTP passwords + Telegram bot tokens)
 // ════════════════════════════════════════════════════════════════════════════
 
-function getEmailCipherKey() {
+function getCredentialCipherKey() {
     const raw = process.env.EMAIL_CRED_KEY;
-    if (!raw) throw new Error('Missing EMAIL_CRED_KEY env var (used to encrypt inbox passwords).');
+    if (!raw) throw new Error('Missing EMAIL_CRED_KEY env var (used to encrypt stored credentials).');
     return crypto.createHash('sha256').update(raw).digest();
 }
 
-function encryptEmailPassword(plain) {
+function encryptCredential(plain) {
     const iv = crypto.randomBytes(12);
-    const cipher = crypto.createCipheriv('aes-256-gcm', getEmailCipherKey(), iv);
+    const cipher = crypto.createCipheriv('aes-256-gcm', getCredentialCipherKey(), iv);
     const enc = Buffer.concat([cipher.update(String(plain), 'utf8'), cipher.final()]);
     const tag = cipher.getAuthTag();
     return Buffer.concat([iv, tag, enc]).toString('base64');
 }
 
-function decryptEmailPassword(blob) {
+function decryptCredential(blob) {
     const buf = Buffer.from(blob, 'base64');
     const iv  = buf.subarray(0, 12);
     const tag = buf.subarray(12, 28);
     const enc = buf.subarray(28);
-    const decipher = crypto.createDecipheriv('aes-256-gcm', getEmailCipherKey(), iv);
+    const decipher = crypto.createDecipheriv('aes-256-gcm', getCredentialCipherKey(), iv);
     decipher.setAuthTag(tag);
     return Buffer.concat([decipher.update(enc), decipher.final()]).toString('utf8');
 }
+
+// Legacy aliases so the existing email code keeps working verbatim.
+function getEmailCipherKey() { return getCredentialCipherKey(); }
+function encryptEmailPassword(plain) { return encryptCredential(plain); }
+function decryptEmailPassword(blob) { return decryptCredential(blob); }
+
+// ════════════════════════════════════════════════════════════════════════════
+// TELEGRAM — WEBHOOK REGISTRATION & BOT API CALLS
+// ════════════════════════════════════════════════════════════════════════════
+
+const TELEGRAM_API_BASE = 'https://api.telegram.org';
+
+/**
+ * POST a JSON body to a Telegram Bot API method.
+ * `token` is the plaintext bot token (never persisted in that form).
+ */
+async function callTelegramApi(token, method, body, { timeoutMs = 8000 } = {}) {
+    const url = `${TELEGRAM_API_BASE}/bot${token}/${method}`;
+    const r = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body || {}),
+        signal: AbortSignal.timeout(timeoutMs),
+    });
+    let parsed;
+    try { parsed = await r.json(); } catch { parsed = null; }
+    if (!r.ok || (parsed && parsed.ok === false)) {
+        const msg = parsed?.description || `HTTP ${r.status}`;
+        throw new Error(`Telegram ${method} failed: ${msg}`);
+    }
+    return parsed?.result;
+}
+
+/**
+ * Register (or update) the webhook that Telegram will POST updates to.
+ * We generate a per-agent secret token so the receiver can verify the call.
+ */
+async function registerTelegramWebhook({ token, businessId, secret, publicBaseUrl }) {
+    const url = `${publicBaseUrl.replace(/\/+$/, '')}/api/telegram/webhook/${encodeURIComponent(businessId)}`;
+    return callTelegramApi(token, 'setWebhook', {
+        url,
+        secret_token: secret,
+        allowed_updates: ['message', 'edited_message'],
+        drop_pending_updates: true,
+    });
+}
+
+async function deleteTelegramWebhook(token) {
+    try {
+        return await callTelegramApi(token, 'deleteWebhook', { drop_pending_updates: true });
+    } catch (e) {
+        console.warn('[Telegram/deleteWebhook]', e.message);
+        return null;
+    }
+}
+
+/** Send a plain-text reply back to the user. Telegram's Markdown is finicky, so we send as-is. */
+async function sendTelegramMessage(token, chatId, text) {
+    const safe = String(text || '').substring(0, 4000) || '(empty reply)';
+    return callTelegramApi(token, 'sendMessage', {
+        chat_id: chatId,
+        text: safe,
+        disable_web_page_preview: true,
+    });
+}
+
+function getPublicBaseUrl(req) {
+    return process.env.PUBLIC_BACKEND_URL ||
+           process.env.APP_URL ||
+           `https://${req.headers.host}`;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/telegram/webhook/:businessId
+// Telegram posts every message here. We validate the secret header, look up
+// the agent, run the SAME AI pipeline used by the web widget, and reply back.
+// ════════════════════════════════════════════════════════════════════════════
+async function handleTelegramWebhook(req, res, path) {
+    if (req.method !== 'POST') return res.status(405).json({ ok: false });
+
+    const businessId = decodeURIComponent(path.replace('/api/telegram/webhook/', ''));
+    if (!businessId) return res.status(400).json({ ok: false, message: 'Missing businessId.' });
+
+    try {
+        const db = getDb();
+        const botSnap = await db.collection('user_bots').doc(businessId).get();
+        if (!botSnap.exists) {
+            console.warn('[Telegram/Webhook] Unknown agent:', businessId);
+            return res.status(200).json({ ok: true });   // 200 so Telegram doesn't retry forever
+        }
+        const bot = botSnap.data();
+        if (bot.deletedAt) return res.status(200).json({ ok: true });
+
+        const tg = bot.telegramConfig || {};
+        if (!tg.enabled || !tg.botTokenEnc) {
+            return res.status(200).json({ ok: true });
+        }
+
+        // Verify the shared secret Telegram sends on every request
+        const incomingSecret = req.headers['x-telegram-bot-api-secret-token'];
+        if (tg.webhookSecret && incomingSecret !== tg.webhookSecret) {
+            console.warn('[Telegram/Webhook] Secret mismatch for', businessId);
+            return res.status(401).json({ ok: false });
+        }
+
+        const token = decryptCredential(tg.botTokenEnc);
+        const update = req.body || {};
+        const message = update.message || update.edited_message;
+
+        if (!message || !message.chat?.id) return res.status(200).json({ ok: true });
+
+        const chatId = message.chat.id;
+        const userText = (message.text || message.caption || '').trim();
+        if (!userText) {
+            // Non-text messages (stickers/photos): politely tell them only text is supported
+            try {
+                await sendTelegramMessage(token, chatId, "I can only read text messages right now — could you type your question?");
+            } catch {}
+            return res.status(200).json({ ok: true });
+        }
+
+        // Ignore obvious Telegram commands
+        if (/^\/(start|help|settings|stop)\b/i.test(userText)) {
+            const greeting = `Hi! I'm ${bot.displayName || bot.name || 'the assistant'}. Ask me anything about this business.`;
+            try { await sendTelegramMessage(token, chatId, greeting); } catch {}
+            return res.status(200).json({ ok: true });
+        }
+
+        // ── Session history is keyed by (businessId, chatId) so each user has their own thread ──
+        const sessionId = `${businessId}__${chatId}`;
+        const sessionRef = db.collection('telegram_sessions').doc(sessionId);
+        const sessionSnap = await sessionRef.get();
+        const session = sessionSnap.exists ? sessionSnap.data() : {};
+        const history = Array.isArray(session.history) ? session.history.slice(-12) : [];
+
+        // ── Run the same AI pipeline used by the web widget ──
+        const result = await generateBotReply({
+            db,
+            businessId,
+            userMsg: userText,
+            history,
+            conversationId: `tg-${businessId}-${chatId}`,
+            source: 'telegram',
+        });
+
+        const replyText = result?.answer || "Sorry, I couldn't respond just now.";
+
+        // Persist updated history (cap to last 24 entries for storage hygiene)
+        const newHistory = [
+            ...history,
+            { role: 'user', content: userText },
+            { role: 'assistant', content: replyText },
+        ].slice(-24);
+        await sessionRef.set({
+            businessId,
+            ownerEmail: bot.owner || null,
+            telegramChatId: chatId,
+            telegramUsername: message.from?.username || null,
+            history: newHistory,
+            updatedAt: new Date().toISOString(),
+        }, { merge: true });
+
+        // Reply on Telegram
+        try {
+            await sendTelegramMessage(token, chatId, replyText);
+        } catch (e) {
+            console.error('[Telegram/Webhook/sendMessage]', e.message);
+        }
+
+        return res.status(200).json({ ok: true });
+    } catch (err) {
+        console.error('[Telegram/Webhook]', err.message);
+        // Always 200 so Telegram doesn't retry the same update forever
+        return res.status(200).json({ ok: true });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// EMAIL AGENT — IMAP/SMTP CONNECTION (Team+ and above)
+// feature: emailAgent
+// ════════════════════════════════════════════════════════════════════════════
 
 async function testImapLogin({ host, port, useSSL, address, password }) {
     const client = new ImapFlow({
@@ -1862,9 +2113,6 @@ async function testSmtpLogin({ host, port, useSSL, address, password }) {
 }
 
 // ── Email HTML formatting: markdown-style AI replies → styled HTML email ──
-// Mirrors the frontend's window.formatEmailBodyHtml() so bold/italic/lists
-// that render correctly in the Email Dashboard preview also render correctly
-// in the actual email the customer receives, plus an "Auto-replied with AI" badge.
 function escapeHtmlForEmail(str) {
     return String(str || '')
         .replace(/&/g, '&amp;')
@@ -1936,9 +2184,6 @@ function buildEmailHtmlBody(replyText, botName) {
     </div>`;
 }
 
-// Shared helper: sends an outbound email through the owner's connected inbox.
-// `html` is auto-generated from `text` (markdown → styled HTML + AI badge)
-// unless an explicit `html` override is passed in.
 async function sendEmailViaSMTP(emailCfg, password, { to, subject, text, html, botName }) {
     const transporter = nodemailer.createTransport({
         host: emailCfg.smtpHost,
@@ -1959,8 +2204,6 @@ async function sendEmailViaSMTP(emailCfg, password, { to, subject, text, html, b
     });
 }
 
-// Parse the "DD:HH:MM" auto-send delay string into milliseconds.
-// Defaults to 2 minutes when missing/invalid.
 function parseAutoSendDelay(delayStr) {
     const s = String(delayStr || '').trim();
     const m = s.match(/^(\d{1,3}):(\d{2}):(\d{2})$/);
@@ -1987,10 +2230,8 @@ async function handleEmailConnect(req, res) {
     try {
         const db = getDb();
 
-        // Plan gate — Email Agent is Team+ and above.
         if (await denyIfFeatureLocked(res, db, ownerEmail, 'emailAgent')) return;
 
-        // 1. IMAP handshake
         try {
             await testImapLogin({ host: imapHost, port: imapPort, useSSL, address, password });
         } catch (err) {
@@ -2001,7 +2242,6 @@ async function handleEmailConnect(req, res) {
             });
         }
 
-        // 2. SMTP handshake
         try {
             await testSmtpLogin({ host: smtpHost, port: smtpPort, useSSL, address, password });
         } catch (err) {
@@ -2012,7 +2252,6 @@ async function handleEmailConnect(req, res) {
             });
         }
 
-        // 3. Save encrypted credentials + settings
         await db.collection('users').doc(ownerEmail).set({
             integrations: {
                 email: {
@@ -2023,7 +2262,7 @@ async function handleEmailConnect(req, res) {
                     smtpHost,
                     smtpPort: Number(smtpPort),
                     useSSL: !!useSSL,
-                    passwordEnc: encryptEmailPassword(password),
+                    passwordEnc: encryptCredential(password),
                     connectedAt: new Date().toISOString(),
                     lastFetchAt: null,
                     lastFetchError: null,
@@ -2052,8 +2291,6 @@ async function handleEmailDisconnect(req, res) {
             integrations: { email: null },
         }, { merge: true });
 
-        // Clear any dangling pending/scheduled drafts so the dashboard doesn't
-        // show orphans after the inbox is gone.
         try {
             const draftsSnap = await db.collection('email_drafts')
                 .where('ownerEmail', '==', ownerEmail)
@@ -2102,7 +2339,6 @@ async function handleEmailStatus(req, res) {
 // EMAIL DASHBOARD ENDPOINTS (pending / approve / reject / stats)
 // ════════════════════════════════════════════════════════════════════════════
 
-// GET /api/email/pending?ownerEmail=
 async function handleEmailPending(req, res) {
     const { ownerEmail } = req.query;
     if (!ownerEmail) return res.status(400).json({ success: false, message: 'Missing ownerEmail.' });
@@ -2115,8 +2351,6 @@ async function handleEmailPending(req, res) {
 
         const pending = [];
         snap.forEach(d => pending.push({ id: d.id, ...d.data() }));
-
-        // Newest first
         pending.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
 
         return res.json({ success: true, pending });
@@ -2126,7 +2360,6 @@ async function handleEmailPending(req, res) {
     }
 }
 
-// POST /api/email/approve  { draftId, businessId?, ownerEmail, finalResponse }
 async function handleEmailApprove(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
     const { draftId, ownerEmail, finalResponse } = req.body || {};
@@ -2148,15 +2381,13 @@ async function handleEmailApprove(req, res) {
             return res.status(409).json({ success: false, message: `This draft is already ${draft.status}.` });
         }
 
-        // Load inbox config
         const userSnap = await db.collection('users').doc(ownerEmail).get();
         const emailCfg = userSnap.data()?.integrations?.email;
         if (!emailCfg?.connected) {
             return res.status(400).json({ success: false, message: 'Your email inbox is disconnected. Reconnect it before approving.' });
         }
-        const password = decryptEmailPassword(emailCfg.passwordEnc);
+        const password = decryptCredential(emailCfg.passwordEnc);
 
-                // Send via SMTP (HTML formatting + AI badge auto-applied)
         await sendEmailViaSMTP(emailCfg, password, {
             to: draft.fromEmail,
             subject: `Re: ${draft.subject || '(no subject)'}`,
@@ -2164,7 +2395,6 @@ async function handleEmailApprove(req, res) {
             botName: draft.botName,
         });
 
-        // Mark as sent
         const now = new Date().toISOString();
         await draftRef.set({
             status: 'sent',
@@ -2174,7 +2404,6 @@ async function handleEmailApprove(req, res) {
             approvedBy: ownerEmail,
         }, { merge: true });
 
-        // Also mark the corresponding queue item as done, if it exists
         if (draft.queueId) {
             try {
                 await db.collection('email_queue').doc(draft.queueId).set({
@@ -2186,12 +2415,10 @@ async function handleEmailApprove(req, res) {
             } catch (e) { /* best-effort */ }
         }
 
-        // Log it in the agent's chat history for analytics
         if (draft.businessId) {
             await logChat(db, draft.businessId, `email-${draftId}`, draft.originalQuery || '', finalResponse, true, false, { source: 'email' });
         }
 
-        // Best-effort status update on the user doc
         try {
             await db.collection('users').doc(ownerEmail).set({
                 integrations: { email: { lastReplyAt: now, lastReplyError: null } },
@@ -2202,7 +2429,6 @@ async function handleEmailApprove(req, res) {
     } catch (err) {
         console.error('[Email/Approve]', err.message);
 
-        // Try to persist the failure so the dashboard can surface it
         try {
             if (req.body?.draftId) {
                 await getDb().collection('email_drafts').doc(req.body.draftId).set({
@@ -2217,7 +2443,6 @@ async function handleEmailApprove(req, res) {
     }
 }
 
-// POST /api/email/reject  { draftId, ownerEmail }
 async function handleEmailReject(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
     const { draftId, ownerEmail } = req.body || {};
@@ -2246,7 +2471,6 @@ async function handleEmailReject(req, res) {
             rejectedBy: ownerEmail,
         }, { merge: true });
 
-        // Mark queue item so it doesn't get picked up again
         if (draft.queueId) {
             try {
                 await db.collection('email_queue').doc(draft.queueId).set({
@@ -2263,7 +2487,6 @@ async function handleEmailReject(req, res) {
     }
 }
 
-// GET /api/email/agent-stats?businessId=&ownerEmail=
 async function handleEmailAgentStats(req, res) {
     const { businessId, ownerEmail } = req.query;
     if (!businessId || !ownerEmail) {
@@ -2272,15 +2495,12 @@ async function handleEmailAgentStats(req, res) {
     try {
         const db = getDb();
 
-        // Verify ownership
         const botSnap = await db.collection('user_bots').doc(businessId).get();
         if (!botSnap.exists) return res.status(404).json({ success: false, message: 'Agent not found.' });
         if (botSnap.data()?.owner !== ownerEmail) {
             return res.status(403).json({ success: false, message: 'You do not own this agent.' });
         }
 
-        // Pending = drafts waiting for approval
-        // Sent = drafts that were sent (approved) — auto-sent ones counted via queue below
         const [pendingSnap, sentSnap, queueSentSnap] = await Promise.all([
             db.collection('email_drafts')
                 .where('businessId', '==', businessId)
@@ -2309,18 +2529,11 @@ async function handleEmailAgentStats(req, res) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // POST /api/email/poll-worker
-//
-// Split into two jobs so it stays under Vercel Hobby's 10-second function cap:
-//   • Even UTC minute  → FETCH job  (IMAP → Firestore `email_queue`)
-//   • Odd  UTC minute  → REPLY job  (queue → LLM → SMTP or email_drafts)
-//
-// The REPLY job also first sends any `scheduled` drafts whose scheduledAt has
-// already passed (from agents where auto-send is ON but with a delay).
 // ════════════════════════════════════════════════════════════════════════════
-const EMAIL_TICK_BUDGET_MS = 8000;          // hard cap — leave 2s headroom before Vercel kills us
-const EMAIL_MAX_INBOXES_PER_FETCH = 3;      // inboxes visited per fetch run
-const EMAIL_REPLY_BATCH_SIZE = 5;           // parallel SMTP+LLM sends per reply run
-const EMAIL_SCHEDULED_BATCH_SIZE = 5;       // scheduled drafts processed per reply run
+const EMAIL_TICK_BUDGET_MS = 8000;
+const EMAIL_MAX_INBOXES_PER_FETCH = 3;
+const EMAIL_REPLY_BATCH_SIZE = 5;
+const EMAIL_SCHEDULED_BATCH_SIZE = 5;
 
 async function handleEmailPollWorker(req, res) {
     const cronSecret = process.env.EMAIL_WORKER_SECRET;
@@ -2345,10 +2558,6 @@ async function handleEmailPollWorker(req, res) {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// JOB A — FETCH: connect to each connected inbox, pull UNSEEN emails into the
-// `email_queue` Firestore collection, mark them Seen. NO LLM, NO SMTP.
-// ────────────────────────────────────────────────────────────────────────────
 async function runEmailFetchJob(db, startedAt) {
     const usersSnap = await db.collection('users').get();
     const targets = [];
@@ -2384,7 +2593,7 @@ async function runEmailFetchJob(db, startedAt) {
 }
 
 async function fetchOneInbox(db, ownerEmail, config, startedAt) {
-    const password = decryptEmailPassword(config.passwordEnc);
+    const password = decryptCredential(config.passwordEnc);
 
     const client = new ImapFlow({
         host: config.imapHost,
@@ -2398,7 +2607,6 @@ async function fetchOneInbox(db, ownerEmail, config, startedAt) {
         socketTimeout:     8000,
     });
 
-    // CRITICAL: without this listener, async socket errors crash the whole Node process.
     let socketError = null;
     client.on('error', (err) => { socketError = err; });
 
@@ -2411,26 +2619,19 @@ async function fetchOneInbox(db, ownerEmail, config, startedAt) {
 
         lock = await client.getMailboxLock('INBOX');
 
-        // Find the owner's email-capable agent before we start queuing, so the
-        // reply job has everything it needs stored on the queue doc.
         const botsSnap = await db.collection('user_bots').where('owner', '==', ownerEmail).get();
         let emailAgent = null;
         botsSnap.forEach(d => {
             const b = d.data();
             if (b.deletedAt) return;
-            if ((b.agentBuildMode === 'email' || b.agentBuildMode === 'both') && !emailAgent) {
+            const chans = normalizeChannels(b);
+            if (chans.includes('email') && !emailAgent) {
                 emailAgent = { id: d.id, name: b.displayName || b.name || 'Assistant' };
             }
         });
         if (!emailAgent) return { skipped: 'no-email-agent' };
 
-        // ── FIX: Only process emails that arrived AFTER the inbox was
-        // connected. Anything older is silently marked Seen and skipped, so
-        // a freshly-connected inbox full of historical unread mail doesn't
-        // get flooded with auto-replies. ──
         const connectedAtMs = config.connectedAt ? new Date(config.connectedAt).getTime() : 0;
-        // If connectedAt is missing (legacy rows), fall back to 24h ago so we
-        // never accidentally process ancient mail.
         const cutoffMs = connectedAtMs || (Date.now() - 24 * 60 * 60 * 1000);
 
         const uids = await client.search({ seen: false }, { uid: true });
@@ -2451,15 +2652,12 @@ async function fetchOneInbox(db, ownerEmail, config, startedAt) {
                 const fromEmail = msg.envelope?.from?.[0]?.address;
                 if (!fromEmail) continue;
 
-                // ── Skip pre-connection emails (Bug 1 fix) ──
                 const receivedMs = msg.internalDate ? new Date(msg.internalDate).getTime() : 0;
                 if (receivedMs && receivedMs < cutoffMs - 60_000) {
-                    // Mark as Seen so it's never picked up again, but don't queue it.
                     try { await client.messageFlagsAdd(uid, ['\\Seen'], { uid: true }); } catch {}
                     continue;
                 }
 
-                // Idempotency: don't queue the same UID twice for the same user.
                 const queueRef = db.collection('email_queue').doc(`${ownerEmail}__${uid}`);
                 const existing = await queueRef.get();
                 if (existing.exists) {
@@ -2497,22 +2695,9 @@ async function fetchOneInbox(db, ownerEmail, config, startedAt) {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// JOB B — REPLY:
-//   1. First: send any `scheduled` drafts whose scheduledAt has passed.
-//   2. Then: pull up to 5 pending emails from the queue and process them
-//      IN PARALLEL. LLM + (SMTP OR draft-write) calls run concurrently.
-//
-// Branch on emailConfig.requireHumanApproval:
-//   • TRUE  → write email_drafts { status: 'pending' } + FCM push, no send.
-//   • FALSE → if delay > 0: write email_drafts { status: 'scheduled' };
-//             else send now and mark queue done.
-// ────────────────────────────────────────────────────────────────────────────
 async function runEmailReplyJob(db, startedAt) {
-    // Step 1 — send due scheduled drafts
     const scheduledResult = await processDueScheduledDrafts(db, startedAt);
 
-    // Step 2 — process new queue items
     const queueSnap = await db.collection('email_queue')
         .where('status', '==', 'pending')
         .orderBy('createdAt', 'asc')
@@ -2525,7 +2710,6 @@ async function runEmailReplyJob(db, startedAt) {
 
     const items = queueSnap.docs.map(d => ({ ref: d.ref, id: d.id, ...d.data() }));
 
-    // Group by owner so we can batch-consume credits per user atomically.
     const byOwner = {};
     items.forEach(it => {
         (byOwner[it.ownerEmail] ||= []).push(it);
@@ -2579,9 +2763,6 @@ async function runEmailReplyJob(db, startedAt) {
     };
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Process drafts whose scheduledAt has passed and send them via SMTP.
-// ────────────────────────────────────────────────────────────────────────────
 async function processDueScheduledDrafts(db, startedAt) {
     try {
         const nowISO = new Date().toISOString();
@@ -2613,13 +2794,11 @@ async function processDueScheduledDrafts(db, startedAt) {
 async function sendScheduledDraft(db, draftId, draft) {
     const draftRef = db.collection('email_drafts').doc(draftId);
 
-    // Reload to make sure status hasn't changed (e.g. user approved/rejected)
     const fresh = await draftRef.get();
     if (!fresh.exists) return { skipped: 'not-found' };
     const d = fresh.data();
     if (d.status !== 'scheduled') return { skipped: 'not-scheduled' };
 
-    // Load email config
     const userSnap = await db.collection('users').doc(d.ownerEmail).get();
     const emailCfg = userSnap.data()?.integrations?.email;
     if (!emailCfg?.connected) {
@@ -2630,9 +2809,9 @@ async function sendScheduledDraft(db, draftId, draft) {
         }, { merge: true });
         return { error: 'inbox-disconnected' };
     }
-    const password = decryptEmailPassword(emailCfg.passwordEnc);
+    const password = decryptCredential(emailCfg.passwordEnc);
 
-        try {
+    try {
         await sendEmailViaSMTP(emailCfg, password, {
             to: d.fromEmail,
             subject: `Re: ${d.subject || '(no subject)'}`,
@@ -2679,9 +2858,8 @@ async function processQueuedEmail(db, queueId, item, startedAt) {
     }
     const bot = botSnap.data();
 
-    // ── Email-specific config: approval + auto-send delay ──
     const emailConfig = bot.emailConfig || {};
-    const requireHumanApproval = emailConfig.requireHumanApproval !== false;   // default: ON
+    const requireHumanApproval = emailConfig.requireHumanApproval !== false;
     const autoSendDelay = emailConfig.autoSendDelay || '00:00:02';
 
     const ctx = await resolveOwnerContext(db, item.ownerEmail);
@@ -2691,16 +2869,14 @@ async function processQueuedEmail(db, queueId, item, startedAt) {
         return { skipped: 'plan' };
     }
 
-    // Resolve inbox config again (may have changed since queue time)
     const userSnap = await db.collection('users').doc(item.ownerEmail).get();
     const emailCfg = userSnap.data()?.integrations?.email;
     if (!emailCfg?.connected) {
         await queueRef.set({ status: 'failed', error: 'inbox-disconnected', failedAt: new Date().toISOString() }, { merge: true });
         return { error: 'inbox-disconnected' };
     }
-    const password = decryptEmailPassword(emailCfg.passwordEnc);
+    const password = decryptCredential(emailCfg.passwordEnc);
 
-    // ── LLM call to draft the reply ──
     const sysPrompt = bot.knowledgeContext?.systemPrompt
         || `You are a helpful assistant replying to an email. Keep replies concise and professional.`;
     const webContext = bot.context ? `\n\n[WEBSITE CONTENT]:\n${bot.context}` : '';
@@ -2717,7 +2893,6 @@ async function processQueuedEmail(db, queueId, item, startedAt) {
 
     const nowISO = new Date().toISOString();
 
-    // ── BRANCH 1: Human approval required → stage as pending draft ──
     if (requireHumanApproval) {
         const draftRef = await db.collection('email_drafts').add({
             ownerEmail: item.ownerEmail,
@@ -2732,9 +2907,6 @@ async function processQueuedEmail(db, queueId, item, startedAt) {
             createdAt: nowISO,
         });
 
-        // Fire a push notification so the owner can review quickly.
-        // Purpose='email' so only devices connected to the Email Push card
-        // receive it (Bug 3 fix).
         try {
             await sendFCMToUser(item.ownerEmail, buildEmailApprovalNotification({
                 id: draftRef.id,
@@ -2755,11 +2927,9 @@ async function processQueuedEmail(db, queueId, item, startedAt) {
         return { awaitingApproval: true, draftId: draftRef.id };
     }
 
-    // ── BRANCH 2: Auto-send (with optional delay) ──
     const delayMs = parseAutoSendDelay(autoSendDelay);
 
-    // Immediate send (delay = 0)
-        if (delayMs <= 0) {
+    if (delayMs <= 0) {
         await sendEmailViaSMTP(emailCfg, password, {
             to: item.fromEmail,
             subject: `Re: ${item.subject || '(no subject)'}`,
@@ -2785,7 +2955,6 @@ async function processQueuedEmail(db, queueId, item, startedAt) {
         return { handled: true, elapsedMs: Date.now() - startedAt };
     }
 
-    // Scheduled send
     const scheduledAt = new Date(Date.now() + delayMs).toISOString();
     const draftRef = await db.collection('email_drafts').add({
         ownerEmail: item.ownerEmail,
@@ -2827,10 +2996,6 @@ function extractEmailBody(raw) {
 // FCM — PUSH NOTIFICATION HELPERS
 // ════════════════════════════════════════════════════════════════════════════
 
-// purpose: 'push'  → appointment / general notifications
-//          'email' → email-approval notifications
-// Each purpose maintains its own token array so the two integration cards
-// (Push Notifications vs Email Push Notifications) track independent state.
 async function sendFCMToUser(ownerEmail, { title, body, url, tag, type }, purpose = 'push') {
     if (!ownerEmail) return { sent: 0, failed: 0 };
 
@@ -2851,7 +3016,6 @@ async function sendFCMToUser(ownerEmail, { title, body, url, tag, type }, purpos
 
     const userData = userSnap.data();
 
-    // ── Pick tokens by purpose ──
     const tokens = purpose === 'email'
         ? (Array.isArray(userData.fcmEmailTokens) ? userData.fcmEmailTokens : [])
         : (Array.isArray(userData.fcmPushTokens) ? userData.fcmPushTokens
@@ -2861,9 +3025,6 @@ async function sendFCMToUser(ownerEmail, { title, body, url, tag, type }, purpos
 
     const messaging = getMessaging();
 
-    // ── Include webpush.notification so the browser auto-displays the alert
-    // even when the tab is in the background and even if the service worker
-    // isn't manually handling background messages. (Bug 2 fix.) ──
     const message = {
         tokens,
         data: {
@@ -3167,7 +3328,7 @@ async function handleFCMRegisterToken(req, res) {
 
         await userRef.set({
             [field]:  newTokens,
-            fcmTokens: newLegacy,                        // keep legacy array in sync
+            fcmTokens: newLegacy,
             notificationsEnabled: true,
             notificationsConnectedAt: new Date().toISOString(),
         }, { merge: true });
@@ -3198,7 +3359,6 @@ async function handleFCMRemoveToken(req, res) {
         const existing = Array.isArray(data[field]) ? data[field] : [];
         const remaining = fcmToken ? existing.filter(t => t !== fcmToken) : [];
 
-        // Keep legacy array in sync by recomputing from both purpose arrays.
         const emailTokens = purpose === 'email' ? remaining : (data.fcmEmailTokens || []);
         const pushTokens  = purpose === 'push'  ? remaining : (data.fcmPushTokens  || []);
         const legacy = [...new Set([...emailTokens, ...pushTokens])];
@@ -3305,14 +3465,36 @@ async function handleDeploy(req, res) {
             botData.modelKey = DEFAULT_MODEL_KEY;
         }
 
-        // Normalize agentBuildMode — anything but widget/email/both becomes widget.
-        const VALID_MODES = ['widget', 'email', 'both'];
-        if (!VALID_MODES.includes(botData.agentBuildMode)) {
-            botData.agentBuildMode = 'widget';
-        }
+        // ── Normalize channels (accepts both the new array and legacy strings) ──
+        const incomingChannels = normalizeChannels(botData);
+
+        // Save the previous Telegram config so we can decide whether to re-register
+        const priorTg = existingSnap.exists ? (existingSnap.data()?.telegramConfig || {}) : {};
+
+        // ── Encrypt the Telegram bot token before persisting ──
+        const rawTg = botData.telegramConfig || {};
+        const rawToken = typeof rawTg.botToken === 'string' ? rawTg.botToken.trim() : '';
+        const incomingTgEnabled = incomingChannels.includes('telegram');
+
+        // If the client sent a token in the clear, encrypt it now. Otherwise preserve the old one.
+        let botTokenEnc = priorTg.botTokenEnc || null;
+        if (rawToken) botTokenEnc = encryptCredential(rawToken);
+
+        // A per-agent secret so the webhook receiver can verify Telegram's calls
+        let webhookSecret = priorTg.webhookSecret || crypto.randomBytes(24).toString('hex');
+
+        botData.channels = incomingChannels;
+        botData.agentBuildMode = deriveBuildMode(incomingChannels);
+        botData.telegramConfig = {
+            enabled: incomingTgEnabled,
+            botId: rawTg.botId || priorTg.botId || null,
+            botTokenEnc,
+            webhookSecret,
+            lastRegisteredAt: priorTg.lastRegisteredAt || null,
+        };
 
         // Normalize emailConfig so the reply job always reads a sane value.
-        if (botData.agentBuildMode === 'email' || botData.agentBuildMode === 'both') {
+        if (incomingChannels.includes('email')) {
             const ec = botData.emailConfig || {};
             botData.emailConfig = {
                 requireHumanApproval: ec.requireHumanApproval !== false,
@@ -3330,6 +3512,40 @@ async function handleDeploy(req, res) {
         botData.createdAt = botData.createdAt || new Date().toISOString();
         await botRef.set(botData, { merge: true });
 
+        // ── Register / update the Telegram webhook when the channel is on ──
+        let telegramWebhookStatus = null;
+        if (botData.telegramConfig.enabled && botData.telegramConfig.botTokenEnc) {
+            try {
+                const token = decryptCredential(botData.telegramConfig.botTokenEnc);
+                const publicBaseUrl = getPublicBaseUrl(req);
+                await registerTelegramWebhook({
+                    token,
+                    businessId: botData.id,
+                    secret: webhookSecret,
+                    publicBaseUrl,
+                });
+                telegramWebhookStatus = 'registered';
+                await botRef.set({
+                    'telegramConfig.lastRegisteredAt': new Date().toISOString(),
+                    'telegramConfig.lastRegisterError': null,
+                }, { merge: true });
+            } catch (tgErr) {
+                console.error('[Deploy/Telegram] setWebhook failed:', tgErr.message);
+                telegramWebhookStatus = 'failed';
+                await botRef.set({
+                    'telegramConfig.lastRegisterError': tgErr.message,
+                }, { merge: true });
+                // Don't fail the whole deploy — surface a warning to the client
+                if (!featuresStripped.includes('telegramWebhook')) featuresStripped.push('telegramWebhook');
+            }
+        } else if (!botData.telegramConfig.enabled && priorTg.botTokenEnc) {
+            // Channel was turned off — best-effort deleteWebhook
+            try {
+                const token = decryptCredential(priorTg.botTokenEnc);
+                await deleteTelegramWebhook(token);
+            } catch (e) { console.warn('[Deploy/Telegram/deleteWebhook]', e.message); }
+        }
+
         const agentsUsed = await countActiveAgents(db, ctx.ownerEmail);
         return res.status(200).json({
             success: true,
@@ -3338,12 +3554,18 @@ async function handleDeploy(req, res) {
             plan: { tier: limits.tier, label: limits.label },
             modelKey: botData.modelKey,
             agentBuildMode: botData.agentBuildMode,
+            channels: botData.channels,
+            telegramWebhook: telegramWebhookStatus,
             ...(featuresStripped.length ? {
                 featuresStripped,
                 featureWarnings: featuresStripped.map(k => ({
                     feature: k,
                     label: FEATURE_CATALOG[k]?.label || k,
-                    message: FEATURE_CATALOG[k] ? buildUpgradeMessage(k) : 'Not available on your plan.',
+                    message: FEATURE_CATALOG[k]
+                        ? buildUpgradeMessage(k)
+                        : (k === 'telegramWebhook'
+                            ? 'The Telegram webhook could not be registered. Double-check the bot token and try saving again.'
+                            : 'Not available on your plan.'),
                 })),
             } : {}),
         });
@@ -3416,11 +3638,14 @@ async function handleConfig(req, res) {
         }, b.behaviorConfig || {});
         if (planFeatures && !planFeatures.appointmentBooking) behaviorConfig.allowAppointmentBooking = false;
 
+        const channels = normalizeChannels(b);
+
         return res.status(200).json({
             success:         true,
             name:            b.displayName || b.name    || 'AI Assistant',
             internalName:    b.name                     || null,
-            agentBuildMode:  b.agentBuildMode           || 'widget',
+            agentBuildMode:  deriveBuildMode(channels),
+            channels,
             position:        b.position                 || 'bottom-right',
             logoBase64:      b.logoBase64               || null,
             themeColor:      b.designConfig?.themeColor || '#0f172a',
@@ -3440,7 +3665,508 @@ async function handleConfig(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// CHAT
+// SHARED CHAT ENGINE — used by both /api/chat and the Telegram webhook
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Generate a reply for a given bot + user message. Handles:
+ *   • Behavior toggles (out-of-topic, web search, hallucination, booking, handoff)
+ *   • Sub-agent routing
+ *   • Autonomous actions (tool calling)
+ *   • Appointment booking / cancel / edit flows
+ *   • Human handoff requests
+ *   • Credit consumption + analytics logging
+ *
+ * @returns {Promise<{answer: string, meta: object}>}
+ */
+async function generateBotReply({ db, businessId, userMsg, history = [], conversationId, source = 'web' }) {
+    const convId = conversationId || `conv-${Date.now()}`;
+    const meta = {};
+
+    const botSnap = await db.collection('user_bots').doc(businessId).get();
+    let sysPrompt  = 'You are a helpful, friendly customer service assistant.';
+    let ownerEmail = '', botName = 'Assistant';
+    let modelKey   = DEFAULT_MODEL_KEY;
+    let subAgents  = [];
+    let agentActionsList = [];
+    let planLimits = resolvePlanLimits({});
+    let behaviorConfig = {
+        allowOutOfTopic: true,
+        allowWebSearch: true,
+        allowHallucination: false,
+        allowAppointmentBooking: false,
+        allowHumanHandoff: true,
+    };
+
+    if (botSnap.exists) {
+        const b  = botSnap.data();
+        ownerEmail = b.owner    || '';
+        botName    = b.displayName || b.name || 'Assistant';
+        modelKey   = MODEL_REGISTRY[b.modelKey] ? b.modelKey : DEFAULT_MODEL_KEY;
+        subAgents  = Array.isArray(b.subAgents) ? b.subAgents.filter(a => a?.id && a?.systemPrompt) : [];
+        agentActionsList = Array.isArray(b.agentActions) ? b.agentActions.filter(a => a?.name && a?.url) : [];
+        behaviorConfig = Object.assign(behaviorConfig, b.behaviorConfig || {});
+
+        if (b.deletedAt) {
+            return {
+                answer: 'This assistant is not available right now. Please contact the business directly.',
+                meta: { _unavailable: true },
+            };
+        }
+
+        if (ownerEmail) {
+            try {
+                const ownerPlanSnap = await db.collection('users').doc(ownerEmail).get();
+                planLimits = resolvePlanLimits(ownerPlanSnap.exists ? ownerPlanSnap.data() : {});
+            } catch (e) {
+                console.error('[Chat/PlanLookup]', e.message);
+            }
+        }
+        if (!planLimits.features.appointmentBooking) behaviorConfig.allowAppointmentBooking = false;
+
+        try { await syncBotWebsite(db, businessId, b); }
+        catch (e) { console.warn('[Chat/Sync]', e.message); }
+
+        const kc   = b.knowledgeContext || {};
+        if (kc.systemPrompt) {
+            sysPrompt = kc.systemPrompt;
+        } else {
+            sysPrompt = `You are a helpful, friendly customer service assistant for "${botName}". Use the business information below to answer questions accurately.`;
+        }
+        if (b.context) {
+            sysPrompt += `\n\n[WEBSITE CONTENT — LIVE, last synced ${b.lastSyncedAt || 'at deploy time'}]:\n${b.context}`;
+            if (b.linksContext) sysPrompt += `\n\n[REFERENCE LINKS — LIVE]:\n${b.linksContext}`;
+            sysPrompt += `\n\nThe website content above is the current source of truth. If earlier messages in this conversation contradict it, the website content is correct and the earlier messages are outdated.`;
+        }
+        if (kc.fileContents) {
+            sysPrompt += `\n\n[REFERENCE DOCUMENTS]:\n${String(kc.fileContents).substring(0, 6000)}`;
+        }
+
+        const dbSources = (kc.databaseSources || []).filter(s => {
+            const featureKey = DB_SERVICE_FEATURE[s?.service];
+            return featureKey && planLimits.features[featureKey];
+        });
+        if (dbSources.length) {
+            const limitedSources = dbSources.slice(0, 3);
+            const snapshots = await Promise.all(limitedSources.map(async s => {
+                try {
+                    return { s, text: await getDbSourceSnapshot(db, businessId, s, ownerEmail) };
+                } catch (e) {
+                    return { s, text: `(Error reading live data: ${e.message})` };
+                }
+            }));
+            const list = snapshots
+                .map(({ s, text }) => `--- ${s.service.toUpperCase()} project "${s.projectName || s.projectId}" ---\n${text}`)
+                .join('\n\n');
+            sysPrompt += `\n\n[CONNECTED DATABASES — LIVE DATA SNAPSHOT]:\nBelow is a read-only, cached-up-to-5-min sample of data from the databases linked to this agent (limited number of collections/tables and rows). Use it to answer questions accurately. If something isn't shown in the sample, say you don't have visibility into it instead of guessing.\n\n${list}`;
+        }
+    }
+
+    sysPrompt += `\n\nBEHAVIOR SETTINGS:`;
+    sysPrompt += behaviorConfig.allowOutOfTopic
+        ? `\n- You MAY answer casual, general-knowledge, or out-of-topic questions (e.g. "What is Google?") in a friendly way, even if unrelated to the business.`
+        : `\n- You must ONLY answer questions related to this business/agent's knowledge base. If the user asks an unrelated, casual, or general-knowledge question, politely explain you can only help with questions about this business and steer them back.`;
+    sysPrompt += behaviorConfig.allowWebSearch
+        ? `\n- You may reason as if you have broad general knowledge of the world to help answer questions beyond the provided context.`
+        : `\n- Do NOT claim to search the web or provide information beyond the given business context and your own reliable general knowledge; if you don't have the information in your context, say so.`;
+    sysPrompt += behaviorConfig.allowHallucination
+        ? `\n- If you do not know the exact answer, you may provide your best reasonable guess, but keep it plausible.`
+        : `\n- If you do not know the answer or it is not in the provided context, honestly say you don't have that information instead of guessing or making something up.`;
+
+    const bookingEnabled = !!behaviorConfig.allowAppointmentBooking;
+    if (bookingEnabled) {
+        sysPrompt += BOOKING_SYSTEM_SUFFIX;
+    } else {
+        sysPrompt += `\n\n- Appointment booking is DISABLED for this agent. If a user asks to book an appointment, politely let them know booking isn't available here and offer to help another way.`;
+    }
+
+    const humanHandoffEnabled = behaviorConfig.allowHumanHandoff !== false;
+    sysPrompt += humanHandoffEnabled
+        ? `\n\n- If the user asks to speak with a human/person/agent, that request will be routed automatically by the system — you don't need to say anything special about it yourself.`
+        : `\n\n- Human agent handoff is DISABLED for this agent. If the user asks to speak with a human, a real person, or a live agent, politely explain that live handoff isn't available here right now, and offer to keep helping them yourself.`;
+
+    if (agentActionsList.length) {
+        sysPrompt += `\n\nAUTONOMOUS ACTIONS:\n- You have access to real, live tools/actions that call external systems on this business's behalf (e.g. checking an order status, updating a record, triggering a webhook).\n- Call the matching tool whenever the user's request matches what that tool does, using the AI Description of each tool to decide when it applies.\n- Extract every required parameter directly from the conversation. If a required parameter is missing, ask the user for it before calling the tool.\n- After a tool result comes back, use it to give a clear, natural-language answer — never show the user raw JSON.\n- If a tool call fails or times out, apologize briefly and let the user know the action could not be completed right now.`;
+    }
+
+    if (source === 'email') {
+        sysPrompt += `\n\nTHIS IS AN EMAIL REPLY. The user's message arrived via email. Write a clear, professional reply. Do NOT mention chat, widgets, or "typing". Include a brief sign-off. Format your response using Markdown where it improves clarity — use **bold** for key terms, names, or important values, and use "-" bullet points or "1." numbered lists for multi-part answers — since this reply is rendered as a richly formatted HTML email.`;
+    } else if (source === 'telegram') {
+        sysPrompt += `\n\nTHIS IS A TELEGRAM CONVERSATION. Keep replies natural and concise. Avoid markdown that Telegram can't render — plain text with short paragraphs works best.`;
+    }
+
+    const wantsHuman = humanHandoffEnabled && /speak to human support|connect (me )?(to )?(a )?human|talk to (a )?(human|person|someone|agent|representative)|(human|real) (agent|person)|customer service rep|talk to (someone|somebody) real/i.test(userMsg);
+    if (wantsHuman) {
+        try {
+            const { requestId } = await ensureHumanRequest(db, {
+                businessId, botName, ownerEmail, conversationId: convId, lastMessage: userMsg,
+            });
+            await notifyOwnerAndEmployees(db, ownerEmail, buildHumanRequestNotification(botName, userMsg))
+                .catch(e => console.error('[Human/FCM]', e.message));
+            const reply = "I've let our team know you'd like to speak with a person — someone will join this chat shortly. Feel free to keep typing in the meantime and they'll see it as soon as they connect.";
+            await logChat(db, businessId, convId, userMsg, reply, false, false, { humanRequested: true, source });
+            return { answer: reply, meta: { _humanRequested: true, _requestId: requestId, _credits: {} } };
+        } catch (e) {
+            console.error('[HumanHandoff]', e.message);
+        }
+    }
+
+    const creditState = await consumeCredits(db, ownerEmail, CREDIT_COSTS.message);
+    if (!creditState.allowed) {
+        const reply = creditState.reason === 'exhausted'
+            ? "I'm offline for the moment — this assistant has reached its monthly message limit. Please reach out to the business directly and they'll get back to you."
+            : "I'm having trouble responding right now. Please try again in a moment.";
+        await logChat(db, businessId, convId, userMsg, reply, false, false, {
+            fallback: true,
+            creditBlocked: true,
+            source,
+        });
+        if (creditState.reason === 'exhausted') {
+            maybeNotifyCreditThreshold(db, ownerEmail, { ...creditState, exhausted: true, period: currentBillingPeriod() });
+        }
+        return {
+            answer: reply,
+            meta: {
+                _creditsExhausted: creditState.reason === 'exhausted',
+                _credits: { used: creditState.used, limit: creditState.limit, remaining: 0 },
+            },
+        };
+    }
+    maybeNotifyCreditThreshold(db, ownerEmail, creditState);
+
+    const creditMeta = {
+        used: creditState.used,
+        limit: creditState.limit,
+        remaining: creditState.remaining,
+        percentUsed: creditState.percentUsed,
+        warning: creditState.warning,
+    };
+    meta._credits = creditMeta;
+
+    const msgLower = userMsg.toLowerCase().trim();
+
+    const isCancelConfirm = bookingEnabled && (/^(yes,?\s*)?(please\s+)?(cancel|delete|remove)\s*(it|this|the appointment|my appointment)?\.?$/i.test(msgLower) ||
+                             /^(confirm cancel|yes cancel|cancel confirmed|go ahead and cancel)\.?$/i.test(msgLower));
+    const isCancelIntent  = bookingEnabled && /\bcancel\b/.test(msgLower) && !isCancelConfirm;
+    const isEditIntent    = bookingEnabled && /\b(edit|change|update|modify|reschedule)\b/.test(msgLower);
+
+    const safeHistory = (Array.isArray(history) ? history : []).slice(-12).filter(m => m?.role && m?.content);
+    const lastAssistantMsg = [...safeHistory].reverse().find(m => m.role === 'assistant')?.content || '';
+    const isPendingCancel     = bookingEnabled && /confirm.*cancel|type.*yes.*cancel|cancel.*confirm/i.test(lastAssistantMsg);
+    const isPendingEdit       = bookingEnabled && /which.*field|what.*change|name.*contact.*date.*time/i.test(lastAssistantMsg);
+    const isPendingEditValue  = bookingEnabled && /new.*value|what.*would.*you.*like.*change.*to|enter.*new/i.test(lastAssistantMsg);
+
+    async function findConversationAppointment() {
+        const apptSnap = await db.collection('appointments')
+            .where('conversationId', '==', convId)
+            .where('status', '==', 'confirmed')
+            .orderBy('createdAt', 'desc')
+            .limit(1)
+            .get();
+        if (!apptSnap.empty) return { id: apptSnap.docs[0].id, ...apptSnap.docs[0].data() };
+
+        const botApptSnap = await db.collection('user_bots').doc(businessId)
+            .collection('appointments')
+            .where('status', '==', 'confirmed')
+            .orderBy('createdAt', 'desc')
+            .limit(1)
+            .get();
+        if (!botApptSnap.empty) return { id: botApptSnap.docs[0].id, ...botApptSnap.docs[0].data() };
+        return null;
+    }
+
+    if (isCancelIntent && !isPendingCancel) {
+        const reply = `Are you sure you want to cancel your appointment? Type "YES, CANCEL" to confirm, or "no" to keep it.`;
+        await logChat(db, businessId, convId, userMsg, reply, false, false, { source });
+        return { answer: reply, meta };
+    }
+
+    if (bookingEnabled && ((isCancelConfirm && isPendingCancel) || (msgLower === 'yes, cancel' || msgLower === 'yes cancel'))) {
+        const appt = await findConversationAppointment();
+        if (!appt) {
+            const reply = "I couldn't find an active appointment to cancel. Please contact us directly.";
+            return { answer: reply, meta };
+        }
+        try {
+            await db.collection('appointments').doc(appt.id).update({
+                status: 'cancelled', cancelledAt: new Date().toISOString(),
+            });
+            const botApptsRef = db.collection('user_bots').doc(businessId).collection('appointments');
+            const q = await botApptsRef.where('conversationId', '==', convId).get();
+            q.forEach(d => d.ref.update({ status: 'cancelled', cancelledAt: new Date().toISOString() }));
+
+            if (ownerEmail) {
+                await deleteCalendarEventsForAppt(db, ownerEmail, appt);
+                await sendFCMToUser(ownerEmail, buildCancellationNotification(appt)).catch(e => console.error('[Cancel/FCM]', e.message));
+            }
+
+            const reply = `✅ Your appointment has been successfully cancelled.\n\n📅 Cancelled: ${appt.scheduledDate} at ${appt.appointmentTime}\n👤 Name: ${appt.customerName}\n\nIf you'd like to rebook, just say "I want to book an appointment".`;
+            await logChat(db, businessId, convId, userMsg, reply, false, false, { source });
+            return { answer: reply, meta };
+        } catch {
+            const reply = 'There was an error cancelling your appointment. Please try again.';
+            return { answer: reply, meta };
+        }
+    }
+
+    if (isEditIntent && !isPendingEdit && !isPendingEditValue) {
+        const reply = `Which detail would you like to change?\n\n1. **Name**\n2. **Contact info** (email/phone)\n3. **Date**\n4. **Time**\n\nPlease type the number or the field name.`;
+        await logChat(db, businessId, convId, userMsg, reply, false, false, { source });
+        return { answer: reply, meta };
+    }
+
+    if (isPendingEdit && !isPendingEditValue) {
+        const fieldMap = {
+            '1': 'customerName',    'name':    'customerName',
+            '2': 'contactInfo',     'contact': 'contactInfo', 'email': 'contactInfo', 'phone': 'contactInfo',
+            '3': 'appointmentDay',  'date':    'appointmentDay',
+            '4': 'appointmentTime', 'time':    'appointmentTime',
+        };
+        const key   = msgLower.replace(/[^a-z0-9]/g, '');
+        const field = fieldMap[key] || fieldMap[msgLower.split(/\s+/)[0]];
+        if (!field) {
+            const reply = 'I didn\'t catch that. Please type: "name", "contact", "date", or "time".';
+            return { answer: reply, meta };
+        }
+        const fieldLabels = { customerName: 'name', contactInfo: 'contact info', appointmentDay: 'date', appointmentTime: 'time' };
+        const reply = `What would you like to change the ${fieldLabels[field]} to?`;
+        await logChat(db, businessId, convId, userMsg, reply, false, false, { source });
+        return { answer: reply, meta: { ...meta, _editField: field } };
+    }
+
+    if (isPendingEditValue) {
+        const fieldHint = lastAssistantMsg.match(/change the (name|contact info|date|time) to/i)?.[1];
+        const fieldMap2 = { 'name': 'customerName', 'contact info': 'contactInfo', 'date': 'appointmentDay', 'time': 'appointmentTime' };
+        const field     = fieldHint ? fieldMap2[fieldHint.toLowerCase()] : null;
+
+        if (field) {
+            const appt = await findConversationAppointment();
+            if (appt) {
+                const oldValue = appt[field];
+                const newValue = userMsg.trim();
+                let scheduledDateUpdate = {};
+                if (field === 'appointmentDay') scheduledDateUpdate = { scheduledDate: resolveDay(newValue) };
+
+                await db.collection('appointments').doc(appt.id).update({
+                    [field]: newValue, ...scheduledDateUpdate, updatedAt: new Date().toISOString(),
+                });
+                const botApptsRef = db.collection('user_bots').doc(businessId).collection('appointments');
+                const q = await botApptsRef.where('conversationId', '==', convId).get();
+                q.forEach(d => d.ref.update({ [field]: newValue, ...scheduledDateUpdate, updatedAt: new Date().toISOString() }));
+
+                if (ownerEmail)
+                    await sendFCMToUser(ownerEmail, buildEditNotification(appt, field, oldValue, newValue)).catch(e => console.error('[Edit/FCM]', e.message));
+
+                const fieldLabels2 = { customerName: 'name', contactInfo: 'contact info', appointmentDay: 'date', appointmentTime: 'time' };
+                const reply = `✅ Updated! Your ${fieldLabels2[field]} has been changed from "${oldValue}" to "${newValue}".\n\nIs there anything else you'd like to change, or are you all set?`;
+                await logChat(db, businessId, convId, userMsg, reply, false, false, { source });
+                return { answer: reply, meta };
+            }
+        }
+    }
+
+    const allText    = [...safeHistory.map(m => m.content), userMsg].join('\n');
+    const allTextLow = allText.toLowerCase();
+
+    const hasName    = /my name is|i am|i'm|it'?s\s+[a-z]+|name[:\s]+/i.test(allText) ||
+                       safeHistory.some(m => m.role === 'user' && /^[A-Z][a-z]+ [A-Z][a-z]+/.test(m.content.trim()));
+    const hasContact = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/.test(allText) ||
+                       /(\+?\d[\d\s\-]{6,}\d)/.test(allText);
+    const hasDay     = /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|today|january|february|march|april|may|june|july|august|september|october|november|december|\d{1,2}[\s\/\-](jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\d{1,2}))\b/i.test(allTextLow);
+    const hasTime    = /\b(\d{1,2}(:\d{2})?\s*(am|pm))\b/i.test(allText) ||
+                       /\b(morning|afternoon|evening|noon|midday|midnight)\b/i.test(allTextLow) ||
+                       /\b([01]?\d|2[0-3]):[0-5]\d\b/.test(allText);
+
+    const isBookingConversation = bookingEnabled && /\b(book|schedule|appointment|slot|reserve|set up|fix a)\b/i.test(allTextLow);
+    const allFieldsPresent      = isBookingConversation && hasName && hasContact && hasDay && hasTime;
+
+    let routedAgent = null;
+    if (subAgents.length) {
+        routedAgent = await routeToSubAgent(modelKey, userMsg, subAgents);
+        await addCreditUsage(db, ownerEmail, CREDIT_COSTS.routing);
+        if (routedAgent) {
+            sysPrompt += `\n\n[ACTIVE SPECIALIZED AGENT: ${routedAgent.name}]\nYou are now acting as this specialized agent. Follow its instructions closely while still respecting the behavior settings above.\n${routedAgent.systemPrompt}`;
+        }
+    }
+
+    const agentActionToolDefs = buildAgentActionToolDefs(agentActionsList);
+
+    const baseMessages = [
+        { role: 'system', content: sysPrompt },
+        ...safeHistory,
+        { role: 'user', content: userMsg },
+    ];
+
+    const choice = await callLLM({
+        modelKey,
+        messages: baseMessages,
+        allFieldsPresent,
+        enableBookingTool: bookingEnabled,
+        extraTools: agentActionToolDefs,
+    });
+    if (choice?.content) choice.content = stripThinkingTags(choice.content);
+
+    if (bookingEnabled && choice?.content && !choice?.tool_calls) {
+        const jsonMatch = choice.content.match(/\{[\s\S]*?"userName"[\s\S]*?"contactInfo"[\s\S]*?\}/);
+        if (jsonMatch) {
+            try {
+                const leaked = JSON.parse(jsonMatch[0]);
+                if (leaked.userName && leaked.contactInfo && leaked.appointmentDay && leaked.appointmentTime) {
+                    choice.tool_calls = [{ function: { name: 'appointmentBooking', arguments: JSON.stringify(leaked) } }];
+                    choice.content    = null;
+                }
+            } catch { /* not valid JSON */ }
+        }
+    }
+
+    if (bookingEnabled && choice?.tool_calls?.[0]?.function?.name === 'appointmentBooking') {
+        let args;
+        try { args = JSON.parse(choice.tool_calls[0].function.arguments); }
+        catch { return { answer: 'Could you confirm your booking details again?', meta }; }
+
+        const { userName, contactInfo, appointmentDay, appointmentTime } = args;
+
+        if (!appointmentTime || appointmentTime.trim() === '' || /^tbd$/i.test(appointmentTime.trim())) {
+            return {
+                answer:  `Got it! Just one more thing — what time works best for you on ${appointmentDay}?`,
+                meta,
+            };
+        }
+        if (!userName || !contactInfo || !appointmentDay) {
+            return {
+                answer:  'I need your name, contact info, preferred date and time to complete the booking. What would you like to provide?',
+                meta,
+            };
+        }
+
+        const dateISO = resolveDay(appointmentDay);
+
+        let bookingAccounts = [];
+        if (ownerEmail && planLimits.features.googleCalendar) {
+            bookingAccounts = bookingEnabledAccounts(await getGoogleCalendarAccounts(db, ownerEmail));
+            if (bookingAccounts.length) {
+                const avail = await checkCalendarAvailability(bookingAccounts[0], dateISO, appointmentTime, ownerEmail, db);
+                if (!avail.available) {
+                    const alts    = avail.suggestedTimes || [];
+                    const altText = alts.length > 0
+                        ? '\n\nHere are 3 available slots on that day:\n' + alts.map((t, i) => `  ${i + 1}. ${t}`).join('\n') + '\n\nWhich one works for you?'
+                        : '\n\nWould you like to pick a different date or time?';
+                    return { answer: `Sorry, ${appointmentTime} on ${appointmentDay} is already booked.${altText}`, meta };
+                }
+            }
+        }
+
+        const appt = {
+            businessId, botName, owner: ownerEmail, conversationId: convId,
+            customerName: userName, contactInfo,
+            appointmentDay, appointmentTime, scheduledDate: dateISO,
+            status: 'confirmed', createdAt: new Date().toISOString(),
+            googleCalendarEvents: [],
+        };
+
+        const apptDocRef = await db.collection('appointments').add(appt);
+        await db.collection('user_bots').doc(businessId).collection('appointments').add({ ...appt, globalId: apptDocRef.id });
+
+        if (ownerEmail) {
+            const createdEvents = [];
+            for (const acct of bookingAccounts) {
+                try {
+                    const calResult = await addCalendarEvent(acct, appt, ownerEmail, db);
+                    if (calResult?.eventId) createdEvents.push({ accountEmail: acct.email, eventId: calResult.eventId });
+                } catch (e) { console.error('[Chat/Calendar]', acct.email, e.message); }
+            }
+            if (createdEvents.length) await apptDocRef.update({ googleCalendarEvents: createdEvents });
+
+            try { await sendFCMToUser(ownerEmail, buildBookingNotification(appt)); }
+            catch (e) { console.error('[FCM] Booking notify error:', e.message); }
+        }
+
+        await logChat(db, businessId, convId, userMsg, 'Appointment booked.', true, true, { source });
+
+        const answer = [
+            '✅ APPOINTMENT BOOKED',
+            '',
+            `📅 Date:     ${dateISO}`,
+            `🕐 Time:     ${appointmentTime}`,
+            `👤 Name:     ${userName}`,
+            `📧 Contact:  ${contactInfo}`,
+            '',
+            'Reply with "CANCEL" to cancel or "EDIT" to change a detail.',
+        ].join('\n');
+
+        return { answer, meta };
+    }
+
+    if (agentActionToolDefs.length && Array.isArray(choice?.tool_calls) && choice.tool_calls.length) {
+        const nonBookingCalls = choice.tool_calls.filter(tc => tc.function?.name !== 'appointmentBooking');
+
+        if (nonBookingCalls.length) {
+            const executed = await runAgentActionToolCalls(nonBookingCalls, agentActionsList);
+
+            const assistantToolCallMsg = {
+                role: 'assistant',
+                content: choice.content || null,
+                tool_calls: nonBookingCalls,
+            };
+
+            const toolResultMessages = executed.map(e => ({
+                role: 'tool',
+                tool_call_id: e.toolCallId,
+                name: e.functionName,
+                content: JSON.stringify(e.result),
+            }));
+
+            const followUpMessages = [
+                ...baseMessages,
+                assistantToolCallMsg,
+                ...toolResultMessages,
+            ];
+
+            let followUpChoice;
+            try {
+                followUpChoice = await callLLM({
+                    modelKey,
+                    messages: followUpMessages,
+                    enableBookingTool: bookingEnabled,
+                    extraTools: agentActionToolDefs,
+                    toolChoice: 'none',
+                });
+                await addCreditUsage(db, ownerEmail, CREDIT_COSTS.toolFollowUp);
+                if (followUpChoice?.content) followUpChoice.content = stripThinkingTags(followUpChoice.content);
+            } catch (err) {
+                console.error('[AgentActions/FollowUp]', err.message);
+                const fallbackAnswer = "I ran that action, but had trouble putting together a response. Could you ask again?";
+                await logChat(db, businessId, convId, userMsg, fallbackAnswer, true, false, { fallback: true, source });
+                return {
+                    answer: fallbackAnswer,
+                    meta: { ...meta, _actionsExecuted: executed.map(e => e.functionName) },
+                };
+            }
+
+            const finalAnswer = followUpChoice?.content?.trim() ||
+                (executed.every(e => e.result?.success)
+                    ? "Done — that action completed successfully."
+                    : "I wasn't able to complete that action. Please try again or contact support.");
+
+            await logChat(db, businessId, convId, userMsg, finalAnswer, true, false, { source });
+            return {
+                answer: finalAnswer,
+                meta: {
+                    ...meta,
+                    _agent: routedAgent?.name || null,
+                    _actionsExecuted: executed.map(e => e.functionName),
+                },
+            };
+        }
+    }
+
+    const answer = choice?.content?.trim() || 'How can I help you?';
+    await logChat(db, businessId, convId, userMsg, answer, true, false, { source });
+    return { answer, meta: { ...meta, _agent: routedAgent?.name || null } };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// CHAT (HTTP wrapper around generateBotReply)
 // ════════════════════════════════════════════════════════════════════════════
 async function handleChat(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -3456,480 +4182,16 @@ async function handleChat(req, res) {
     const db     = getDb();
 
     try {
-        const botSnap = await db.collection('user_bots').doc(businessId).get();
-        let sysPrompt  = 'You are a helpful, friendly customer service assistant.';
-        let ownerEmail = '', botName = 'Assistant';
-        let modelKey   = DEFAULT_MODEL_KEY;
-        let subAgents  = [];
-        let agentActionsList = [];
-        let planLimits = resolvePlanLimits({});
-        let behaviorConfig = {
-            allowOutOfTopic: true,
-            allowWebSearch: true,
-            allowHallucination: false,
-            allowAppointmentBooking: false,
-            allowHumanHandoff: true,
-        };
-
-        if (botSnap.exists) {
-            const b  = botSnap.data();
-            ownerEmail = b.owner    || '';
-            botName    = b.displayName || b.name || 'Assistant';
-            modelKey   = MODEL_REGISTRY[b.modelKey] ? b.modelKey : DEFAULT_MODEL_KEY;
-            subAgents  = Array.isArray(b.subAgents) ? b.subAgents.filter(a => a?.id && a?.systemPrompt) : [];
-            agentActionsList = Array.isArray(b.agentActions) ? b.agentActions.filter(a => a?.name && a?.url) : [];
-            behaviorConfig = Object.assign(behaviorConfig, b.behaviorConfig || {});
-
-            if (b.deletedAt) {
-                const reply = 'This assistant is not available right now. Please contact the business directly.';
-                return res.json({ success: true, answer: reply, reply, _unavailable: true });
-            }
-
-            if (ownerEmail) {
-                try {
-                    const ownerPlanSnap = await db.collection('users').doc(ownerEmail).get();
-                    planLimits = resolvePlanLimits(ownerPlanSnap.exists ? ownerPlanSnap.data() : {});
-                } catch (e) {
-                    console.error('[Chat/PlanLookup]', e.message);
-                }
-            }
-            if (!planLimits.features.appointmentBooking) behaviorConfig.allowAppointmentBooking = false;
-
-            try { await syncBotWebsite(db, businessId, b); }
-            catch (e) { console.warn('[Chat/Sync]', e.message); }
-
-            const kc   = b.knowledgeContext || {};
-            if (kc.systemPrompt) {
-                sysPrompt = kc.systemPrompt;
-            } else {
-                sysPrompt = `You are a helpful, friendly customer service assistant for "${botName}". Use the business information below to answer questions accurately.`;
-            }
-            if (b.context) {
-                sysPrompt += `\n\n[WEBSITE CONTENT — LIVE, last synced ${b.lastSyncedAt || 'at deploy time'}]:\n${b.context}`;
-                if (b.linksContext) sysPrompt += `\n\n[REFERENCE LINKS — LIVE]:\n${b.linksContext}`;
-                sysPrompt += `\n\nThe website content above is the current source of truth. If earlier messages in this conversation contradict it, the website content is correct and the earlier messages are outdated.`;
-            }
-            if (kc.fileContents) {
-                sysPrompt += `\n\n[REFERENCE DOCUMENTS]:\n${String(kc.fileContents).substring(0, 6000)}`;
-            }
-
-            const dbSources = (kc.databaseSources || []).filter(s => {
-                const featureKey = DB_SERVICE_FEATURE[s?.service];
-                return featureKey && planLimits.features[featureKey];
-            });
-            if (dbSources.length) {
-                const limitedSources = dbSources.slice(0, 3);
-                const snapshots = await Promise.all(limitedSources.map(async s => {
-                    try {
-                        return { s, text: await getDbSourceSnapshot(db, businessId, s, ownerEmail) };
-                    } catch (e) {
-                        return { s, text: `(Error reading live data: ${e.message})` };
-                    }
-                }));
-                const list = snapshots
-                    .map(({ s, text }) => `--- ${s.service.toUpperCase()} project "${s.projectName || s.projectId}" ---\n${text}`)
-                    .join('\n\n');
-                sysPrompt += `\n\n[CONNECTED DATABASES — LIVE DATA SNAPSHOT]:\nBelow is a read-only, cached-up-to-5-min sample of data from the databases linked to this agent (limited number of collections/tables and rows). Use it to answer questions accurately. If something isn't shown in the sample, say you don't have visibility into it instead of guessing.\n\n${list}`;
-            }
-        }
-
-        sysPrompt += `\n\nBEHAVIOR SETTINGS:`;
-        sysPrompt += behaviorConfig.allowOutOfTopic
-            ? `\n- You MAY answer casual, general-knowledge, or out-of-topic questions (e.g. "What is Google?") in a friendly way, even if unrelated to the business.`
-            : `\n- You must ONLY answer questions related to this business/agent's knowledge base. If the user asks an unrelated, casual, or general-knowledge question, politely explain you can only help with questions about this business and steer them back.`;
-        sysPrompt += behaviorConfig.allowWebSearch
-            ? `\n- You may reason as if you have broad general knowledge of the world to help answer questions beyond the provided context.`
-            : `\n- Do NOT claim to search the web or provide information beyond the given business context and your own reliable general knowledge; if you don't have the information in your context, say so.`;
-        sysPrompt += behaviorConfig.allowHallucination
-            ? `\n- If you do not know the exact answer, you may provide your best reasonable guess, but keep it plausible.`
-            : `\n- If you do not know the answer or it is not in the provided context, honestly say you don't have that information instead of guessing or making something up.`;
-
-        const bookingEnabled = !!behaviorConfig.allowAppointmentBooking;
-        if (bookingEnabled) {
-            sysPrompt += BOOKING_SYSTEM_SUFFIX;
-        } else {
-            sysPrompt += `\n\n- Appointment booking is DISABLED for this agent. If a user asks to book an appointment, politely let them know booking isn't available here and offer to help another way.`;
-        }
-
-        const humanHandoffEnabled = behaviorConfig.allowHumanHandoff !== false;
-        sysPrompt += humanHandoffEnabled
-            ? `\n\n- If the user asks to speak with a human/person/agent, that request will be routed automatically by the system — you don't need to say anything special about it yourself.`
-            : `\n\n- Human agent handoff is DISABLED for this agent. If the user asks to speak with a human, a real person, or a live agent, politely explain that live handoff isn't available here right now, and offer to keep helping them yourself.`;
-
-        if (agentActionsList.length) {
-            sysPrompt += `\n\nAUTONOMOUS ACTIONS:\n- You have access to real, live tools/actions that call external systems on this business's behalf (e.g. checking an order status, updating a record, triggering a webhook).\n- Call the matching tool whenever the user's request matches what that tool does, using the AI Description of each tool to decide when it applies.\n- Extract every required parameter directly from the conversation. If a required parameter is missing, ask the user for it before calling the tool.\n- After a tool result comes back, use it to give a clear, natural-language answer — never show the user raw JSON.\n- If a tool call fails or times out, apologize briefly and let the user know the action could not be completed right now.`;
-        }
-
-        if (source === 'email') {
-            sysPrompt += `\n\nTHIS IS AN EMAIL REPLY. The user's message arrived via email. Write a clear, professional reply. Do NOT mention chat, widgets, or "typing". Include a brief sign-off. Format your response using Markdown where it improves clarity — use **bold** for key terms, names, or important values, and use "-" bullet points or "1." numbered lists for multi-part answers — since this reply is rendered as a richly formatted HTML email.`;
-        }
-
-        const wantsHuman = humanHandoffEnabled && /speak to human support|connect (me )?(to )?(a )?human|talk to (a )?(human|person|someone|agent|representative)|(human|real) (agent|person)|customer service rep|talk to (someone|somebody) real/i.test(userMsg);
-        if (wantsHuman) {
-            try {
-                const { requestId } = await ensureHumanRequest(db, {
-                    businessId, botName, ownerEmail, conversationId: convId, lastMessage: userMsg,
-                });
-                await notifyOwnerAndEmployees(db, ownerEmail, buildHumanRequestNotification(botName, userMsg))
-                    .catch(e => console.error('[Human/FCM]', e.message));
-                const reply = "I've let our team know you'd like to speak with a person — someone will join this chat shortly. Feel free to keep typing in the meantime and they'll see it as soon as they connect.";
-                await logChat(db, businessId, convId, userMsg, reply, false, false, { humanRequested: true });
-                return res.json({ success: true, answer: reply, reply, _humanRequested: true, _requestId: requestId });
-            } catch (e) {
-                console.error('[HumanHandoff]', e.message);
-            }
-        }
-
-        const creditState = await consumeCredits(db, ownerEmail, CREDIT_COSTS.message);
-        if (!creditState.allowed) {
-            const reply = creditState.reason === 'exhausted'
-                ? "I'm offline for the moment — this assistant has reached its monthly message limit. Please reach out to the business directly and they'll get back to you."
-                : "I'm having trouble responding right now. Please try again in a moment.";
-            await logChat(db, businessId, convId, userMsg, reply, false, false, {
-                fallback: true,
-                creditBlocked: true,
-            });
-            if (creditState.reason === 'exhausted') {
-                maybeNotifyCreditThreshold(db, ownerEmail, { ...creditState, exhausted: true, period: currentBillingPeriod() });
-            }
-            return res.json({
-                success: true,
-                answer: reply,
-                reply,
-                _creditsExhausted: creditState.reason === 'exhausted',
-                _credits: { used: creditState.used, limit: creditState.limit, remaining: 0 },
-            });
-        }
-        maybeNotifyCreditThreshold(db, ownerEmail, creditState);
-
-        const creditMeta = {
-            used: creditState.used,
-            limit: creditState.limit,
-            remaining: creditState.remaining,
-            percentUsed: creditState.percentUsed,
-            warning: creditState.warning,
-        };
-
-        const msgLower = userMsg.toLowerCase().trim();
-
-        const isCancelConfirm = bookingEnabled && (/^(yes,?\s*)?(please\s+)?(cancel|delete|remove)\s*(it|this|the appointment|my appointment)?\.?$/i.test(msgLower) ||
-                                 /^(confirm cancel|yes cancel|cancel confirmed|go ahead and cancel)\.?$/i.test(msgLower));
-        const isCancelIntent  = bookingEnabled && /\bcancel\b/.test(msgLower) && !isCancelConfirm;
-        const isEditIntent    = bookingEnabled && /\b(edit|change|update|modify|reschedule)\b/.test(msgLower);
-
-        const safeHistory = (Array.isArray(history) ? history : []).slice(-12).filter(m => m?.role && m?.content);
-        const lastAssistantMsg = [...safeHistory].reverse().find(m => m.role === 'assistant')?.content || '';
-        const isPendingCancel     = bookingEnabled && /confirm.*cancel|type.*yes.*cancel|cancel.*confirm/i.test(lastAssistantMsg);
-        const isPendingEdit       = bookingEnabled && /which.*field|what.*change|name.*contact.*date.*time/i.test(lastAssistantMsg);
-        const isPendingEditValue  = bookingEnabled && /new.*value|what.*would.*you.*like.*change.*to|enter.*new/i.test(lastAssistantMsg);
-
-        async function findConversationAppointment() {
-            const apptSnap = await db.collection('appointments')
-                .where('conversationId', '==', convId)
-                .where('status', '==', 'confirmed')
-                .orderBy('createdAt', 'desc')
-                .limit(1)
-                .get();
-            if (!apptSnap.empty) return { id: apptSnap.docs[0].id, ...apptSnap.docs[0].data() };
-
-            const botApptSnap = await db.collection('user_bots').doc(businessId)
-                .collection('appointments')
-                .where('status', '==', 'confirmed')
-                .orderBy('createdAt', 'desc')
-                .limit(1)
-                .get();
-            if (!botApptSnap.empty) return { id: botApptSnap.docs[0].id, ...botApptSnap.docs[0].data() };
-            return null;
-        }
-
-        if (isCancelIntent && !isPendingCancel) {
-            const reply = `Are you sure you want to cancel your appointment? Type "YES, CANCEL" to confirm, or "no" to keep it.`;
-            await logChat(db, businessId, convId, userMsg, reply, false, false);
-            return res.json({ success: true, answer: reply, reply, _credits: creditMeta });
-        }
-
-        if (bookingEnabled && ((isCancelConfirm && isPendingCancel) || (msgLower === 'yes, cancel' || msgLower === 'yes cancel'))) {
-            const appt = await findConversationAppointment();
-            if (!appt) {
-                const reply = "I couldn't find an active appointment to cancel. Please contact us directly.";
-                return res.json({ success: true, answer: reply, reply, _credits: creditMeta });
-            }
-            try {
-                await db.collection('appointments').doc(appt.id).update({
-                    status: 'cancelled', cancelledAt: new Date().toISOString(),
-                });
-                const botApptsRef = db.collection('user_bots').doc(businessId).collection('appointments');
-                const q = await botApptsRef.where('conversationId', '==', convId).get();
-                q.forEach(d => d.ref.update({ status: 'cancelled', cancelledAt: new Date().toISOString() }));
-
-                if (ownerEmail) {
-                    await deleteCalendarEventsForAppt(db, ownerEmail, appt);
-                    await sendFCMToUser(ownerEmail, buildCancellationNotification(appt)).catch(e => console.error('[Cancel/FCM]', e.message));
-                }
-
-                const reply = `✅ Your appointment has been successfully cancelled.\n\n📅 Cancelled: ${appt.scheduledDate} at ${appt.appointmentTime}\n👤 Name: ${appt.customerName}\n\nIf you'd like to rebook, just say "I want to book an appointment".`;
-                await logChat(db, businessId, convId, userMsg, reply, false, false);
-                return res.json({ success: true, answer: reply, reply, _credits: creditMeta });
-            } catch {
-                const reply = 'There was an error cancelling your appointment. Please try again.';
-                return res.json({ success: true, answer: reply, reply, _credits: creditMeta });
-            }
-        }
-
-        if (isEditIntent && !isPendingEdit && !isPendingEditValue) {
-            const reply = `Which detail would you like to change?\n\n1. **Name**\n2. **Contact info** (email/phone)\n3. **Date**\n4. **Time**\n\nPlease type the number or the field name.`;
-            await logChat(db, businessId, convId, userMsg, reply, false, false);
-            return res.json({ success: true, answer: reply, reply, _credits: creditMeta });
-        }
-
-        if (isPendingEdit && !isPendingEditValue) {
-            const fieldMap = {
-                '1': 'customerName',    'name':    'customerName',
-                '2': 'contactInfo',     'contact': 'contactInfo', 'email': 'contactInfo', 'phone': 'contactInfo',
-                '3': 'appointmentDay',  'date':    'appointmentDay',
-                '4': 'appointmentTime', 'time':    'appointmentTime',
-            };
-            const key   = msgLower.replace(/[^a-z0-9]/g, '');
-            const field = fieldMap[key] || fieldMap[msgLower.split(/\s+/)[0]];
-            if (!field) {
-                const reply = 'I didn\'t catch that. Please type: "name", "contact", "date", or "time".';
-                return res.json({ success: true, answer: reply, reply, _credits: creditMeta });
-            }
-            const fieldLabels = { customerName: 'name', contactInfo: 'contact info', appointmentDay: 'date', appointmentTime: 'time' };
-            const reply = `What would you like to change the ${fieldLabels[field]} to?`;
-            await logChat(db, businessId, convId, userMsg, reply, false, false);
-            return res.json({ success: true, answer: reply, reply, _editField: field, _credits: creditMeta });
-        }
-
-        if (isPendingEditValue) {
-            const fieldHint = lastAssistantMsg.match(/change the (name|contact info|date|time) to/i)?.[1];
-            const fieldMap2 = { 'name': 'customerName', 'contact info': 'contactInfo', 'date': 'appointmentDay', 'time': 'appointmentTime' };
-            const field     = fieldHint ? fieldMap2[fieldHint.toLowerCase()] : null;
-
-            if (field) {
-                const appt = await findConversationAppointment();
-                if (appt) {
-                    const oldValue = appt[field];
-                    const newValue = userMsg.trim();
-                    let scheduledDateUpdate = {};
-                    if (field === 'appointmentDay') scheduledDateUpdate = { scheduledDate: resolveDay(newValue) };
-
-                    await db.collection('appointments').doc(appt.id).update({
-                        [field]: newValue, ...scheduledDateUpdate, updatedAt: new Date().toISOString(),
-                    });
-                    const botApptsRef = db.collection('user_bots').doc(businessId).collection('appointments');
-                    const q = await botApptsRef.where('conversationId', '==', convId).get();
-                    q.forEach(d => d.ref.update({ [field]: newValue, ...scheduledDateUpdate, updatedAt: new Date().toISOString() }));
-
-                    if (ownerEmail)
-                        await sendFCMToUser(ownerEmail, buildEditNotification(appt, field, oldValue, newValue)).catch(e => console.error('[Edit/FCM]', e.message));
-
-                    const fieldLabels2 = { customerName: 'name', contactInfo: 'contact info', appointmentDay: 'date', appointmentTime: 'time' };
-                    const reply = `✅ Updated! Your ${fieldLabels2[field]} has been changed from "${oldValue}" to "${newValue}".\n\nIs there anything else you'd like to change, or are you all set?`;
-                    await logChat(db, businessId, convId, userMsg, reply, false, false);
-                    return res.json({ success: true, answer: reply, reply, _credits: creditMeta });
-                }
-            }
-        }
-
-        const allText    = [...safeHistory.map(m => m.content), userMsg].join('\n');
-        const allTextLow = allText.toLowerCase();
-
-        const hasName    = /my name is|i am|i'm|it'?s\s+[a-z]+|name[:\s]+/i.test(allText) ||
-                           safeHistory.some(m => m.role === 'user' && /^[A-Z][a-z]+ [A-Z][a-z]+/.test(m.content.trim()));
-        const hasContact = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/.test(allText) ||
-                           /(\+?\d[\d\s\-]{6,}\d)/.test(allText);
-        const hasDay     = /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|today|january|february|march|april|may|june|july|august|september|october|november|december|\d{1,2}[\s\/\-](jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\d{1,2}))\b/i.test(allTextLow);
-        const hasTime    = /\b(\d{1,2}(:\d{2})?\s*(am|pm))\b/i.test(allText) ||
-                           /\b(morning|afternoon|evening|noon|midday|midnight)\b/i.test(allTextLow) ||
-                           /\b([01]?\d|2[0-3]):[0-5]\d\b/.test(allText);
-
-        const isBookingConversation = bookingEnabled && /\b(book|schedule|appointment|slot|reserve|set up|fix a)\b/i.test(allTextLow);
-        const allFieldsPresent      = isBookingConversation && hasName && hasContact && hasDay && hasTime;
-
-        let routedAgent = null;
-        if (subAgents.length) {
-            routedAgent = await routeToSubAgent(modelKey, userMsg, subAgents);
-            await addCreditUsage(db, ownerEmail, CREDIT_COSTS.routing);
-            if (routedAgent) {
-                sysPrompt += `\n\n[ACTIVE SPECIALIZED AGENT: ${routedAgent.name}]\nYou are now acting as this specialized agent. Follow its instructions closely while still respecting the behavior settings above.\n${routedAgent.systemPrompt}`;
-            }
-        }
-
-        const agentActionToolDefs = buildAgentActionToolDefs(agentActionsList);
-
-        const baseMessages = [
-            { role: 'system', content: sysPrompt },
-            ...safeHistory,
-            { role: 'user', content: userMsg },
-        ];
-
-        const choice = await callLLM({
-            modelKey,
-            messages: baseMessages,
-            allFieldsPresent,
-            enableBookingTool: bookingEnabled,
-            extraTools: agentActionToolDefs,
+        const result = await generateBotReply({
+            db,
+            businessId,
+            userMsg,
+            history,
+            conversationId: convId,
+            source,
         });
-        if (choice?.content) choice.content = stripThinkingTags(choice.content);
-
-        if (bookingEnabled && choice?.content && !choice?.tool_calls) {
-            const jsonMatch = choice.content.match(/\{[\s\S]*?"userName"[\s\S]*?"contactInfo"[\s\S]*?\}/);
-            if (jsonMatch) {
-                try {
-                    const leaked = JSON.parse(jsonMatch[0]);
-                    if (leaked.userName && leaked.contactInfo && leaked.appointmentDay && leaked.appointmentTime) {
-                        choice.tool_calls = [{ function: { name: 'appointmentBooking', arguments: JSON.stringify(leaked) } }];
-                        choice.content    = null;
-                    }
-                } catch { /* not valid JSON */ }
-            }
-        }
-
-        if (bookingEnabled && choice?.tool_calls?.[0]?.function?.name === 'appointmentBooking') {
-            let args;
-            try { args = JSON.parse(choice.tool_calls[0].function.arguments); }
-            catch { return res.json({ success: true, answer: 'Could you confirm your booking details again?', _credits: creditMeta }); }
-
-            const { userName, contactInfo, appointmentDay, appointmentTime } = args;
-
-            if (!appointmentTime || appointmentTime.trim() === '' || /^tbd$/i.test(appointmentTime.trim())) {
-                return res.json({
-                    success: true,
-                    answer:  `Got it! Just one more thing — what time works best for you on ${appointmentDay}?`,
-                    _credits: creditMeta,
-                });
-            }
-            if (!userName || !contactInfo || !appointmentDay) {
-                return res.json({
-                    success: true,
-                    answer:  'I need your name, contact info, preferred date and time to complete the booking. What would you like to provide?',
-                    _credits: creditMeta,
-                });
-            }
-
-            const dateISO = resolveDay(appointmentDay);
-
-            let bookingAccounts = [];
-            if (ownerEmail && planLimits.features.googleCalendar) {
-                bookingAccounts = bookingEnabledAccounts(await getGoogleCalendarAccounts(db, ownerEmail));
-                if (bookingAccounts.length) {
-                    const avail = await checkCalendarAvailability(bookingAccounts[0], dateISO, appointmentTime, ownerEmail, db);
-                    if (!avail.available) {
-                        const alts    = avail.suggestedTimes || [];
-                        const altText = alts.length > 0
-                            ? '\n\nHere are 3 available slots on that day:\n' + alts.map((t, i) => `  ${i + 1}. ${t}`).join('\n') + '\n\nWhich one works for you?'
-                            : '\n\nWould you like to pick a different date or time?';
-                        return res.json({ success: true, answer: `Sorry, ${appointmentTime} on ${appointmentDay} is already booked.${altText}`, _credits: creditMeta });
-                    }
-                }
-            }
-
-            const appt = {
-                businessId, botName, owner: ownerEmail, conversationId: convId,
-                customerName: userName, contactInfo,
-                appointmentDay, appointmentTime, scheduledDate: dateISO,
-                status: 'confirmed', createdAt: new Date().toISOString(),
-                googleCalendarEvents: [],
-            };
-
-            const apptDocRef = await db.collection('appointments').add(appt);
-            await db.collection('user_bots').doc(businessId).collection('appointments').add({ ...appt, globalId: apptDocRef.id });
-
-            if (ownerEmail) {
-                const createdEvents = [];
-                for (const acct of bookingAccounts) {
-                    try {
-                        const calResult = await addCalendarEvent(acct, appt, ownerEmail, db);
-                        if (calResult?.eventId) createdEvents.push({ accountEmail: acct.email, eventId: calResult.eventId });
-                    } catch (e) { console.error('[Chat/Calendar]', acct.email, e.message); }
-                }
-                if (createdEvents.length) await apptDocRef.update({ googleCalendarEvents: createdEvents });
-
-                try { await sendFCMToUser(ownerEmail, buildBookingNotification(appt)); }
-                catch (e) { console.error('[FCM] Booking notify error:', e.message); }
-            }
-
-            await logChat(db, businessId, convId, userMsg, 'Appointment booked.', true, true);
-
-            const answer = [
-                '✅ APPOINTMENT BOOKED',
-                '',
-                `📅 Date:     ${dateISO}`,
-                `🕐 Time:     ${appointmentTime}`,
-                `👤 Name:     ${userName}`,
-                `📧 Contact:  ${contactInfo}`,
-                '',
-                'Reply with "CANCEL" to cancel or "EDIT" to change a detail.',
-            ].join('\n');
-
-            return res.json({ success: true, answer, reply: answer, _credits: creditMeta });
-        }
-
-        if (agentActionToolDefs.length && Array.isArray(choice?.tool_calls) && choice.tool_calls.length) {
-            const nonBookingCalls = choice.tool_calls.filter(tc => tc.function?.name !== 'appointmentBooking');
-
-            if (nonBookingCalls.length) {
-                const executed = await runAgentActionToolCalls(nonBookingCalls, agentActionsList);
-
-                const assistantToolCallMsg = {
-                    role: 'assistant',
-                    content: choice.content || null,
-                    tool_calls: nonBookingCalls,
-                };
-
-                const toolResultMessages = executed.map(e => ({
-                    role: 'tool',
-                    tool_call_id: e.toolCallId,
-                    name: e.functionName,
-                    content: JSON.stringify(e.result),
-                }));
-
-                const followUpMessages = [
-                    ...baseMessages,
-                    assistantToolCallMsg,
-                    ...toolResultMessages,
-                ];
-
-                let followUpChoice;
-                try {
-                    followUpChoice = await callLLM({
-                        modelKey,
-                        messages: followUpMessages,
-                        enableBookingTool: bookingEnabled,
-                        extraTools: agentActionToolDefs,
-                        toolChoice: 'none',
-                    });
-                    await addCreditUsage(db, ownerEmail, CREDIT_COSTS.toolFollowUp);
-                    if (followUpChoice?.content) followUpChoice.content = stripThinkingTags(followUpChoice.content);
-                } catch (err) {
-                    console.error('[AgentActions/FollowUp]', err.message);
-                    const fallbackAnswer = "I ran that action, but had trouble putting together a response. Could you ask again?";
-                    await logChat(db, businessId, convId, userMsg, fallbackAnswer, true, false, { fallback: true });
-                    return res.json({ success: true, answer: fallbackAnswer, reply: fallbackAnswer, _actionsExecuted: executed.map(e => e.functionName), _credits: creditMeta });
-                }
-
-                const finalAnswer = followUpChoice?.content?.trim() ||
-                    (executed.every(e => e.result?.success)
-                        ? "Done — that action completed successfully."
-                        : "I wasn't able to complete that action. Please try again or contact support.");
-
-                await logChat(db, businessId, convId, userMsg, finalAnswer, true, false);
-                return res.json({
-                    success: true,
-                    answer: finalAnswer,
-                    reply: finalAnswer,
-                    _agent: routedAgent?.name || null,
-                    _actionsExecuted: executed.map(e => e.functionName),
-                    _credits: creditMeta,
-                });
-            }
-        }
-
-        const answer = choice?.content?.trim() || 'How can I help you?';
-        await logChat(db, businessId, convId, userMsg, answer, true, false);
-        return res.json({ success: true, answer, reply: answer, _agent: routedAgent?.name || null, _credits: creditMeta });
-
+        const answer = result.answer || 'How can I help you?';
+        return res.json({ success: true, answer, reply: answer, ...result.meta });
     } catch (err) {
         console.error('[Chat]', err.message);
         return res.status(500).json({
@@ -5655,12 +5917,12 @@ async function handleAccountChangeEmail(req, res) {
             await batch.commit();
         }
 
-        // Also migrate email drafts/queue ownership
-        for (const col of ['email_drafts', 'email_queue']) {
-            const snap = await db.collection(col).where('ownerEmail', '==', oldEmail).get();
+        for (const col of ['email_drafts', 'email_queue', 'telegram_sessions']) {
+            const field = col === 'telegram_sessions' ? 'ownerEmail' : 'ownerEmail';
+            const snap = await db.collection(col).where(field, '==', oldEmail).get();
             if (snap.empty) continue;
             const batch = db.batch();
-            snap.docs.forEach(d => batch.update(d.ref, { ownerEmail: newEmail }));
+            snap.docs.forEach(d => batch.update(d.ref, { [field]: newEmail }));
             await batch.commit();
         }
 
@@ -5733,36 +5995,30 @@ async function handlePasswordResetRequest(req, res) {
             subject: 'Reset your Mebor AI password',
             html: `
                 <div style="max-width: 520px; margin: 0 auto; font-family: 'Google Sans Flex', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #0f172a; background-color: #ffffff; border: 1px solid #e2e8f0; border-radius: 20px; padding: 40px 36px; box-shadow: 0 10px 25px -5px rgba(15, 23, 42, 0.05); box-sizing: border-box;">
-
   <div style="display: flex; align-items: center; margin-bottom: 28px;">
     <span style="margin-left: 12px; font-size: 22px; font-weight: 800; color: #0f172a; letter-spacing: -0.5px;">
       Mebor<span style="color: #5b3df5;"> AI</span>
     </span>
   </div>
-
   <h2 style="margin: 0 0 16px 0; font-size: 24px; font-weight: 700; color: #0f172a; letter-spacing: -0.3px; line-height: 1.3;">
     Reset your password
   </h2>
-  
   <p style="margin: 0 0 24px 0; font-size: 15px; line-height: 1.6; color: #475569;">
     We received a request to reset the password for your Mebor AI account attached to 
     <span style="display: inline-block; background-color: #f1f5f9; color: #334155; padding: 2px 10px; border-radius: 6px; font-weight: 600; font-size: 14px; word-break: break-all;">
       ${email}
     </span>.
   </p>
-
   <div style="text-align: center; margin-bottom: 28px;">
     <a href="${resetLink}" target="_blank" style="display: inline-block; padding: 14px 32px; background: linear-gradient(135deg, #5b3df5 0%, #7c3aed 100%); color: #ffffff; text-decoration: none; font-weight: 700; font-size: 15px; border-radius: 100px; box-shadow: 0 6px 20px rgba(91, 61, 245, 0.35); letter-spacing: 0.2px;">
       Reset Password &rarr;
     </a>
   </div>
-
   <div style="background-color: #f8fafc; border-left: 4px solid #5b3df5; border-radius: 8px; padding: 14px 16px; margin-bottom: 24px;">
     <p style="margin: 0; font-size: 13px; line-height: 1.5; color: #64748b;">
       <strong style="color: #0f172a; font-weight: 600;">Security Note:</strong> This reset link will expire in <strong style="color: #5b3df5;">1 hour</strong>. If you did not request a password reset, no action is required and you can safely ignore this email.
     </p>
   </div>
-
   <div style="border-top: 1px solid #f1f5f9; padding-top: 20px;">
     <p style="margin: 0 0 8px 0; font-size: 12px; color: #94a3b8; line-height: 1.4;">
       Having trouble with the button? Copy and paste this link into your web browser:
@@ -5773,7 +6029,6 @@ async function handlePasswordResetRequest(req, res) {
       </a>
     </div>
   </div>
-
 </div>`,
         });
 
