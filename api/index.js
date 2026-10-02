@@ -3128,15 +3128,49 @@ async function processQueuedEmail(db, queueId, item, startedAt) {
         || `You are a helpful assistant replying to an email. Keep replies concise and professional.`;
     const webContext = bot.context ? `\n\n[WEBSITE CONTENT]:\n${bot.context}` : '';
 
-    const choice = await callLLM({
-        modelKey: bot.modelKey || DEFAULT_MODEL_KEY,
-        messages: [
-            { role: 'system', content: sysPrompt + webContext + `\n\nTHIS IS AN EMAIL REPLY. Write a clear, professional reply. Do NOT mention chat, widgets, or "typing". Include a brief sign-off. Format your response using Markdown where it improves clarity — use **bold** for key terms, names, or important values, and use "-" bullet points or "1." numbered lists for multi-part answers — since this reply is rendered as a richly formatted HTML email.` },
-            { role: 'user', content: item.bodyText },
-        ],
-        enableBookingTool: false,
-    });
-    const replyText = choice?.content?.trim() || 'Thanks for your message.';
+    const _emailSuffix = `\n\nTHIS IS AN EMAIL REPLY. Write a clear, professional reply. Do NOT mention chat, widgets, or "typing". Include a brief sign-off. Format your response using Markdown where it improves clarity — use **bold** for key terms, names, or important values, and use "-" bullet points or "1." numbered lists for multi-part answers — since this reply is rendered as a richly formatted HTML email.`;
+    const _emailPersonality = typeof bot.personality === 'string' ? bot.personality : 'default';
+    const _emailTools = (bot.toolsConfig && typeof bot.toolsConfig === 'object') ? bot.toolsConfig : {};
+    const _emailSys = sysPrompt + webContext + (PERSONALITY_PROMPTS[_emailPersonality] || '') + INJECTION_GUARD + _emailSuffix;
+    const _emailModelKey = bot.modelKey || DEFAULT_MODEL_KEY;
+    let replyText = findPinnedAnswer(bot.pinnedQA, item.bodyText);
+
+    if (!replyText) {
+        const _defs = buildBuiltinToolDefs(_emailTools);
+        const _actions = Array.isArray(bot.agentActions) ? bot.agentActions.filter(a => a?.name && a?.url) : [];
+        const _actionDefs = buildAgentActionToolDefs(_actions);
+        if (_emailTools.agentLoop && AGENT_CAPABLE_MODELS.has(_emailModelKey) && (_defs.length + _actionDefs.length) > 0) {
+            try {
+                const loop = await runAgentLoop({
+                    modelKey: _emailModelKey, sysPrompt: _emailSys, history: [], userMsg: item.bodyText,
+                    tools: [..._defs, ..._actionDefs],
+                    ctx: {
+                        db, businessId: item.businessId,
+                        botName: item.botName || bot.displayName || bot.name || 'Assistant',
+                        ownerEmail: item.ownerEmail, convId: `email-${queueId}`, source: 'email',
+                        agentActionsList: _actions,
+                    },
+                });
+                if (loop.answer) {
+                    replyText = loop.answer;
+                    const _src = [...new Set(loop.sources)].slice(0, 4);
+                    if (_src.length) replyText += '\n\nSources:\n' + _src.map(u => `- ${u}`).join('\n');
+                }
+            } catch (e) { console.error('[Email/AgentLoop]', e.message); }
+        }
+    }
+
+    if (!replyText) {
+        const choice = await callLLM({
+            modelKey: _emailModelKey,
+            messages: [
+                { role: 'system', content: _emailSys },
+                { role: 'user', content: item.bodyText },
+            ],
+            enableBookingTool: false,
+        });
+        replyText = choice?.content?.trim() || 'Thanks for your message.';
+    }
 
     const nowISO = new Date().toISOString();
 
