@@ -645,7 +645,7 @@
         if (isUser) {
             bubbleEl.textContent = text;
         } else {
-            bubbleEl.innerHTML = (opts.isAgent ? '<strong>🧑‍💻 Human Agent:</strong> ' : '') + parseMarkdown(text);
+            bubbleEl.innerHTML = (opts.isAgent ? '<strong>' + iconHtml('svg:user') + ' Human Agent:</strong> ' : '') + parseMarkdown(text);
         }
         container.appendChild(bubbleEl);
 
@@ -809,7 +809,57 @@
     const escW = v => String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     const colW = (c, d) => /^#[0-9a-f]{3,8}$/i.test(c || '') ? c : d;
 
+    // ── SVG icons / image icons / custom-HTML widgets (parity with Widget Studio) ──
+    const SVG_PATHS = {
+        check:'<circle cx="12" cy="12" r="10"/><path d="m8 12 3 3 5-6"/>',
+        user:'<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>',
+        package:'<path d="m21 8-9-5-9 5 9 5z"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/>',
+        form:'<rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/>',
+        chat:'<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
+        tag:'<path d="M20 13 13 20a2 2 0 0 1-3 0L3 13V3h10l7 7a2 2 0 0 1 0 3z"/><circle cx="7.5" cy="7.5" r="1"/>',
+        book:'<path d="M4 19V5a2 2 0 0 1 2-2h14v16H6a2 2 0 0 0-2 2z"/><path d="M8 7h8"/>',
+        plug:'<path d="M9 2v6M15 2v6M6 8h12v3a6 6 0 0 1-12 0z"/><path d="M12 17v5"/>',
+        rocket:'<path d="M5 15c-1 1-2 4-2 6 2 0 5-1 6-2"/><path d="M12 15 9 12c1-5 5-9 12-9 0 7-4 11-9 12z"/><circle cx="15" cy="9" r="1"/>',
+        bell:'<path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a2 2 0 0 0 3.4 0"/>',
+        alert:'<path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/>',
+        stop:'<circle cx="12" cy="12" r="10"/><path d="m4.9 4.9 14.2 14.2"/>',
+        clock:'<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
+        bolt:'<path d="M13 2 3 14h9l-1 8 10-12h-9z"/>',
+        headset:'<path d="M3 14v-2a9 9 0 0 1 18 0v2"/><rect x="2" y="14" width="4" height="6" rx="1"/><rect x="18" y="14" width="4" height="6" rx="1"/>',
+        trend:'<path d="m22 7-8.5 8.5-5-5L2 17"/><path d="M16 7h6v6"/>',
+        bag:'<path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/><path d="M3 6h18"/><path d="M16 10a4 4 0 0 1-8 0"/>',
+        star:'<path d="m12 2 3 6.9 7.5.6-5.7 4.9 1.8 7.3L12 17.8 5.4 21.7l1.8-7.3L1.5 9.5 9 8.9z"/>',
+        calendar:'<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/>',
+        heart:'<path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1-1.1a5.5 5.5 0 0 0-7.8 7.8l1 1.1L12 21l7.8-7.5 1-1.1a5.5 5.5 0 0 0 0-7.8z"/>',
+        gift:'<rect x="3" y="8" width="18" height="4"/><path d="M12 8v13M19 12v9H5v-9"/><path d="M7.5 8a2.5 2.5 0 0 1 0-5C11 3 12 8 12 8s1-5 4.5-5a2.5 2.5 0 0 1 0 5"/>',
+        mail:'<rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-10 6L2 7"/>'
+    };
+    const iconHtml = v => {
+        v = String(v == null ? '' : v);
+        if (v.startsWith('svg:') && SVG_PATHS[v.slice(4)])
+            return `<svg viewBox="0 0 24 24" width="1em" height="1em" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-0.125em">${SVG_PATHS[v.slice(4)]}</svg>`;
+        if (/^(data:image\/|https?:\/\/)/i.test(v))
+            return `<img src="${v.replace(/"/g, '&quot;')}" alt="" style="width:100%;height:100%;object-fit:contain;border-radius:6px;">`;
+        return escW(v);
+    };
+    function customWidgetHtml(def, ctx) {
+        ctx = ctx || {};
+        const raw = String((def.config || {}).html || '').replace(/\{\{(\w+)\}\}/g, (m, k) => ctx[k] !== undefined ? escW(ctx[k]) : '');
+        const d = '<!doctype html><html><head><meta charset="utf-8"><style>html,body{margin:0;font-family:inherit}</style></head><body>' + raw +
+            '<script>window.sendToChat=function(t){parent.postMessage({ccSend:String(t)},"*")};function h(){parent.postMessage({ccHeight:document.documentElement.scrollHeight},"*")}try{new ResizeObserver(h).observe(document.body)}catch(e){}addEventListener("load",h);<\/script></body></html>';
+        return `<iframe class="cw-custom" sandbox="allow-scripts allow-forms" srcdoc="${d.replace(/&/g, '&amp;').replace(/"/g, '&quot;')}" style="width:100%;max-width:340px;height:120px;border:0;background:transparent;display:block;"></iframe>`;
+    }
+    window.addEventListener('message', e => {
+        if (!e.data) return;
+        const fr = Array.from(document.querySelectorAll('iframe.cw-custom')).find(f => f.contentWindow === e.source);
+        if (!fr) return;
+        if (e.data.ccHeight) fr.style.height = Math.min(800, Math.max(40, e.data.ccHeight)) + 'px';
+        if (typeof e.data.ccSend === 'string' && fr.__send) fr.__send(e.data.ccSend);
+    });
+
+
     function widgetToHtml(def, ctx) {
+        if ((def.config || {}).mode === 'custom') return customWidgetHtml(def, ctx);
         ctx = ctx || {};
         const c = def.config || {};
         const accent = colW(c.accent, '#5b3df5'), bg = colW(c.bg, '#ffffff'), tx = colW(c.text, '#15121f');
@@ -828,7 +878,7 @@
             if (c.button) body += `<div style="margin-top:10px;text-align:center;padding:9px;border-radius:10px;background:${accent};color:#fff;font-weight:800;font-size:.8rem;">${t(c.button)}</div>`;
         }
         return `<div class="cw-card" style="width:100%;background:${bg};color:${tx};border-radius:${r}px;border:1px solid ${accent}44;box-shadow:0 10px 26px -10px ${accent}66;overflow:hidden;font-family:inherit;">
-            <div style="background:${accent};color:#fff;padding:14px 16px;display:flex;gap:10px;align-items:center;"><span style="font-size:1.4rem;">${escW(c.icon || '')}</span><div><div style="font-weight:800;font-size:.95rem;">${t(c.title)}</div><div style="font-size:.76rem;opacity:.9;">${t(c.subtitle)}</div></div></div>
+            <div style="background:${accent};color:#fff;padding:14px 16px;display:flex;gap:10px;align-items:center;"><span style="font-size:1.4rem;display:inline-flex;width:28px;height:28px;align-items:center;justify-content:center;">${iconHtml(c.icon)}</span><div><div style="font-weight:800;font-size:.95rem;">${t(c.title)}</div><div style="font-size:.76rem;opacity:.9;">${t(c.subtitle)}</div></div></div>
             <div style="padding:14px 16px;">${body}${c.footer ? `<div style="margin-top:10px;font-size:.72rem;opacity:.65;">${t(c.footer)}</div>` : ''}</div></div>`;
     }
 
@@ -836,6 +886,8 @@
         const row = document.createElement('div');
         row.className = 'cc-widget-row';
         row.innerHTML = widgetToHtml(def, ctx);
+        const _cf = row.querySelector('iframe.cw-custom');
+        if (_cf) _cf.__send = t => { inputEl.value = t; sendMessage(); };
         const btn = row.querySelector('.cw-submit');
         if (btn) btn.onclick = () => {
             const v = {};
