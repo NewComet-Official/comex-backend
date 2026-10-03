@@ -3929,6 +3929,7 @@ async function handleConfig(req, res) {
             channels,
             position:        b.position                 || 'bottom-right',
             logoBase64:      b.logoBase64               || null,
+            uiWidgets:       (b.uiWidgets && typeof b.uiWidgets === 'object') ? b.uiWidgets : {},
             themeColor:      b.designConfig?.themeColor || '#0f172a',
             designConfig:    b.designConfig             || {},
             modelKey:        b.modelKey                 || DEFAULT_MODEL_KEY,
@@ -4160,13 +4161,6 @@ const creditState = await consumeCredits(db, ownerEmail, CREDIT_COSTS.message);
             .get();
         if (!apptSnap.empty) return { id: apptSnap.docs[0].id, ...apptSnap.docs[0].data() };
 
-        const botApptSnap = await db.collection('user_bots').doc(businessId)
-            .collection('appointments')
-            .where('status', '==', 'confirmed')
-            .orderBy('createdAt', 'desc')
-            .limit(1)
-            .get();
-        if (!botApptSnap.empty) return { id: botApptSnap.docs[0].id, ...botApptSnap.docs[0].data() };
         return null;
     }
 
