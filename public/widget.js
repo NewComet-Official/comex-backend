@@ -13,26 +13,67 @@
     }
 
     // ── Session State ────────────────────────────────────────────────────────
-    let chatHistory    = [];
-    let isSending      = false;
+    // The ACTIVE conversation lives in sessionStorage, so every tab / window is its own
+    // visitor (private windows in the same Chrome session share localStorage, which is
+    // what used to make two windows look like one user).
+    // Past chats (only when the owner enables "Save Past Chats") live in localStorage.
+    let chatHistory  = [];
+    let savedMessages = [];
+    let isSending    = false;
+    let savePastChatsEnabled = false;
 
-    // ── Persistence: survive a page refresh mid human-conversation ───────────
     const SESSION_KEY = `comex_widget_session_${businessId}`;
+    const CHATS_KEY   = `comex_widget_chats_${businessId}`;
+
+    const newConvId = () => {
+        const a = new Uint32Array(3);
+        crypto.getRandomValues(a);
+        return `conv-${Date.now()}-${Array.from(a).map(n => n.toString(36)).join('')}`;
+    };
+
+    // Drop the old shared (localStorage) session from previous widget versions
+    try { localStorage.removeItem(SESSION_KEY); } catch (e) {}
+
     function loadSession() {
         try {
-            const raw = localStorage.getItem(SESSION_KEY);
-            if (!raw) return null;
-            return JSON.parse(raw);
+            const raw = sessionStorage.getItem(SESSION_KEY);
+            return raw ? JSON.parse(raw) : null;
         } catch (e) { return null; }
+    }
+    function readChats() {
+        try {
+            const a = JSON.parse(localStorage.getItem(CHATS_KEY) || '[]');
+            return Array.isArray(a) ? a : [];
+        } catch (e) { return []; }
+    }
+    function writeChats(a) {
+        try { localStorage.setItem(CHATS_KEY, JSON.stringify(a.slice(0, 30))); } catch (e) {}
+    }
+    function persistPastChat() {
+        if (!savePastChatsEnabled) return;
+        const first = savedMessages.find(m => m.k === 'user');
+        if (!first) return;
+        const chats = readChats().filter(c => c.id !== conversationId);
+        chats.unshift({
+            id: conversationId,
+            title: String(first.text || 'Chat').slice(0, 40),
+            updatedAt: Date.now(),
+            messages: savedMessages.slice(-100),
+            history: chatHistory.slice(-30),
+        });
+        writeChats(chats);
     }
     function saveSession() {
         try {
-            localStorage.setItem(SESSION_KEY, JSON.stringify({
-                conversationId, chatHistory: chatHistory.slice(-30),
+            sessionStorage.setItem(SESSION_KEY, JSON.stringify({
+                conversationId,
+                chatHistory: chatHistory.slice(-30),
+                messages: savedMessages.slice(-100),
                 humanSessionActive, humanRequestId, humanLastPollISO,
                 humanRenderedIds: Array.from(humanRenderedIds),
             }));
         } catch (e) { /* storage may be unavailable — degrade gracefully */ }
+        persistPastChat();
     }
     function clearHumanFromSession() {
         humanSessionActive = false; humanRequestId = null; humanLastPollISO = null;
@@ -41,7 +82,7 @@
     }
 
     const existingSession = loadSession();
-    const conversationId = existingSession?.conversationId || `conv-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    let conversationId = existingSession?.conversationId || newConvId();
 
     // ── Human handoff session state ──────────────────────────────────────────
     let humanSessionActive = !!(existingSession?.humanSessionActive && existingSession?.humanRequestId);
@@ -51,12 +92,14 @@
     let humanRenderedIds   = new Set(existingSession?.humanRenderedIds || []);
     let humanPollInFlight  = false;
     if (existingSession?.chatHistory?.length) chatHistory = existingSession.chatHistory;
+    if (existingSession?.messages?.length) savedMessages = existingSession.messages;
 
     // ── Default Configuration ────────────────────────────────────────────────
     let config = {
         name: 'AI Assistant',
         position: 'bottom-right',
         logoBase64: null,
+        uiWidgets: {},
         designConfig: {
             themeColor:      '#0f172a',
             typebarSize:      'standard',
@@ -69,7 +112,8 @@
             allowWebSearch: true,
             allowHallucination: false,
             allowAppointmentBooking: false,
-            allowHumanHandoff: true
+            allowHumanHandoff: true,
+            allowSavePastChats: false
         },
         messageConfig: {
             user: { showTime: true, editMessage: true, copy: true },
@@ -107,6 +151,7 @@
     const userMsgCfg = config.messageConfig.user;
     const botMsgCfg  = config.messageConfig.bot;
     const humanHandoffEnabled = config.behaviorConfig.allowHumanHandoff !== false;
+    savePastChatsEnabled = !!config.behaviorConfig.allowSavePastChats;
 
     // ── Position Computations ────────────────────────────────────────────────
     const positions = {
@@ -117,7 +162,7 @@
     };
     const pos = positions[config.position] || positions['bottom-right'];
 
-    // ── Inject Modern Modern CSS & Micro-Interactions ─────────────────────────
+    // ── Inject Modern CSS & Micro-Interactions ───────────────────────────────
     const style = document.createElement('style');
     style.textContent = `
         @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,400;0,500;0,600;0,700;0,800&display=swap');
@@ -189,6 +234,35 @@
         .cc-close-btn:hover { background: rgba(255,255,255,.3); transform: rotate(90deg); }
         .cc-endchat-btn:hover { background: rgba(239,68,68,.9); border-color: transparent; transform: scale(1.06); }
         .cc-close-btn svg, .cc-endchat-btn svg { width: 16px; height: 16px; stroke: currentColor; }
+
+        /* ── Past chats menu (three-dot) ── */
+        .cc-menu-btn {
+            width: 34px; height: 34px; border-radius: 50%; cursor: pointer; color: #fff;
+            background: rgba(255,255,255,.14); border: 1px solid rgba(255,255,255,.22);
+            display: none; align-items: center; justify-content: center; transition: background .2s;
+        }
+        .cc-menu-btn:hover { background: rgba(255,255,255,.3); }
+        .cc-menu-btn svg { width: 16px; height: 16px; }
+        .cc-menu-panel {
+            position: absolute; top: 68px; right: 14px; width: 260px; max-height: 340px; overflow-y: auto;
+            background: #fff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 8px; z-index: 5;
+            box-shadow: 0 18px 40px rgba(15,23,42,.22); display: none;
+        }
+        .cc-menu-panel.open { display: block; animation: ccFadeIn .2s ease forwards; }
+        .cc-menu-new {
+            width: 100%; text-align: left; background: ${themeColor}; color: #fff; border: none;
+            border-radius: 10px; padding: 10px 12px; font-family: inherit; font-weight: 700; font-size: 13px;
+            cursor: pointer; margin-bottom: 6px;
+        }
+        .cc-menu-label { font-size: 10.5px; font-weight: 800; text-transform: uppercase; letter-spacing: .06em; color: #94a3b8; padding: 8px 6px 4px; }
+        .cc-menu-empty { font-size: 12.5px; color: #94a3b8; padding: 8px 6px; }
+        .cc-menu-chat { display: flex; align-items: center; gap: 6px; padding: 9px 10px; border-radius: 10px; cursor: pointer; }
+        .cc-menu-chat:hover, .cc-menu-chat.active { background: #f1f5f9; }
+        .cc-menu-chat-main { flex: 1; min-width: 0; }
+        .cc-menu-chat-title { font-size: 13px; font-weight: 700; color: #0f172a; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .cc-menu-chat-date { font-size: 11px; color: #94a3b8; }
+        .cc-menu-del { background: none; border: none; color: #94a3b8; cursor: pointer; font-size: 12px; }
+        .cc-menu-del:hover { color: #ef4444; }
 
         .cc-confirm-overlay, .cc-report-overlay {
             position: fixed; inset: 0; background: rgba(15,23,42,.55); backdrop-filter: blur(5px);
@@ -344,7 +418,7 @@
     header.className = 'cc-header';
     const headerLeft = document.createElement('div');
     headerLeft.className = 'cc-header-left';
-    
+
     const avatarContainer = document.createElement('div');
     avatarContainer.className = 'cc-avatar-container';
     const avatar = document.createElement('div');
@@ -360,7 +434,7 @@
     statusDot.className = 'cc-status-dot';
     avatarContainer.appendChild(avatar);
     avatarContainer.appendChild(statusDot);
-    
+
     const headerInfo = document.createElement('div');
     const botNameEl = document.createElement('div');
     botNameEl.className = 'cc-bot-title';
@@ -372,7 +446,7 @@
     statusEl.textContent = 'Replies instantly';
     headerInfo.appendChild(botNameEl);
     headerInfo.appendChild(statusEl);
-    
+
     headerLeft.appendChild(avatarContainer);
     headerLeft.appendChild(headerInfo);
 
@@ -391,11 +465,24 @@
     closeBtn.className = 'cc-close-btn';
     closeBtn.setAttribute('aria-label', 'Close chat');
     closeBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none"><path d="M18 6L6 18M6 6l12 12" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+
+    // Three-dot past-chats menu (only shown when "Save Past Chats" is enabled)
+    const menuBtn = document.createElement('button');
+    menuBtn.className = 'cc-menu-btn';
+    menuBtn.setAttribute('aria-label', 'Past chats');
+    menuBtn.title = 'Past chats';
+    menuBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/></svg>`;
+    if (savePastChatsEnabled) menuBtn.style.display = 'flex';
+    const menuPanel = document.createElement('div');
+    menuPanel.className = 'cc-menu-panel';
+
+    headerActions.appendChild(menuBtn);
     headerActions.appendChild(endChatBtn);
     headerActions.appendChild(closeBtn);
     header.appendChild(headerLeft);
     header.appendChild(headerActions);
     win.appendChild(header);
+    win.appendChild(menuPanel);
 
     // Chat Scroller Compartment
     const chatBox = document.createElement('div');
@@ -438,26 +525,26 @@
     // Interactive Widget Footer Element
     const footer = document.createElement('div');
     footer.className = 'cc-footer';
-    
+
     const inputWrapper = document.createElement('div');
     inputWrapper.className = 'cc-input-wrapper';
-    
+
     const inputEl = document.createElement('input');
     inputEl.type = 'text';
     inputEl.className = 'cc-input';
     inputEl.id = 'ccInput';
     inputEl.placeholder = 'Type a message…';
     inputEl.setAttribute('autocomplete', 'off');
-    
+
     const micBtn = document.createElement('button');
     micBtn.className = 'cc-mic-btn';
     micBtn.id = 'ccMicBtn';
     micBtn.setAttribute('aria-label', 'Voice input');
     micBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v1a7 7 0 0 1-14 0v-1M12 19v3M8 22h8"/></svg>`;
-    
+
     inputWrapper.appendChild(inputEl);
     inputWrapper.appendChild(micBtn);
-    
+
     const sendBtn = document.createElement('button');
     sendBtn.className = 'cc-send-btn';
     sendBtn.id = 'ccSendBtn';
@@ -467,7 +554,7 @@
     } else {
         sendBtn.innerHTML = `<svg viewBox="0 0 24 24"><path d="M5 12h14M12 5l7 7-7 7"/></svg>`;
     }
-    
+
     footer.appendChild(inputWrapper);
     footer.appendChild(sendBtn);
     win.appendChild(footer);
@@ -543,12 +630,18 @@
 
     function appendMsg(text, isUser, opts) {
         opts = opts || {};
+
+        // Remember what's on screen so the chat can be restored / saved as a past chat
+        if (!opts.noSave) {
+            savedMessages.push({ k: isUser ? 'user' : (opts.isAgent ? 'agent' : 'bot'), text: String(text || '') });
+        }
+
         const container = document.createElement('div');
         container.className = `cc-bubble-container ${isUser ? 'cc-user' : (opts.isAgent ? 'cc-agent' : 'cc-ai')}`;
-        
+
         const bubbleEl = document.createElement('div');
         bubbleEl.className = 'cc-bubble';
-        
+
         if (isUser) {
             bubbleEl.textContent = text;
         } else {
@@ -626,7 +719,7 @@
         if (!isUser) metaRow.appendChild(actionsEl);
 
         container.appendChild(metaRow);
-        
+
         chatBox.insertBefore(container, typingEl);
         chatBox.scrollTop = chatBox.scrollHeight;
         return { container, bubbleEl };
@@ -639,6 +732,78 @@
         chatBox.insertBefore(note, typingEl);
         chatBox.scrollTop = chatBox.scrollHeight;
     }
+
+    // ── Past chats: menu, switch, continue ───────────────────────────────────
+    const escM = v => String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+    function resetChatUI() {
+        chatBox.querySelectorAll('.cc-bubble-container, .cc-widget-row, .cc-system-note').forEach(n => n.remove());
+    }
+    function renderSaved(m) {
+        appendMsg(m.text, m.k === 'user', { noSave: true, isAgent: m.k === 'agent', noRegenerate: true, noReport: m.k !== 'bot' });
+    }
+    function closeMenu() { menuPanel.classList.remove('open'); }
+    function renderMenu() {
+        const chats = readChats();
+        menuPanel.innerHTML =
+            `<button class="cc-menu-new" data-act="new">＋ New chat</button><div class="cc-menu-label">Past chats</div>` +
+            (chats.length
+                ? chats.map(c => `<div class="cc-menu-chat ${c.id === conversationId ? 'active' : ''}" data-id="${escM(c.id)}">
+                    <div class="cc-menu-chat-main">
+                        <div class="cc-menu-chat-title">${escM(c.title)}</div>
+                        <div class="cc-menu-chat-date">${escM(new Date(c.updatedAt).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }))}</div>
+                    </div>
+                    <button class="cc-menu-del" data-del="${escM(c.id)}" aria-label="Delete chat">✕</button>
+                </div>`).join('')
+                : `<div class="cc-menu-empty">No saved chats yet.</div>`);
+    }
+    function canSwitchChat() {
+        if (humanSessionActive) {
+            appendSystemNote('End the live conversation before switching chats.');
+            closeMenu();
+            return false;
+        }
+        return !isSending;
+    }
+    function startNewChat() {
+        if (!canSwitchChat()) return;
+        conversationId = newConvId();
+        chatHistory = [];
+        savedMessages = [];
+        resetChatUI();
+        welcomeCard.style.display = '';
+        saveSession();
+        closeMenu();
+    }
+    function loadPastChat(id) {
+        if (!canSwitchChat()) return;
+        const c = readChats().find(x => x.id === id);
+        if (!c) return;
+        conversationId = c.id;
+        chatHistory = (c.history || []).slice();
+        savedMessages = (c.messages || []).slice();
+        resetChatUI();
+        welcomeCard.style.display = 'none';
+        savedMessages.forEach(renderSaved);
+        saveSession();
+        closeMenu();
+    }
+
+    menuBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (menuPanel.classList.contains('open')) { closeMenu(); return; }
+        renderMenu();
+        menuPanel.classList.add('open');
+    });
+    menuPanel.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const del = e.target.closest('[data-del]');
+        if (del) { writeChats(readChats().filter(c => c.id !== del.dataset.del)); renderMenu(); return; }
+        if (e.target.closest('[data-act="new"]')) { startNewChat(); return; }
+        const row = e.target.closest('.cc-menu-chat');
+        if (row) loadPastChat(row.dataset.id);
+    });
+    win.addEventListener('click', closeMenu);
 
     // ── Widget Studio cards (designed in the dashboard) ──────────────────────
     const escW = v => String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -730,7 +895,7 @@
 
             if (data.status === 'active') {
                 statusEl.textContent = 'A team member has joined';
-                if (!humanRenderedIds.has('__joined_widget') && (config.uiWidgets.human_joined || []).length) {
+                if (!humanRenderedIds.has('__joined_widget') && ((config.uiWidgets || {}).human_joined || []).length) {
                     humanRenderedIds.add('__joined_widget');
                     const agentName = data.agentEmail ? String(data.agentEmail).split('@')[0] : 'A team member';
                     appendWidget(config.uiWidgets.human_joined[0], { agent: agentName });
@@ -748,9 +913,8 @@
                     appendMsg(m.text, false, { isAgent: true, noRegenerate: true, noReport: true });
                 } else if (m.sender === 'agent' && m.isSystem) {
                     appendSystemNote(m.text);
-                } else if (m.sender === 'user' && isInitialReplay) {
-                    appendMsg(m.text, true, { isHuman: true });
                 }
+                // visitor's own messages are already on screen / in savedMessages
             });
             saveSession();
 
@@ -790,6 +954,9 @@
                 chatHistory[chatHistory.length - 1].content = reply;
             } else {
                 chatHistory.push({ role: 'assistant', content: reply });
+            }
+            for (let i = savedMessages.length - 1; i >= 0; i--) {
+                if (savedMessages[i].k === 'bot') { savedMessages[i].text = reply; break; }
             }
             saveSession();
         } catch (err) {
@@ -911,6 +1078,7 @@
     }
 
     function closeWidget() {
+        closeMenu();
         win.classList.remove('cc-open');
         win.classList.add('cc-closed');
         setTimeout(() => { if (win.classList.contains('cc-closed')) win.style.display = 'none'; }, 300);
@@ -923,7 +1091,7 @@
             openWidget();
         }
     });
-    
+
     closeBtn.addEventListener('click', (e) => {
         e.stopPropagation();
         closeWidget();
@@ -962,7 +1130,7 @@
         sendBtn.disabled = true;
         inputEl.value = '';
         welcomeCard.style.display = 'none';
-        
+
         appendMsg(text, true);
         chatHistory.push({ role: 'user', content: text });
         chatBox.scrollTop = chatBox.scrollHeight;
@@ -1000,7 +1168,7 @@
             typingEl.classList.remove('visible');
 
             if (!r.ok) {
-                appendMsg('Sorry, something went wrong. Please try again.', false, { noRegenerate: true, noReport: true });
+                appendMsg('Sorry, something went wrong. Please try again.', false, { noRegenerate: true, noReport: true, noSave: true });
                 return;
             }
 
@@ -1025,7 +1193,7 @@
 
         } catch (err) {
             typingEl.classList.remove('visible');
-            appendMsg('Connection interrupted. Please try again.', false, { noRegenerate: true, noReport: true });
+            appendMsg('Connection interrupted. Please try again.', false, { noRegenerate: true, noReport: true, noSave: true });
         } finally {
             isSending = false;
             sendBtn.disabled = false;
@@ -1067,13 +1235,12 @@
         }
     }
 
-    // ── Restore active human session after refresh ────────────────────────────
-    if (humanHandoffEnabled && humanSessionActive && humanRequestId) {
+    // ── Restore this tab's conversation after a refresh ──────────────────────
+    if (savedMessages.length) {
         welcomeCard.style.display = 'none';
-        chatHistory.forEach(m => {
-            if (m.role === 'user') appendMsg(m.content, true);
-            else if (m.role === 'assistant') appendMsg(m.content, false, { noRegenerate: true, noReport: true });
-        });
+        savedMessages.forEach(renderSaved);
+    }
+    if (humanHandoffEnabled && humanSessionActive && humanRequestId) {
         humanLastPollISO = null;
         startHumanPolling();
         pollHumanMessages(true);
