@@ -567,6 +567,56 @@
 
     document.body.appendChild(win);
 
+    // ── Style Studio overrides (designConfig.studio) ─────────────────────────
+    (function applyStudio() {
+        const st = config.designConfig && config.designConfig.studio;
+        if (!st || typeof st !== 'object') return;
+        const e = st.el || {};
+        const dev = innerWidth <= 480 ? 'mobile' : (innerWidth <= 900 ? 'tablet' : 'desktop');
+        const dl = (st.delta && st.delta[dev]) || {};
+        const ok = v => /^#[0-9a-f]{3,8}$/i.test(v || '');
+        const num = v => (v != null && Number.isFinite(+v)) ? Math.max(0, +v) : null;
+        const grad = c => `linear-gradient(135deg, ${c} 0%, ${c}dd 100%)`;
+        const mv = id => { const d = dl[id]; return d && (d.dx || d.dy) ? [`translate:${Math.round(d.dx)}px ${Math.round(d.dy)}px !important`] : []; };
+        const base = (o, bgf) => { const p = []; if (ok(o.bg)) p.push(`background:${bgf ? bgf(o.bg) : o.bg} !important`); if (ok(o.fg)) p.push(`color:${o.fg} !important`); return p; };
+        let css = '';
+        const rule = (sel, p) => { if (p.length) css += `${sel}{${p.join(';')}}\n`; };
+
+        let o = e.header || {}, p = base(o, grad), r = num(o.r), h = num(o.h);
+        if (r !== null) { p.push(`border-radius:${r}px ${r}px 0 0 !important`); if (dev !== 'mobile') rule('#cc-widget-window', [`border-radius:${r}px !important`]); }
+        if (h !== null) p.push(`height:${h}px`);
+        rule('.cc-header', p.concat(mv('header')));
+
+        o = e.botMsg || {}; p = base(o); r = num(o.r);
+        if (r !== null) p.push(`border-radius:${r}px !important`, `border-bottom-left-radius:${Math.min(r, 6)}px !important`);
+        rule('.cc-ai .cc-bubble', p);
+
+        o = e.userMsg || {}; p = base(o); r = num(o.r);
+        if (r !== null) p.push(`border-radius:${r}px !important`, `border-bottom-right-radius:${Math.min(r, 6)}px !important`);
+        rule('.cc-user .cc-bubble', p);
+
+        o = e.input || {}; p = base(o); r = num(o.r); h = num(o.h);
+        if (r !== null) p.push(`border-radius:${r}px !important`);
+        if (h !== null) p.push(`height:${h}px !important`);
+        rule('.cc-input', p);
+        rule('.cc-input-wrapper', mv('input'));
+
+        o = e.send || {}; p = base(o); r = num(o.r); h = num(o.h); const sw = num(o.w);
+        if (r !== null) p.push(`border-radius:${r}px !important`);
+        if (sw !== null) p.push(`width:${sw}px !important`);
+        if (h !== null) p.push(`height:${h}px !important`);
+        rule('.cc-send-btn', p.concat(mv('send')));
+
+        o = e.bubble || {}; p = base(o); r = num(o.r); h = num(o.h);
+        if (ok(o.bg)) { p.splice(0, p.length); p.push(`background-color:${o.bg} !important`); if (ok(o.fg)) p.push(`color:${o.fg} !important`); }
+        if (r !== null) p.push(`border-radius:${r}px !important`);
+        if (num(o.w) !== null) p.push(`width:${num(o.w)}px !important`);
+        if (h !== null) p.push(`height:${h}px !important`);
+        rule('#cc-widget-bubble', p.concat(mv('bubble')));
+
+        if (css) { const s = document.createElement('style'); s.id = 'cc-studio-style'; s.textContent = css; document.head.appendChild(s); }
+    })();
+
     // ── Ultra-Clean Sanitized Markdown Message Parser ─────────────────────────
     function parseMarkdown(text) {
         let t = String(text || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
