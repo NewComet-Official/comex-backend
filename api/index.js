@@ -5237,6 +5237,20 @@ function rgbToHex(r, g, b) {
     return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
 }
 
+// Pick black or white text for a given background hex, so the header/send button
+// stays readable no matter what colour the Figma design uses.
+function pickReadableFg(hex) {
+    if (!hex || typeof hex !== 'string') return '#ffffff';
+    const m = hex.replace('#', '');
+    if (m.length !== 6) return '#ffffff';
+    const r = parseInt(m.slice(0, 2), 16);
+    const g = parseInt(m.slice(2, 4), 16);
+    const b = parseInt(m.slice(4, 6), 16);
+    // Perceived luminance — anything brighter than mid-gray gets dark text.
+    const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+    return lum > 0.6 ? '#0f172a' : '#ffffff';
+}
+
 const REQUIRED_DESIGN_ELEMENTS = [
     { key: 'header',  label: 'Header / Bot Name',         match: /header|bot[\s_-]?name|title/i },
     { key: 'avatar',  label: 'Avatar / Logo',             match: /avatar|logo|icon/i },
@@ -5261,32 +5275,136 @@ async function handleDesignImport(req, res) {
         const integrations = userSnap.exists ? (userSnap.data()?.integrations || {}) : {};
 
         let layerNames = [];
-        const extracted = { themeColor: null, logoUrl: null };
+        // Rich extraction object. Every field here is consumed by the frontend's importDesign().
+        const extracted = {
+            themeColor:      null,
+            headerBg:        null,
+            headerFg:        null,
+            bubbleBg:        null,
+            bubbleFg:        null,
+            sendBg:          null,
+            sendFg:          null,
+            inputBg:         null,
+            inputFg:         null,
+            logoBase64:      null,
+            botDisplayName:  null,
+            radius:          null,
+            sendButtonStyle: null,
+            typebarSize:     null,
+        };
 
         if (service === 'figma') {
             const figma = integrations.figma;
             if (!figma?.connected) return res.status(400).json({ success: false, message: 'Figma not connected.' });
 
-            const r = await fetch(`https://api.figma.com/v1/files/${encodeURIComponent(fileKeyOrDesignId)}`, {
+            const fileRes = await fetch(`https://api.figma.com/v1/files/${encodeURIComponent(fileKeyOrDesignId)}`, {
                 headers: { Authorization: `Bearer ${figma.access_token}` },
             });
-            if (!r.ok) return res.status(502).json({ success: false, message: `Figma API error: ${await r.text()}` });
-            const data = await r.json();
+            if (!fileRes.ok) return res.status(502).json({ success: false, message: `Figma API error: ${await fileRes.text()}` });
+            const data = await fileRes.json();
 
+            // ── Flatten every node into a searchable list with fill + image + text info ──
+            const nodes = [];
             const walk = (node) => {
                 if (!node) return;
-                const name = node.name || '';
-                layerNames.push(name);
-                if (/bubble|background/i.test(name) && node.fills?.[0]?.color) {
-                    const c = node.fills[0].color;
-                    extracted.themeColor = rgbToHex(c.r, c.g, c.b);
-                }
-                if (/avatar|logo/i.test(name) && node.type === 'IMAGE') {
-                    extracted.logoUrl = 'figma-image-ref';
-                }
+                const fills = Array.isArray(node.fills) ? node.fills : [];
+                const solidFill = fills.find(f => f && f.visible !== false && f.type === 'SOLID' && f.color);
+                const fillHex = solidFill ? rgbToHex(solidFill.color.r, solidFill.color.g, solidFill.color.b) : null;
+                const imageFill = fills.find(f => f && f.visible !== false && f.type === 'IMAGE' && f.imageRef);
+                nodes.push({
+                    id:           node.id,
+                    name:         node.name || '',
+                    type:         node.type,
+                    fillHex,
+                    imageRef:     imageFill ? imageFill.imageRef : null,
+                    characters:   node.type === 'TEXT' ? (node.characters || '') : null,
+                    width:        node.absoluteBoundingBox?.width  || 0,
+                    height:       node.absoluteBoundingBox?.height || 0,
+                    absoluteY:    node.absoluteBoundingBox?.y      ?? 0,
+                    cornerRadius: typeof node.cornerRadius === 'number' ? node.cornerRadius : null,
+                });
                 (node.children || []).forEach(walk);
             };
             walk(data.document);
+
+            layerNames = nodes.map(n => n.name);
+
+            // ── Match helpers: name-first, position/size fallback ──
+            const byNameWithFill = (regex) => nodes.find(n => regex.test(n.name) && n.fillHex);
+            const topmostFilled = () => nodes
+                .filter(n => n.fillHex && n.type !== 'TEXT')
+                .sort((a, b) => a.absoluteY - b.absoluteY)[0];
+            const biggestFilled = (excludeId) => nodes
+                .filter(n => n.fillHex && n.type !== 'TEXT' && n.id !== excludeId)
+                .sort((a, b) => (b.width * b.height) - (a.width * a.height))[0];
+
+            // Header / top bar — the bar at the top of the widget
+            const headerNode = byNameWithFill(/header|top[\s_-]?bar|navbar|title[\s_-]?bar/i) || topmostFilled();
+            // Avatar / logo — a small circle/image inside the header
+            const avatarNode = nodes.find(n =>
+                /avatar|logo|profile|icon/i.test(n.name) && (n.imageRef || n.fillHex)
+            ) || nodes.find(n =>
+                // fallback: circle-ish shape inside the header (roughly square, small)
+                n.type === 'ELLIPSE' ||
+                (n.fillHex && Math.abs(n.width - n.height) < 6 && n.width > 20 && n.width < 80)
+            );
+            // Chat bubble / message body — the big rectangle in the middle
+            const bubbleNode = byNameWithFill(/bubble|message|body|card|chat/i) || biggestFilled(headerNode?.id);
+            // Send button — bottom-right corner button
+            const sendNode = byNameWithFill(/send[\s_-]?button|send[\s_-]?btn|\bsend\b|cta|submit/i);
+            // Header text — pull the bot's display name from a TEXT layer inside the header
+            const headerText = nodes.find(n => n.type === 'TEXT' && /title|name|heading/i.test(n.name))
+                            || nodes.find(n => n.type === 'TEXT' && /agent|assistant|support|help|bot|chat/i.test(n.characters || ''));
+
+            // ── Apply extracted values ──
+            if (bubbleNode?.fillHex) extracted.themeColor = bubbleNode.fillHex;
+
+            if (headerNode?.fillHex) {
+                extracted.headerBg = headerNode.fillHex;
+                extracted.headerFg = pickReadableFg(headerNode.fillHex);
+            }
+            if (bubbleNode?.fillHex) {
+                extracted.bubbleBg = bubbleNode.fillHex;
+                extracted.bubbleFg = pickReadableFg(bubbleNode.fillHex);
+            }
+            if (sendNode?.fillHex) {
+                extracted.sendBg = sendNode.fillHex;
+                extracted.sendFg = pickReadableFg(sendNode.fillHex);
+            }
+            if (headerText?.characters) {
+                extracted.botDisplayName = String(headerText.characters).trim().substring(0, 60);
+            }
+            if (headerNode?.cornerRadius != null) extracted.radius = headerNode.cornerRadius;
+            if (sendNode) {
+                const w = sendNode.width || 0;
+                extracted.sendButtonStyle = w > 80 ? 'pill' : 'icon';
+            }
+
+            // ── Fetch the actual avatar image from Figma and inline it as base64 ──
+            if (avatarNode?.id) {
+                try {
+                    const imgRes = await fetch(
+                        `https://api.figma.com/v1/images/${encodeURIComponent(fileKeyOrDesignId)}?ids=${encodeURIComponent(avatarNode.id)}&format=png&scale=2`,
+                        { headers: { Authorization: `Bearer ${figma.access_token}` } }
+                    );
+                    if (imgRes.ok) {
+                        const imgData = await imgRes.json();
+                        const url = imgData.images?.[avatarNode.id];
+                        if (url) {
+                            const binRes = await fetch(url);
+                            if (binRes.ok) {
+                                const buf = Buffer.from(await binRes.arrayBuffer());
+                                // Cap at 200KB to keep the bot doc lean
+                                if (buf.length <= 200 * 1024) {
+                                    extracted.logoBase64 = `data:image/png;base64,${buf.toString('base64')}`;
+                                }
+                            }
+                        }
+                    }
+                } catch (e) {
+                    console.warn('[DesignImport/FigmaAvatar]', e.message);
+                }
+            }
         }
 
         if (service === 'canva') {
@@ -5298,7 +5416,10 @@ async function handleDesignImport(req, res) {
             });
             if (!r.ok) return res.status(502).json({ success: false, message: `Canva API error: ${await r.text()}` });
             const data = await r.json();
-            layerNames = [data.design?.title || ''];
+            const design = data.design || {};
+            layerNames = [design.title || '', ...((design.pages || []).map(p => p.title || ''))];
+            // Canva doesn't expose a public per-layer API, so we can't yet extract
+            // header/bubble/send colours. The frontend still applies themeColor when present.
         }
 
         const results = REQUIRED_DESIGN_ELEMENTS.map(req => ({
