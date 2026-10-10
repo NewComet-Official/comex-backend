@@ -789,7 +789,7 @@ function stripThinkingTags(text) {
         .trim();
 }
 
-async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent, enableBookingTool, extraTools }) {
+async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent, enableBookingTool, extraTools, maxTokens }) {
     const entry = MODEL_REGISTRY[modelKey] || MODEL_REGISTRY[DEFAULT_MODEL_KEY];
     const apiKey = process.env.OPENROUTER_API_KEY;
     if (!apiKey) throw new Error('OPENROUTER_API_KEY not set.');
@@ -813,8 +813,8 @@ async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent, enabl
         model: entry.id,
         messages,
         ...(hasTools ? { tools, tool_choice: toolChoiceValue } : {}),
-        temperature: 0.3,
-        max_tokens:  600,
+                temperature: 0.3,
+        max_tokens:  maxTokens || 600,
     };
 
     const r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
@@ -4496,8 +4496,52 @@ async function handleChat(req, res) {
     if (!businessId || !userMsg)
         return res.status(400).json({ success: false, answer: 'Missing businessId or message.' });
 
-    const convId = inId || `conv-${Date.now()}`;
+        const convId = inId || `conv-${Date.now()}`;
     const db     = getDb();
+
+    // ── Testing Lab meta tasks: raw LLM call, no bot persona, large token budget ──
+    const metaTask = req.body?.metaTask;
+    if (metaTask === 'test_generation' || metaTask === 'ai_invigilator') {
+        try {
+            const reqOwner = req.body?.ownerEmail;
+            if (!reqOwner) return res.status(401).json({ success: false, answer: 'Missing ownerEmail.', message: 'Missing ownerEmail.' });
+
+            const botSnap = await db.collection('user_bots').doc(businessId).get();
+            if (!botSnap.exists) return res.status(404).json({ success: false, message: 'Agent not found.' });
+            const botDoc = botSnap.data();
+
+            const ownerCtx = await resolveOwnerContext(db, reqOwner);
+            if (botDoc.owner !== ownerCtx.ownerEmail) {
+                return res.status(403).json({ success: false, message: 'You do not own this agent.' });
+            }
+
+            const credit = await consumeCredits(db, botDoc.owner, CREDIT_COSTS.message);
+            if (!credit.allowed) {
+                return res.json({ success: false, message: 'Monthly credits exhausted.', answer: 'Monthly credits exhausted.' });
+            }
+
+            const requested = req.body?.model;
+            const metaModelKey = MODEL_REGISTRY[requested] ? requested
+                : (MODEL_REGISTRY[botDoc.modelKey] ? botDoc.modelKey : DEFAULT_MODEL_KEY);
+
+            const sysMsg = (Array.isArray(history) ? history.find(m => m?.role === 'system')?.content : '')
+                || 'You are a helpful assistant. Reply with valid JSON only.';
+
+            const choice = await callLLM({
+                modelKey: metaModelKey,
+                messages: [
+                    { role: 'system', content: String(sysMsg) },
+                    { role: 'user',   content: String(userMsg) },
+                ],
+                maxTokens: metaTask === 'test_generation' ? 4000 : 900,
+            });
+            const metaAnswer = (choice?.content || '').trim();
+            return res.json({ success: true, answer: metaAnswer, reply: metaAnswer });
+        } catch (err) {
+            console.error('[Chat/MetaTask]', err.message);
+            return res.status(500).json({ success: false, message: err.message, answer: err.message });
+        }
+    }
 
     try {
         const result = await generateBotReply({
