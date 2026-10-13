@@ -98,7 +98,7 @@ async function requireAuth(req, res, { matches = [], allowUnverified = false } =
         return null;
     }
     // FIX #24: require email_verified unless explicitly allowed (e.g. during onboarding)
-    const requireVerified = process.env.REQUIRE_EMAIL_VERIFIED !== 'false';
+    const requireVerified = process.env.REQUIRE_EMAIL_VERIFIED === 'true';
     if (requireVerified && !allowUnverified && !user.email_verified) {
         res.status(403).json({ success: false, message: 'Please verify your email address first.' });
         return null;
@@ -1465,6 +1465,7 @@ export default async function handler(req, res) {
     if (path === '/api/oauth/google')             return handleGoogleOAuth(req, res);
     if (path === '/api/oauth/google/callback')    return handleGoogleCallback(req, res);
     if (path === '/api/disconnect-calendar')      return handleDisconnectCalendar(req, res);
+    if (path === '/api/integrations/calendar-accounts') return handleCalendarAccounts(req, res);
     if (path === '/api/integrations/toggle-calendar-account') return handleToggleCalendarAccount(req, res);
     if (path === '/api/report/submit')            return handleReportSubmit(req, res);
     if (path === '/api/bot/delete-cascade')       return handleBotDeleteCascade(req, res);
@@ -2231,11 +2232,11 @@ async function refreshSupabaseToken(sb, ownerEmail, db) {
             const t = await r.json();
             if (t.access_token) {
                 accessToken = t.access_token;
-                await setUserSecrets(db, ownerEmail, {
-                    'integrations.supabase.access_token': t.access_token,
-                    'integrations.supabase.refresh_token': t.refresh_token || sb.refresh_token,
-                    'integrations.supabase.expiry_date': new Date(Date.now() + (t.expires_in || 3500) * 1000).toISOString(),
-                });
+                await setUserSecrets(db, ownerEmail, { integrations: { supabase: {
+                    access_token: t.access_token,
+                    refresh_token: t.refresh_token || sb.refresh_token,
+                    expiry_date: new Date(Date.now() + (t.expires_in || 3500) * 1000).toISOString(),
+                } } });
             }
         }
     }
@@ -5027,7 +5028,7 @@ async function handleChat(req, res) {
 
     const { businessId, message, question, history = [], conversationId: inId } = req.body || {};
     const userMsg = message || question;
-    const source = req.body?.source === 'email' ? 'email' : 'web';
+    const source = req.body?.source === 'email' ? 'email' : (req.body?.metaTask === 'test_execution' ? 'test' : 'web');
 
     if (!businessId || !userMsg)
         return res.status(400).json({ success: false, answer: 'Missing businessId or message.' });
@@ -5422,6 +5423,24 @@ async function handleGoogleCallback(req, res) {
     } catch (err) {
         console.error('[OAuth/Google]', err.message);
         return res.status(500).send(`Server error: ${err.message}`);
+    }
+}
+
+async function handleCalendarAccounts(req, res) {
+    const { userEmail } = req.query;
+    if (!userEmail) return res.status(400).json({ success: false, message: 'Missing userEmail.' });
+    const auth = await requireAuth(req, res, { matches: [userEmail] });
+    if (!auth) return;
+    try {
+        const secrets = await getUserSecrets(getDb(), userEmail);
+        // never expose tokens
+        const accounts = (secrets?.integrations?.google_calendar_accounts || [])
+            .filter(a => a && a.connected)
+            .map(a => ({ email: a.email, connected: true, enabledForBooking: a.enabledForBooking !== false }));
+        return res.json({ success: true, accounts });
+    } catch (err) {
+        console.error('[CalendarAccounts]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
     }
 }
 
@@ -6171,11 +6190,10 @@ async function refreshGenericGoogleToken(authObj, ownerEmail, db, key) {
             const t = await r.json();
             if (t.access_token) {
                 accessToken = t.access_token;
-                await setUserSecrets(db, ownerEmail, {
-                    [`integrations.${key}.access_token`]: t.access_token,
-                    [`integrations.${key}.expiry_date`]:
-                        new Date(Date.now() + (t.expires_in || 3500) * 1000).toISOString(),
-                });
+                await setUserSecrets(db, ownerEmail, { integrations: { [key]: {
+                    access_token: t.access_token,
+                    expiry_date: new Date(Date.now() + (t.expires_in || 3500) * 1000).toISOString(),
+                } } });
             }
         }
     }
@@ -6711,26 +6729,33 @@ async function ensureHumanRequest(db, { businessId, botName, ownerEmail, convers
 }
 
 // FIX #9: require auth + ownership for all human routes
-async function requireHumanRequestAccess(db, req, res, requestId) {
-    const auth = await requireAuth(req, res);
-    if (!auth) return null;
-    const ref = db.collection('human_requests').doc(requestId);
+async function requireHumanRequestAccess(db, req, res, requestId, { visitorOk = false } = {}) {
+    const user = await verifyIdToken(req);
+    if (!user && !visitorOk) {
+        res.status(401).json({ success: false, message: 'Authentication required.' });
+        return null;
+    }
+    const ref = db.collection('human_requests').doc(String(requestId));
     const snap = await ref.get();
     if (!snap.exists) {
         res.status(404).json({ success: false, message: 'Request not found.' });
         return null;
     }
     const data = snap.data();
-    const ctx = await resolveOwnerContext(db, auth.email);
-    // The owner, any employee of the owner's company, or the assigned agent can access.
-    const allowed = data.ownerEmail === auth.email ||
-                    data.ownerEmail === ctx.ownerEmail ||
-                    data.agentEmail === auth.email;
-    if (!allowed) {
-        res.status(403).json({ success: false, message: 'You do not have access to this request.' });
-        return null;
+    if (user) {
+        const ctx = await resolveOwnerContext(db, user.email);
+        // The owner, any employee of the owner's company, or the assigned agent can access.
+        const allowed = data.ownerEmail === user.email ||
+                        data.ownerEmail === ctx.ownerEmail ||
+                        data.agentEmail === user.email;
+        if (allowed) return { ref, data, auth: user, ctx, visitor: false };
     }
-    return { ref, data, auth, ctx };
+    if (visitorOk) {
+        // Website visitors have no account; the request id embeds a random conversation id.
+        return { ref, data, auth: null, ctx: null, visitor: true };
+    }
+    res.status(403).json({ success: false, message: 'You do not have access to this request.' });
+    return null;
 }
 
 async function handleHumanList(req, res) {
@@ -6801,7 +6826,10 @@ async function handleHumanSendMessage(req, res) {
     if (!['user', 'agent'].includes(sender))
         return res.status(400).json({ success: false, message: 'sender must be "user" or "agent".' });
 
-    const access = await requireHumanRequestAccess(getDb(), req, res, requestId);
+    const access = await requireHumanRequestAccess(getDb(), req, res, requestId, { visitorOk: true });
+    if (access && access.visitor && sender !== 'user') {
+        return res.status(403).json({ success: false, message: 'Visitors can only send user messages.' });
+    }
     if (!access) return;
 
     try {
@@ -6830,7 +6858,7 @@ async function handleHumanPoll(req, res) {
     const { requestId, sinceTs } = req.query;
     if (!requestId) return res.status(400).json({ success: false, message: 'Missing requestId.' });
 
-    const access = await requireHumanRequestAccess(getDb(), req, res, requestId);
+    const access = await requireHumanRequestAccess(getDb(), req, res, requestId, { visitorOk: true });
     if (!access) return;
 
     try {
@@ -6853,7 +6881,10 @@ async function handleHumanClose(req, res) {
     const { requestId, agentEmail, closedBy } = req.body || {};
     if (!requestId) return res.status(400).json({ success: false, message: 'Missing requestId.' });
 
-    const access = await requireHumanRequestAccess(getDb(), req, res, requestId);
+    const access = await requireHumanRequestAccess(getDb(), req, res, requestId, { visitorOk: true });
+    if (access && access.visitor && closedBy !== 'user') {
+        return res.status(403).json({ success: false, message: 'Not allowed.' });
+    }
     if (!access) return;
 
     try {
