@@ -34,7 +34,7 @@ function getAuthAdmin() {
     return admin.auth();
 }
 
-// === FIX #1/#24: CORS now restricts to allowed origins, and exposes auth header ===
+// === CORS: public routes get *, authenticated routes get allowlist ===
 const DEFAULT_ALLOWED_ORIGINS = [
     process.env.APP_URL,
     'https://mebor-ai.com',
@@ -46,23 +46,46 @@ function getAllowedOrigins() {
     return [...new Set([...DEFAULT_ALLOWED_ORIGINS, ...extra])];
 }
 
-function cors(req, res) {
+// P0-1: public endpoints must be callable from any customer website.
+const PUBLIC_ROUTE_PREFIXES = [
+    '/api/chat',
+    '/api/config',
+    '/api/models',
+    '/api/human/',
+    '/api/report/submit',
+    '/api/telegram/webhook/',
+    '/api/webhooks/whop',
+    '/api/email/poll-worker',
+    '/api/password-reset/',
+];
+
+function isPublicRoute(path) {
+    return PUBLIC_ROUTE_PREFIXES.some(p => path.startsWith(p));
+}
+
+function cors(req, res, path) {
     const origin = req.headers.origin;
     const allowed = getAllowedOrigins();
-    if (origin && (allowed.length === 0 || allowed.includes(origin))) {
+
+    if (isPublicRoute(path || '')) {
+        // Public widget / webhook routes: allow any origin, no credentials.
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-worker-secret, x-whop-signature, x-telegram-bot-api-secret-token');
+        return;
+    }
+
+    if (origin && allowed.includes(origin)) {
         res.setHeader('Access-Control-Allow-Origin', origin);
         res.setHeader('Vary', 'Origin');
-    } else if (allowed.length === 0) {
-        // No APP_URL configured yet — allow * for local dev only.
-        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
     }
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-worker-secret');
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// AUTH MIDDLEWARE  (FIX #1, #24)
+// AUTH MIDDLEWARE
 // ════════════════════════════════════════════════════════════════════════════
 
 /**
@@ -87,6 +110,33 @@ async function verifyIdToken(req) {
 }
 
 /**
+ * P0-10: resolve the effective owner context for an authenticated user.
+ * An employee only counts as "acting on behalf of" the owner when
+ * employeeStatus === 'active'. Removed/disabled employees are treated as
+ * standalone users (i.e. they get no access to the owner's workspace).
+ */
+async function resolveOwnerContext(db, email) {
+    if (!email) return { ownerEmail: null, isEmployee: false, profile: {}, ownerProfile: {} };
+    const snap = await db.collection('users').doc(email).get();
+    const profile = snap.exists ? snap.data() : {};
+
+    const isActiveEmployee = profile.accountType === 'employee'
+        && profile.employerOwnerEmail
+        && (profile.employeeStatus || 'active') === 'active';
+
+    if (isActiveEmployee) {
+        const ownerSnap = await db.collection('users').doc(profile.employerOwnerEmail).get();
+        return {
+            ownerEmail: profile.employerOwnerEmail,
+            isEmployee: true,
+            profile,
+            ownerProfile: ownerSnap.exists ? ownerSnap.data() : {},
+        };
+    }
+    return { ownerEmail: email, isEmployee: false, profile, ownerProfile: profile };
+}
+
+/**
  * Require a valid ID token. Optionally require the token's email to match
  * one of the emails supplied in `matches` (body/query). Writes a 401/403 and
  * returns null if the check fails.
@@ -97,7 +147,6 @@ async function requireAuth(req, res, { matches = [], allowUnverified = false } =
         res.status(401).json({ success: false, message: 'Authentication required.' });
         return null;
     }
-    // FIX #24: require email_verified unless explicitly allowed (e.g. during onboarding)
     const requireVerified = process.env.REQUIRE_EMAIL_VERIFIED === 'true';
     if (requireVerified && !allowUnverified && !user.email_verified) {
         res.status(403).json({ success: false, message: 'Please verify your email address first.' });
@@ -106,12 +155,15 @@ async function requireAuth(req, res, { matches = [], allowUnverified = false } =
     if (matches.length) {
         const normalized = matches.map(e => String(e || '').toLowerCase()).filter(Boolean);
         if (normalized.length && !normalized.includes(user.email)) {
-            // Allow employees acting on behalf of their owner
+            // P0-10: only ACTIVE employees may act on behalf of their owner.
             try {
                 const db = getDb();
                 const snap = await db.collection('users').doc(user.email).get();
                 const profile = snap.exists ? snap.data() : {};
-                const ownerEmail = (profile.accountType === 'employee' && profile.employerOwnerEmail)
+                const isActiveEmployee = profile.accountType === 'employee'
+                    && profile.employerOwnerEmail
+                    && (profile.employeeStatus || 'active') === 'active';
+                const ownerEmail = isActiveEmployee
                     ? String(profile.employerOwnerEmail).toLowerCase()
                     : null;
                 if (!ownerEmail || !normalized.includes(ownerEmail)) {
@@ -128,14 +180,9 @@ async function requireAuth(req, res, { matches = [], allowUnverified = false } =
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// USER SECRETS  (FIX #14)
+// USER SECRETS
 // ════════════════════════════════════════════════════════════════════════════
 
-/**
- * OAuth tokens and other secrets are now stored in `user_secrets/{email}`
- * instead of `users/{email}.integrations`, so the browser can never read them.
- * The readable `users` doc keeps only `connected: true` flags.
- */
 async function getUserSecrets(db, ownerEmail) {
     if (!ownerEmail) return {};
     const snap = await db.collection('user_secrets').doc(ownerEmail).get();
@@ -152,7 +199,7 @@ function publicIntegrationFlag(connected) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// OAUTH STATE SIGNING  (FIX #8)
+// OAUTH STATE SIGNING
 // ════════════════════════════════════════════════════════════════════════════
 
 function getOAuthStateSecret() {
@@ -162,7 +209,13 @@ function getOAuthStateSecret() {
 }
 
 function signOAuthState(payload) {
-    const data = Buffer.from(JSON.stringify(payload)).toString('base64url');
+    const data = Buffer.from(JSON.stringify({
+        ...payload,
+        // P1-21: short-lived, single-use state
+        iat: Date.now(),
+        exp: Date.now() + 10 * 60 * 1000,
+        nonce: crypto.randomBytes(12).toString('hex'),
+    })).toString('base64url');
     const sig = crypto.createHmac('sha256', getOAuthStateSecret()).update(data).digest('base64url');
     return `${data}.${sig}`;
 }
@@ -176,7 +229,9 @@ function verifyOAuthState(state) {
         if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
     } catch { return null; }
     try {
-        return JSON.parse(Buffer.from(data, 'base64url').toString('utf-8'));
+        const parsed = JSON.parse(Buffer.from(data, 'base64url').toString('utf-8'));
+        if (!parsed.exp || parsed.exp < Date.now()) return null;
+        return parsed;
     } catch { return null; }
 }
 
@@ -188,8 +243,6 @@ const PLAN_LIMITS = {
     free:       { label: 'Free',       maxAgents: 1,   maxSeats: 1,   monthlyCredits: 100    },
     team:       { label: 'Team',       maxAgents: 3,   maxSeats: 3,   monthlyCredits: 2500   },
     teamplus:   { label: 'Team+',      maxAgents: 10,  maxSeats: 10,  monthlyCredits: 10000  },
-    // FIX #32: Enterprise defaults are conservative; the Whop webhook overrides
-    // these per-customer via `entitlement.limits`.
     enterprise: { label: 'Enterprise', maxAgents: 10,  maxSeats: 10,  monthlyCredits: 45000  },
 };
 
@@ -211,7 +264,6 @@ const FEATURE_CATALOG = {
 const DB_SERVICE_FEATURE = { firebase: 'firebaseDatabase', supabase: 'supabaseDatabase' };
 const DESIGN_SERVICE_FEATURE = { canva: 'canvaDesign', figma: 'figmaDesign' };
 
-// ── Channel helpers ─────────────────────────────────────────────────────────
 const ALL_CHANNELS = ['widget', 'email', 'telegram'];
 
 function normalizeChannels(botData) {
@@ -317,7 +369,6 @@ async function denyIfFeatureLocked(res, db, email, featureKey) {
     return true;
 }
 
-// FIX #5: buildAppUrl no longer trusts the client-supplied origin blindly.
 function buildAppUrl(req, origin) {
     const allowed = getAllowedOrigins();
     if (origin && allowed.length && allowed.includes(origin)) return origin;
@@ -397,8 +448,7 @@ const CREDIT_COSTS = {
     toolFollowUp:  1,
 };
 
-// FIX #36: token-based credit multiplier
-const CREDIT_TOKENS_PER_UNIT = 2000; // 1 credit per ~2000 tokens of input+output
+const CREDIT_TOKENS_PER_UNIT = 2000;
 function creditsForMessage(messages, outputText) {
     const inputChars = (messages || []).reduce((sum, m) => sum + String(m.content || '').length, 0);
     const outputChars = String(outputText || '').length;
@@ -443,25 +493,8 @@ function resolvePlanLimits(userData) {
         monthlyCredits: toPositiveInt(overrides.monthlyCredits, base.monthlyCredits),
         features:       resolveFeatureAccess(tier, featureOverrides),
         entitlementSource: ent?.source || 'none',
-        allowOverage:   !!ent?.allowOverage, // FIX #31
+        allowOverage:   !!ent?.allowOverage,
     };
-}
-
-async function resolveOwnerContext(db, email) {
-    if (!email) return { ownerEmail: null, isEmployee: false, profile: {}, ownerProfile: {} };
-    const snap = await db.collection('users').doc(email).get();
-    const profile = snap.exists ? snap.data() : {};
-
-    if (profile.accountType === 'employee' && profile.employerOwnerEmail) {
-        const ownerSnap = await db.collection('users').doc(profile.employerOwnerEmail).get();
-        return {
-            ownerEmail: profile.employerOwnerEmail,
-            isEmployee: true,
-            profile,
-            ownerProfile: ownerSnap.exists ? ownerSnap.data() : {},
-        };
-    }
-    return { ownerEmail: email, isEmployee: false, profile, ownerProfile: profile };
 }
 
 async function countActiveAgents(db, ownerEmail) {
@@ -512,7 +545,6 @@ async function consumeCredits(db, ownerEmail, amount, opts = {}) {
             const limits = resolvePlanLimits(data);
             const state = readCreditState(data, limits);
 
-            // FIX #31: allow overage if the entitlement opts in
             if (!opts.force && state.exhausted && !limits.allowOverage) {
                 return { ...state, allowed: false, tier: limits.tier, reason: 'exhausted' };
             }
@@ -653,14 +685,12 @@ async function getCompanyCapacity(db, rawUsername) {
 // ════════════════════════════════════════════════════════════════════════════
 
 const MODEL_REGISTRY = {
-    // ── Free / cheap ──
     'llama-3.2-1b-instruct': { id: 'meta-llama/llama-3.2-1b-instruct', label: 'Llama 3.2 1B Instruct', providers: ['Cloudflare', 'Groq'] },
     'llama-3.1-8b-instruct': { id: 'meta-llama/llama-3.1-8b-instruct', label: 'Llama 3.1 8B Instruct', providers: ['Cloudflare', 'Groq'] },
     'gemma-3-4b':            { id: 'google/gemma-3-4b-it', label: 'Gemma 3 4B' },
     'gemma-3-12b':           { id: 'google/gemma-3-12b-it', label: 'Gemma 3 12B' },
     'deepseek-v4-flash-0423':{ id: 'deepseek/deepseek-v4-flash', label: 'DeepSeek V4 Flash 0423' },
 
-    // ── Paid ──
     'gpt-4o-mini':           { id: 'openai/gpt-4o-mini', label: 'OpenAI GPT-4o mini' },
     'gpt-oss-20b':           { id: 'openai/gpt-oss-20b', label: 'GPT-OSS 20B (Fast)', providers: ['Groq'] },
     'gemma-3-27b':           { id: 'google/gemma-3-27b-it', label: 'Gemma 3 27B' },
@@ -680,16 +710,13 @@ const MODEL_REGISTRY = {
     'mistral-saba':          { id: 'mistralai/mistral-saba', label: 'Mistral Saba' },
     'mistral-small-4':       { id: 'mistralai/mistral-small-2603', label: 'Mistral Small 4' },
 
-    // FIX #33: NVIDIA models were missing from the backend registry.
     'nvidia-nemotron-4-340b': { id: 'nvidia/nemotron-4-340b-instruct', label: 'NVIDIA Nemotron-4 340B' },
     'nvidia-llama-3.1-nemotron-70b': { id: 'nvidia/llama-3.1-nemotron-70b-instruct', label: 'NVIDIA Llama 3.1 Nemotron 70B' },
     'nvidia-mistral-nemo-12b': { id: 'nvidia/mistral-nemo-minitron-8b-8k-instruct', label: 'NVIDIA Mistral NeMo 12B' },
 };
 
-// FIX #34: stronger default model
 const DEFAULT_MODEL_KEY = 'gpt-4o-mini';
 
-// FIX #20: models that require a paid plan
 const PREMIUM_MODEL_KEYS = new Set([
     'gpt-4o-mini', 'gpt-oss-20b', 'gpt-oss-120b', 'gemini-2.5-flash',
     'gemma-4-26b-a4b', 'gemma-4-31b', 'llama-3.3-70b-instruct', 'llama-4-maverick',
@@ -700,31 +727,6 @@ const PREMIUM_MODEL_KEYS = new Set([
 
 function isPremiumModel(modelKey) {
     return PREMIUM_MODEL_KEYS.has(modelKey);
-}
-
-async function sendOpenRouterRequest(modelKey, messages) {
-  const modelConfig = MODEL_REGISTRY[modelKey];
-  if (!modelConfig) throw new Error(`Model key '${modelKey}' not found in registry.`);
-
-  const payload = { model: modelConfig.id, messages };
-  if (modelConfig.providers && modelConfig.providers.length > 0) {
-    payload.provider = { order: modelConfig.providers, allow_fallbacks: true };
-  }
-
-  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(payload)
-  });
-
-  if (!response.ok) {
-    const errorData = await response.json();
-    throw new Error(`OpenRouter Error: ${JSON.stringify(errorData)}`);
-  }
-  return await response.json();
 }
 
 async function routeToSubAgent(modelKey, userMsg, subAgents) {
@@ -849,7 +851,7 @@ function formatActionUrl(urlTemplate, params) {
     return { url, usedKeys };
 }
 
-// FIX #22: SSRF guard with DNS resolution
+// SSRF guard with DNS resolution
 const PRIVATE_HOST_REGEX = /^(127\.|10\.|0\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/;
 
 async function isSafePublicUrl(raw) {
@@ -861,12 +863,10 @@ async function isSafePublicUrl(raw) {
         if (h === '::1' || h.startsWith('[')) return false;
         if (PRIVATE_HOST_REGEX.test(h)) return false;
 
-        // DNS resolution check — reject if it resolves to a private IP
         try {
             const { address } = await dns.promises.lookup(h);
             if (!address) return false;
             if (PRIVATE_HOST_REGEX.test(address)) return false;
-            // IPv6 loopback / link-local
             if (address === '::1' || /^fe80:/i.test(address) || /^fc00:/i.test(address)) return false;
         } catch {
             return false;
@@ -879,7 +879,6 @@ async function safeFetch(rawUrl, options = {}, timeoutMs = 12000) {
     if (!(await isSafePublicUrl(rawUrl))) {
         throw new Error('That URL is not allowed.');
     }
-    // FIX #22: don't auto-follow redirects — re-validate each hop
     return fetch(rawUrl, {
         ...options,
         redirect: 'manual',
@@ -975,7 +974,6 @@ function stripThinkingTags(text) {
         .trim();
 }
 
-// FIX #17: escape quotes in auto-linked URLs to prevent href breakout
 function sanitizeMarkdown(text) {
     if (!text) return text;
     return String(text).replace(/\]\((https?:\/\/[^)\s]+)\)/g, (m, url) => {
@@ -983,7 +981,19 @@ function sanitizeMarkdown(text) {
     });
 }
 
-// FIX #35: retry + fallback for LLM calls
+// P1-32: detect OpenRouter 200-with-error-body and empty reasoning output
+function extractOpenRouterMessage(data) {
+    if (!data || typeof data !== 'object') throw new Error('OpenRouter returned an empty response.');
+    if (data.error) {
+        const msg = typeof data.error === 'string' ? data.error : (data.error.message || JSON.stringify(data.error));
+        throw new Error(`OpenRouter returned an error: ${msg}`);
+    }
+    if (!Array.isArray(data.choices) || !data.choices.length) {
+        throw new Error('OpenRouter returned no choices.');
+    }
+    return data.choices[0]?.message || {};
+}
+
 async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent, enableBookingTool, extraTools, maxTokens }) {
     const entry = MODEL_REGISTRY[modelKey] || MODEL_REGISTRY[DEFAULT_MODEL_KEY];
     const apiKey = process.env.OPENROUTER_API_KEY;
@@ -1004,12 +1014,15 @@ async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent, enabl
         toolChoiceValue = 'auto';
     }
 
+    // P1-32: reasoning models need headroom; default bumped.
+    const resolvedMaxTokens = maxTokens || 900;
+
     const body = {
         model: entry.id,
         messages,
         ...(hasTools ? { tools, tool_choice: toolChoiceValue } : {}),
         temperature: 0.3,
-        max_tokens: maxTokens || 600,
+        max_tokens: resolvedMaxTokens,
     };
 
     const doFetch = async (m) => {
@@ -1028,24 +1041,24 @@ async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent, enabl
             const errText = await r.text();
             throw new Error(`OpenRouter error ${r.status}: ${errText.substring(0, 300)}`);
         }
-        return r.json();
+        const json = await r.json();
+        // P1-32: some providers reply 200 with an error body.
+        return extractOpenRouterMessage(json);
     };
 
-    let data;
+    let msg;
     try {
-        data = await doFetch(entry);
+        msg = await doFetch(entry);
     } catch (e) {
         console.warn('[LLM] primary failed, retrying with fallback:', e.message);
         const fallbackKey = process.env.FALLBACK_MODEL_KEY || 'gpt-4o-mini';
         const fallback = MODEL_REGISTRY[fallbackKey];
         if (fallback && fallback.id !== entry.id) {
-            data = await doFetch(fallback);
+            msg = await doFetch(fallback);
         } else {
             throw e;
         }
     }
-
-    const msg = data.choices?.[0]?.message || {};
 
     if (Array.isArray(msg.tool_calls)) {
         msg.tool_calls = msg.tool_calls.map(tc => {
@@ -1082,21 +1095,31 @@ function htmlToText(html) {
         .trim();
 }
 
-async function fetchPageText(url, timeoutMs = SYNC_FETCH_TIMEOUT_MS) {
-    // FIX #22: validate URL before fetching
-    if (!(await isSafePublicUrl(url))) throw new Error('URL not allowed.');
-    const r = await fetch(url, {
-        headers: {
-            'User-Agent': 'Mozilla/5.0 MeborAI/1.0',
-            'Cache-Control': 'no-cache',
-            'Pragma': 'no-cache',
-        },
-        cache: 'no-store',
-        redirect: 'follow',
-        signal: AbortSignal.timeout(timeoutMs),
-    });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    return htmlToText(await r.text());
+// P1-20: no auto-follow redirects; re-validate each hop.
+async function fetchPageText(url, timeoutMs = SYNC_FETCH_TIMEOUT_MS, maxHops = 3) {
+    let current = url;
+    for (let hop = 0; hop <= maxHops; hop++) {
+        if (!(await isSafePublicUrl(current))) throw new Error('URL not allowed.');
+        const r = await fetch(current, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 MeborAI/1.0',
+                'Cache-Control': 'no-cache',
+                'Pragma': 'no-cache',
+            },
+            cache: 'no-store',
+            redirect: 'manual',
+            signal: AbortSignal.timeout(timeoutMs),
+        });
+        if (r.status >= 300 && r.status < 400) {
+            const loc = r.headers.get('location');
+            if (!loc) throw new Error('Redirect without a location.');
+            current = new URL(loc, current).toString();
+            continue;
+        }
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return htmlToText(await r.text());
+    }
+    throw new Error('Too many redirects.');
 }
 
 async function syncBotWebsite(db, businessId, bot, { force = false } = {}) {
@@ -1196,7 +1219,6 @@ function isRateLimited(req) {
     return b.count > RATE_LIMIT_PER_MIN;
 }
 
-// FIX #37: Firestore-backed rate limit fallback
 async function isRateLimitedDistributed(db, key, limit, windowMs) {
     if (!db || !key) return false;
     try {
@@ -1336,7 +1358,6 @@ async function toolCaptureLead(ctx, { name, contact, note }) {
     } catch (e) { return { success: false, error: e.message }; }
 }
 
-// FIX #21: send_email spam relay — now keyed on ownerEmail + persisted in Firestore
 const EMAIL_TOOL_DAILY_CAP = 20;
 
 async function toolSendEmail(ctx, { to, subject, body }) {
@@ -1344,7 +1365,6 @@ async function toolSendEmail(ctx, { to, subject, body }) {
     if (!recipient || recipient.toLowerCase() === 'owner') recipient = ctx.ownerEmail;
     if (!recipient || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipient)) return { success: false, error: 'Invalid recipient.' };
 
-    // Global per-owner daily cap
     const dayKey = new Date().toISOString().slice(0, 10);
     const capRef = ctx.db.collection('email_tool_caps').doc(`${ctx.ownerEmail}__${dayKey}`);
     try {
@@ -1356,7 +1376,6 @@ async function toolSendEmail(ctx, { to, subject, body }) {
         await capRef.set({ count: used + 1, updatedAt: new Date().toISOString() }, { merge: true });
     } catch { /* best-effort */ }
 
-    // Per-conversation cap
     const convRef = ctx.db.collection('email_tool_convs').doc(`${ctx.ownerEmail}__${ctx.convId}`);
     try {
         const convSnap = await convRef.get();
@@ -1435,10 +1454,9 @@ async function runAgentLoop({ modelKey, sysPrompt, history, userMsg, tools, ctx 
 // ════════════════════════════════════════════════════════════════════════════
 
 export default async function handler(req, res) {
-    cors(req, res);
-    if (req.method === 'OPTIONS') return res.status(200).end();
-
     const path = req.url.split('?')[0].replace(/\/$/, '');
+    cors(req, res, path);
+    if (req.method === 'OPTIONS') return res.status(200).end();
 
     // ── Public routes (no auth) ──
     if (path === '/api/chat')                     return handleChat(req, res);
@@ -1647,7 +1665,7 @@ async function handlePlanSelect(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// ENTERPRISE DYNAMIC PRICING (WHOP)  — FIX #30
+// ENTERPRISE DYNAMIC PRICING (WHOP)
 // ════════════════════════════════════════════════════════════════════════════
 
 const ENTERPRISE_PRICING = {
@@ -1776,11 +1794,13 @@ function whopPlanTierMap() {
     return map;
 }
 
+// P0-5: never fall back to a privileged tier on ambiguity.
 function resolveWhopTier(data, metadata) {
-    if (metadata?.tier && PLAN_LIMITS[metadata.tier]) return metadata.tier;
-    const planId = data?.plan_id || data?.plan?.id || null;
     const map = whopPlanTierMap();
+    const planId = data?.plan_id || data?.plan?.id || null;
     if (planId && map[planId]) return map[planId];
+    // Enterprise is resolved from explicit, server-set metadata only.
+    if (metadata?.tier && metadata.tier === 'enterprise') return 'enterprise';
     return null;
 }
 
@@ -1793,7 +1813,6 @@ function resolveWhopEmail(data, metadata) {
            null;
 }
 
-// FIX #7: verify signature over the RAW body, not JSON.stringify
 async function getRawBody(req) {
     return new Promise((resolve, reject) => {
         const chunks = [];
@@ -1812,17 +1831,12 @@ async function handleWhopWebhook(req, res) {
         return res.status(500).json({ success: false, message: 'Webhook secret not configured.' });
     }
 
-    // Vercel parses JSON body by default; we need the raw body for HMAC.
-    // The framework usually provides req.rawBody when configured, otherwise
-    // we re-serialize — but for security we require the raw buffer.
     let rawBody;
     if (Buffer.isBuffer(req.rawBody)) {
         rawBody = req.rawBody;
     } else if (typeof req.rawBody === 'string') {
         rawBody = Buffer.from(req.rawBody);
     } else {
-        // Fallback: read from the stream. On Vercel, req.body is already parsed,
-        // so this may be empty. We log a warning and use a best-effort body.
         try {
             rawBody = await getRawBody(req);
         } catch {
@@ -1864,7 +1878,6 @@ async function handleWhopWebhook(req, res) {
             return res.json({ success: true });
         }
 
-        // FIX #53: event dedupe
         const eventId = event.id || data.id || `${type}:${ownerEmail}:${data.created_at || Date.now()}`;
         const dedupeRef = db.collection('whop_events').doc(String(eventId));
         try {
@@ -1876,9 +1889,17 @@ async function handleWhopWebhook(req, res) {
             await dedupeRef.set({ type, ownerEmail, receivedAt: new Date().toISOString() });
         } catch (e) { console.warn('[Whop/Webhook/Dedupe]', e.message); }
 
-        const tier = resolveWhopTier(data, metadata) || 'enterprise';
+        // P0-5: if we cannot resolve a tier with certainty, ignore + alert.
+        const tier = resolveWhopTier(data, metadata);
+        if (!tier) {
+            console.error(`[Whop/Webhook] Could not resolve tier for event "${type}" for ${ownerEmail}. Check WHOP_PLAN_* env vars.`);
+            await db.collection('whop_unresolved_events').add({
+                type, ownerEmail, planId: data?.plan_id || null, receivedAt: new Date().toISOString(),
+            }).catch(() => {});
+            return res.json({ success: true, unresolved: true });
+        }
 
-        if (type === 'membership.went_valid' || type === 'payment.succeeded') {
+        if (type === 'membership.went_valid' || type === 'membership.activated' || type === 'payment.succeeded') {
             if (tier === 'enterprise') {
                 const creditPool = parseInt(metadata.credit_pool, 10) || ENTERPRISE_PRICING.baseCredits;
                 const agentCount = parseInt(metadata.agent_count, 10) || ENTERPRISE_PRICING.baseAgents;
@@ -1911,9 +1932,18 @@ async function handleWhopWebhook(req, res) {
                 await writeEntitlement(db, ownerEmail, tier, 'whop', null, { whopMembershipId: data.id || null, allowOverage: true });
                 console.log(`[Whop/Webhook] ${tier} activated for ${ownerEmail}.`);
             }
-        } else if (type === 'membership.went_invalid' || type === 'membership.cancelled') {
-            // FIX #53: don't revoke before period end if we have an expiry
+        } else if (type === 'membership.went_invalid' || type === 'membership.deactivated' || type === 'membership.cancelled') {
             const periodEnd = data.current_period_end || data.expires_at || null;
+            const eventMembershipId = data.id || null;
+
+            // P0-5: only revoke if the event is about the CURRENT membership.
+            const userSnap = await db.collection('users').doc(ownerEmail).get();
+            const storedMembershipId = userSnap.exists ? userSnap.data()?.entitlement?.whopMembershipId : null;
+            if (storedMembershipId && eventMembershipId && storedMembershipId !== eventMembershipId) {
+                console.log(`[Whop/Webhook] Ignoring stale membership ${eventMembershipId} for ${ownerEmail} (current: ${storedMembershipId}).`);
+                return res.json({ success: true, stale: true });
+            }
+
             if (periodEnd && new Date(periodEnd).getTime() > Date.now()) {
                 await db.collection('users').doc(ownerEmail).set({
                     entitlement: {
@@ -2013,7 +2043,6 @@ async function handleAdvancedAnalytics(req, res) {
     const { businessId, period, ownerEmail } = req.body || {};
     if (!businessId) return res.status(400).json({ success: false, message: 'Missing businessId.' });
 
-    // FIX #10: auth + ownership
     const auth = await requireAuth(req, res);
     if (!auth) return;
     try {
@@ -2041,7 +2070,6 @@ async function handleAdvancedAnalytics(req, res) {
         const chats = [];
         chatsSnap.forEach(d => {
             const data = d.data();
-            // FIX #50: exclude Testing Lab meta tasks from analytics
             if (data.metaTask) return;
             if (data.source === 'test') return;
             chats.push({ id: d.id, ...data });
@@ -2413,7 +2441,7 @@ async function handleBotRestore(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// POST /api/account/delete-cascade  — FIX #2, #52
+// POST /api/account/delete-cascade
 // ════════════════════════════════════════════════════════════════════════════
 async function handleAccountDeleteCascade(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -2425,6 +2453,20 @@ async function handleAccountDeleteCascade(req, res) {
 
     try {
         const db = getDb();
+
+        // P1-15: cancel the Whop subscription first so the customer stops being billed.
+        try {
+            const userSnap = await db.collection('users').doc(email).get();
+            const ent = userSnap.exists ? userSnap.data()?.entitlement : null;
+            const membershipId = ent?.whopMembershipId;
+            const whopApiKey = process.env.WHOP_API_KEY;
+            if (membershipId && whopApiKey) {
+                await fetch(`https://api.whop.com/api/v1/memberships/${encodeURIComponent(membershipId)}/cancel`, {
+                    method: 'POST',
+                    headers: { 'Authorization': `Bearer ${whopApiKey}`, 'Content-Type': 'application/json' },
+                }).catch(e => console.warn('[AccountDelete/WhopCancel]', e.message));
+            }
+        } catch (e) { console.warn('[AccountDelete/WhopCancel]', e.message); }
 
         const botsSnap = await db.collection('user_bots').where('owner', '==', email).get();
         for (const d of botsSnap.docs) {
@@ -2438,7 +2480,6 @@ async function handleAccountDeleteCascade(req, res) {
         await deleteQueryBatch(db, db.collection('email_queue').where('ownerEmail', '==', email));
         await deleteQueryBatch(db, db.collection('telegram_sessions').where('ownerEmail', '==', email));
 
-        // FIX #52: clean up orphaned user_widgets, human_requests, companies, employees
         await deleteQueryBatch(db, db.collection('user_widgets').where('owner', '==', email));
         await deleteQueryBatch(db, db.collection('human_requests').where('ownerEmail', '==', email));
 
@@ -2523,7 +2564,6 @@ async function callTelegramApi(token, method, body, { timeoutMs = 8000 } = {}) {
     return parsed?.result;
 }
 
-// FIX #47: validate bot token via getMe before registering
 async function validateTelegramToken(token) {
     return callTelegramApi(token, 'getMe', {});
 }
@@ -2533,7 +2573,7 @@ async function registerTelegramWebhook({ token, businessId, secret, publicBaseUr
     return callTelegramApi(token, 'setWebhook', {
         url,
         secret_token: secret,
-        allowed_updates: ['message'], // FIX #47: drop edited_message to avoid duplicate replies
+        allowed_updates: ['message'],
         drop_pending_updates: true,
     });
 }
@@ -2562,7 +2602,6 @@ function getPublicBaseUrl(req) {
            `https://${req.headers.host}`;
 }
 
-// FIX #47: update_id dedupe
 async function isDuplicateTelegramUpdate(db, businessId, updateId) {
     if (!updateId) return false;
     const ref = db.collection('telegram_updates').doc(`${businessId}__${updateId}`);
@@ -2595,7 +2634,6 @@ async function handleTelegramWebhook(req, res, path) {
             return res.status(200).json({ ok: true });
         }
 
-        // FIX #47: plan feature check
         if (bot.owner) {
             const ownerSnap = await db.collection('users').doc(bot.owner).get();
             const limits = resolvePlanLimits(ownerSnap.exists ? ownerSnap.data() : {});
@@ -2614,7 +2652,6 @@ async function handleTelegramWebhook(req, res, path) {
         const token = decryptCredential(tg.botTokenEnc);
         const update = req.body || {};
 
-        // FIX #47: dedupe by update_id
         if (await isDuplicateTelegramUpdate(db, businessId, update.update_id)) {
             console.log('[Telegram/Webhook] Duplicate update ignored:', update.update_id);
             return res.status(200).json({ ok: true });
@@ -2686,7 +2723,6 @@ async function handleTelegramWebhook(req, res, path) {
 // EMAIL AGENT
 // ════════════════════════════════════════════════════════════════════════════
 
-// FIX #23: rejectUnauthorized true by default, opt-out via env
 function tlsOptions() {
     return { rejectUnauthorized: process.env.ALLOW_INSECURE_TLS !== 'true' };
 }
@@ -2871,7 +2907,6 @@ async function handleEmailConnect(req, res) {
             });
         }
 
-        // FIX #14: store the encrypted password in user_secrets, not users
         await setUserSecrets(db, ownerEmail, {
             integrations: {
                 email: {
@@ -2892,7 +2927,6 @@ async function handleEmailConnect(req, res) {
             },
         });
 
-        // The readable users doc only exposes a connected flag.
         await db.collection('users').doc(ownerEmail).set({
             integrations: { email: publicIntegrationFlag(true) },
         }, { merge: true });
@@ -3175,7 +3209,7 @@ async function handleEmailAgentStats(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// POST /api/email/poll-worker  — FIX #12, #41
+// POST /api/email/poll-worker
 // ════════════════════════════════════════════════════════════════════════════
 const EMAIL_TICK_BUDGET_MS = 8000;
 const EMAIL_MAX_INBOXES_PER_FETCH = 3;
@@ -3183,7 +3217,6 @@ const EMAIL_REPLY_BATCH_SIZE = 5;
 const EMAIL_SCHEDULED_BATCH_SIZE = 5;
 
 async function handleEmailPollWorker(req, res) {
-    // FIX #12: no User-Agent bypass — secret is required.
     const cronSecret = process.env.EMAIL_WORKER_SECRET;
     if (!cronSecret) {
         console.error('[Email/PollWorker] EMAIL_WORKER_SECRET is not set — rejecting.');
@@ -3193,22 +3226,25 @@ async function handleEmailPollWorker(req, res) {
         return res.status(401).json({ success: false, message: 'Unauthorized.' });
     }
 
-    const minute = new Date().getUTCMinutes();
-    const job = (minute % 2 === 0) ? 'fetch' : 'reply';
-
+    // P1-5: run BOTH jobs each tick instead of alternating by minute parity.
     try {
         const db = getDb();
         const startedAt = Date.now();
-        const result = (job === 'fetch')
-            ? await runEmailFetchJob(db, startedAt)
-            : await runEmailReplyJob(db, startedAt);
-        return res.json({ success: true, job, elapsedMs: Date.now() - startedAt, ...result });
+        const fetchResult = await runEmailFetchJob(db, startedAt);
+        const replyResult = await runEmailReplyJob(db, startedAt);
+        return res.json({
+            success: true,
+            elapsedMs: Date.now() - startedAt,
+            fetch: fetchResult,
+            reply: replyResult,
+        });
     } catch (err) {
         console.error('[Email/Tick]', err.message);
-        return res.status(500).json({ success: false, job, message: err.message });
+        return res.status(500).json({ success: false, message: err.message });
     }
 }
 
+// P1-7: rotate inboxes by lastFetchAt so inboxes 4+ eventually get polled.
 async function runEmailFetchJob(db, startedAt) {
     const usersSnap = await db.collection('users').get();
     const targets = [];
@@ -3217,7 +3253,16 @@ async function runEmailFetchJob(db, startedAt) {
         if (em?.connected) targets.push({ email: d.id, config: em });
     });
 
-    const inboxes = targets.slice(0, EMAIL_MAX_INBOXES_PER_FETCH);
+    const allConnected = targets;
+
+    const inboxes = allConnected
+        .sort((a, b) => {
+            const at = a.config.lastFetchAt ? new Date(a.config.lastFetchAt).getTime() : 0;
+            const bt = b.config.lastFetchAt ? new Date(b.config.lastFetchAt).getTime() : 0;
+            return at - bt;
+        })
+        .slice(0, EMAIL_MAX_INBOXES_PER_FETCH);
+
     const results = [];
 
     for (const t of inboxes) {
@@ -3243,9 +3288,7 @@ async function runEmailFetchJob(db, startedAt) {
     return { queued: results.reduce((s, r) => s + (r.queued || 0), 0), results };
 }
 
-// FIX #42, #43: use mailparser if available, check no-reply headers
 async function parseEmailSource(source, envelope) {
-    // Try mailparser first (add `mailparser` to package.json)
     try {
         const mod = await import('mailparser');
         const parsed = await mod.simpleParser(source);
@@ -3257,7 +3300,6 @@ async function parseEmailSource(source, envelope) {
             from: parsed.from?.value?.[0]?.address || envelope?.from?.[0]?.address || null,
         };
     } catch {
-        // Fallback: naive parsing (existing behaviour)
         const raw = source.toString('utf8');
         const idx = raw.indexOf('\r\n\r\n') >= 0 ? raw.indexOf('\r\n\r\n') : raw.indexOf('\n\n');
         const body = idx >= 0 ? raw.substring(idx + 4) : raw;
@@ -3299,7 +3341,6 @@ function isAutoReplyOrList(parsed) {
 }
 
 async function fetchOneInbox(db, ownerEmail, config, startedAt) {
-    // FIX #14: read the encrypted password from user_secrets
     const secrets = await getUserSecrets(db, ownerEmail);
     const fullCfg = secrets?.integrations?.email;
     if (!fullCfg?.passwordEnc) return { skipped: 'no-credentials' };
@@ -3368,14 +3409,12 @@ async function fetchOneInbox(db, ownerEmail, config, startedAt) {
                     continue;
                 }
 
-                // FIX #42/#43: parse properly and skip auto-replies
                 const parsed = await parseEmailSource(msg.source, msg.envelope);
                 if (isAutoReplyOrList(parsed)) {
                     try { await client.messageFlagsAdd(uid, ['\\Seen'], { uid: true }); } catch {}
                     continue;
                 }
 
-                // FIX #41: atomic claim via transaction
                 const queueRef = db.collection('email_queue').doc(`${ownerEmail}__${uid}`);
                 const claimed = await db.runTransaction(async (tx) => {
                     const existing = await tx.get(queueRef);
@@ -3465,19 +3504,37 @@ async function runEmailReplyJob(db, startedAt) {
         };
     }
 
+    // P1-6: claim each item transactionally before processing so overlapping
+    // ticks don't double-process and retries don't re-charge credits forever.
+    const claimed = [];
+    for (const it of activeItems) {
+        try {
+            const ok = await db.runTransaction(async (tx) => {
+                const snap = await tx.get(it.ref);
+                const data = snap.exists ? snap.data() : {};
+                if (data.status !== 'pending') return false;
+                tx.set(it.ref, { status: 'processing', processingStartedAt: new Date().toISOString() }, { merge: true });
+                return true;
+            });
+            if (ok) claimed.push(it);
+        } catch (e) {
+            console.warn('[Email/ReplyJob/claim]', it.id, e.message);
+        }
+    }
+
     const settled = await Promise.allSettled(
-        activeItems.map(it => processQueuedEmail(db, it.id, it, startedAt))
+        claimed.map(it => processQueuedEmail(db, it.id, it, startedAt))
     );
 
     const results = settled.map((r, i) => {
-        const id = activeItems[i].id;
+        const id = claimed[i].id;
         return r.status === 'fulfilled'
             ? { id, ...r.value }
             : { id, error: r.reason?.message || 'unknown' };
     });
 
     return {
-        processed: activeItems.length,
+        processed: claimed.length,
         skipped: skipped.length,
         results,
         scheduledSent: scheduledResult.sent || 0,
@@ -3572,83 +3629,146 @@ async function sendScheduledDraft(db, draftId, draft) {
 async function processQueuedEmail(db, queueId, item, startedAt) {
     const queueRef = db.collection('email_queue').doc(queueId);
 
-    const botSnap = await db.collection('user_bots').doc(item.businessId).get();
-    if (!botSnap.exists) {
-        await queueRef.set({ status: 'failed', error: 'agent-not-found', failedAt: new Date().toISOString() }, { merge: true });
-        return { error: 'agent-not-found' };
-    }
-    const bot = botSnap.data();
-
-    const emailConfig = bot.emailConfig || {};
-    const requireHumanApproval = emailConfig.requireHumanApproval !== false;
-    const autoSendDelay = emailConfig.autoSendDelay || '00:00:02';
-
-    const ctx = await resolveOwnerContext(db, item.ownerEmail);
-    const limits = resolvePlanLimits(ctx.ownerProfile);
-    if (!limits.features.emailAgent) {
-        await queueRef.set({ status: 'skipped', reason: 'plan-lost-email-feature', skippedAt: new Date().toISOString() }, { merge: true });
-        return { skipped: 'plan' };
-    }
-
-    const secrets = await getUserSecrets(db, item.ownerEmail);
-    const emailCfg = secrets?.integrations?.email;
-    if (!emailCfg?.connected) {
-        await queueRef.set({ status: 'failed', error: 'inbox-disconnected', failedAt: new Date().toISOString() }, { merge: true });
-        return { error: 'inbox-disconnected' };
-    }
-    const password = decryptCredential(emailCfg.passwordEnc);
-
-    const sysPrompt = bot.knowledgeContext?.systemPrompt
-        || `You are a helpful assistant replying to an email. Keep replies concise and professional.`;
-    const webContext = bot.context ? `\n\n[WEBSITE CONTENT]:\n${bot.context}` : '';
-
-    const _emailSuffix = `\n\nTHIS IS AN EMAIL REPLY. Write a clear, professional reply. Do NOT mention chat, widgets, or "typing". Include a brief sign-off. Format your response using Markdown where it improves clarity — use **bold** for key terms, names, or important values, and use "-" bullet points or "1." numbered lists for multi-part answers — since this reply is rendered as a richly formatted HTML email.`;
-    const _emailPersonality = typeof bot.personality === 'string' ? bot.personality : 'default';
-    const _emailTools = (bot.toolsConfig && typeof bot.toolsConfig === 'object') ? bot.toolsConfig : {};
-    const _emailSys = sysPrompt + webContext + (PERSONALITY_PROMPTS[_emailPersonality] || '') + INJECTION_GUARD + _emailSuffix;
-    const _emailModelKey = bot.modelKey || DEFAULT_MODEL_KEY;
-    let replyText = findPinnedAnswer(bot.pinnedQA, item.bodyText);
-
-    if (!replyText) {
-        const _defs = buildBuiltinToolDefs(_emailTools);
-        const _actions = Array.isArray(bot.agentActions) ? bot.agentActions.filter(a => a?.name && a?.url) : [];
-        const _actionDefs = buildAgentActionToolDefs(_actions);
-        if (_emailTools.agentLoop && AGENT_CAPABLE_MODELS.has(_emailModelKey) && (_defs.length + _actionDefs.length) > 0) {
-            try {
-                const loop = await runAgentLoop({
-                    modelKey: _emailModelKey, sysPrompt: _emailSys, history: [], userMsg: item.bodyText,
-                    tools: [..._defs, ..._actionDefs],
-                    ctx: {
-                        db, businessId: item.businessId,
-                        botName: item.botName || bot.displayName || bot.name || 'Assistant',
-                        ownerEmail: item.ownerEmail, convId: `email-${queueId}`, source: 'email',
-                        agentActionsList: _actions,
-                    },
-                });
-                if (loop.answer) {
-                    replyText = loop.answer;
-                    const _src = [...new Set(loop.sources)].slice(0, 4);
-                    if (_src.length) replyText += '\n\nSources:\n' + _src.map(u => `- ${u}`).join('\n');
-                }
-            } catch (e) { console.error('[Email/AgentLoop]', e.message); }
+    try {
+        const botSnap = await db.collection('user_bots').doc(item.businessId).get();
+        if (!botSnap.exists) {
+            await queueRef.set({ status: 'failed', error: 'agent-not-found', failedAt: new Date().toISOString() }, { merge: true });
+            return { error: 'agent-not-found' };
         }
-    }
+        const bot = botSnap.data();
 
-    if (!replyText) {
-        const choice = await callLLM({
-            modelKey: _emailModelKey,
-            messages: [
-                { role: 'system', content: _emailSys },
-                { role: 'user', content: item.bodyText },
-            ],
-            enableBookingTool: false,
-        });
-        replyText = choice?.content?.trim() || 'Thanks for your message.';
-    }
+        const emailConfig = bot.emailConfig || {};
+        const requireHumanApproval = emailConfig.requireHumanApproval !== false;
+        const autoSendDelay = emailConfig.autoSendDelay || '00:00:02';
 
-    const nowISO = new Date().toISOString();
+        const ctx = await resolveOwnerContext(db, item.ownerEmail);
+        const limits = resolvePlanLimits(ctx.ownerProfile);
+        if (!limits.features.emailAgent) {
+            await queueRef.set({ status: 'skipped', reason: 'plan-lost-email-feature', skippedAt: new Date().toISOString() }, { merge: true });
+            return { skipped: 'plan' };
+        }
 
-    if (requireHumanApproval) {
+        const secrets = await getUserSecrets(db, item.ownerEmail);
+        const emailCfg = secrets?.integrations?.email;
+        if (!emailCfg?.connected) {
+            await queueRef.set({ status: 'failed', error: 'inbox-disconnected', failedAt: new Date().toISOString() }, { merge: true });
+            return { error: 'inbox-disconnected' };
+        }
+        const password = decryptCredential(emailCfg.passwordEnc);
+
+        const sysPrompt = bot.knowledgeContext?.systemPrompt
+            || `You are a helpful assistant replying to an email. Keep replies concise and professional.`;
+        const webContext = bot.context ? `\n\n[WEBSITE CONTENT]:\n${bot.context}` : '';
+
+        const _emailSuffix = `\n\nTHIS IS AN EMAIL REPLY. Write a clear, professional reply. Do NOT mention chat, widgets, or "typing". Include a brief sign-off. Format your response using Markdown where it improves clarity — use **bold** for key terms, names, or important values, and use "-" bullet points or "1." numbered lists for multi-part answers — since this reply is rendered as a richly formatted HTML email.`;
+        const _emailPersonality = typeof bot.personality === 'string' ? bot.personality : 'default';
+        const _emailTools = (bot.toolsConfig && typeof bot.toolsConfig === 'object') ? bot.toolsConfig : {};
+        const _emailSys = sysPrompt + webContext + (PERSONALITY_PROMPTS[_emailPersonality] || '') + INJECTION_GUARD + _emailSuffix;
+        const _emailModelKey = bot.modelKey || DEFAULT_MODEL_KEY;
+        let replyText = findPinnedAnswer(bot.pinnedQA, item.bodyText);
+
+        if (!replyText) {
+            const _defs = buildBuiltinToolDefs(_emailTools);
+            const _actions = Array.isArray(bot.agentActions) ? bot.agentActions.filter(a => a?.name && a?.url) : [];
+            const _actionDefs = buildAgentActionToolDefs(_actions);
+            if (_emailTools.agentLoop && AGENT_CAPABLE_MODELS.has(_emailModelKey) && (_defs.length + _actionDefs.length) > 0) {
+                try {
+                    const loop = await runAgentLoop({
+                        modelKey: _emailModelKey, sysPrompt: _emailSys, history: [], userMsg: item.bodyText,
+                        tools: [..._defs, ..._actionDefs],
+                        ctx: {
+                            db, businessId: item.businessId,
+                            botName: item.botName || bot.displayName || bot.name || 'Assistant',
+                            ownerEmail: item.ownerEmail, convId: `email-${queueId}`, source: 'email',
+                            agentActionsList: _actions,
+                        },
+                    });
+                    if (loop.answer) {
+                        replyText = loop.answer;
+                        const _src = [...new Set(loop.sources)].slice(0, 4);
+                        if (_src.length) replyText += '\n\nSources:\n' + _src.map(u => `- ${u}`).join('\n');
+                    }
+                } catch (e) { console.error('[Email/AgentLoop]', e.message); }
+            }
+        }
+
+        if (!replyText) {
+            const choice = await callLLM({
+                modelKey: _emailModelKey,
+                messages: [
+                    { role: 'system', content: _emailSys },
+                    { role: 'user', content: item.bodyText },
+                ],
+                enableBookingTool: false,
+            });
+            replyText = choice?.content?.trim() || 'Thanks for your message.';
+        }
+
+        const nowISO = new Date().toISOString();
+
+        if (requireHumanApproval) {
+            const draftRef = await db.collection('email_drafts').add({
+                ownerEmail: item.ownerEmail,
+                businessId: item.businessId,
+                botName: item.botName || bot.displayName || bot.name || 'Email Agent',
+                fromEmail: item.fromEmail,
+                subject: item.subject || '(no subject)',
+                originalQuery: item.bodyText,
+                draftedResponse: replyText,
+                status: 'pending',
+                queueId,
+                createdAt: nowISO,
+            });
+
+            try {
+                await sendFCMToUser(item.ownerEmail, buildEmailApprovalNotification({
+                    id: draftRef.id,
+                    fromEmail: item.fromEmail,
+                    originalQuery: item.bodyText,
+                    botName: item.botName || bot.name || 'Email Agent',
+                }), 'email');
+            } catch (e) {
+                console.error('[Email/ApprovalFCM]', e.message);
+            }
+
+            await queueRef.set({
+                status: 'awaiting-approval',
+                draftId: draftRef.id,
+                approvalRequestedAt: nowISO,
+            }, { merge: true });
+
+            return { awaitingApproval: true, draftId: draftRef.id };
+        }
+
+        const delayMs = parseAutoSendDelay(autoSendDelay);
+
+        if (delayMs <= 0) {
+            await sendEmailViaSMTP(emailCfg, password, {
+                to: item.fromEmail,
+                subject: `Re: ${item.subject || '(no subject)'}`,
+                text: replyText,
+                botName: item.botName || bot.displayName || bot.name,
+            });
+
+            await queueRef.set({
+                status: 'done',
+                replyText,
+                processedAt: nowISO,
+                elapsedMs: Date.now() - startedAt,
+            }, { merge: true });
+
+            await logChat(db, item.businessId, `email-${queueId}`, item.bodyText, replyText, true, false, { source: 'email' });
+
+            try {
+                await setUserSecrets(db, item.ownerEmail, {
+                    integrations: { email: { lastReplyAt: nowISO, lastReplyError: null } },
+                });
+            } catch {}
+
+            return { handled: true, elapsedMs: Date.now() - startedAt };
+        }
+
+        const scheduledAt = new Date(Date.now() + delayMs).toISOString();
         const draftRef = await db.collection('email_drafts').add({
             ownerEmail: item.ownerEmail,
             businessId: item.businessId,
@@ -3657,81 +3777,26 @@ async function processQueuedEmail(db, queueId, item, startedAt) {
             subject: item.subject || '(no subject)',
             originalQuery: item.bodyText,
             draftedResponse: replyText,
-            status: 'pending',
+            status: 'scheduled',
+            scheduledAt,
             queueId,
             createdAt: nowISO,
         });
 
-        try {
-            await sendFCMToUser(item.ownerEmail, buildEmailApprovalNotification({
-                id: draftRef.id,
-                fromEmail: item.fromEmail,
-                originalQuery: item.bodyText,
-                botName: item.botName || bot.name || 'Email Agent',
-            }), 'email');
-        } catch (e) {
-            console.error('[Email/ApprovalFCM]', e.message);
-        }
-
         await queueRef.set({
-            status: 'awaiting-approval',
+            status: 'scheduled',
             draftId: draftRef.id,
-            approvalRequestedAt: nowISO,
+            scheduledAt,
         }, { merge: true });
 
-        return { awaitingApproval: true, draftId: draftRef.id };
-    }
-
-    const delayMs = parseAutoSendDelay(autoSendDelay);
-
-    if (delayMs <= 0) {
-        await sendEmailViaSMTP(emailCfg, password, {
-            to: item.fromEmail,
-            subject: `Re: ${item.subject || '(no subject)'}`,
-            text: replyText,
-            botName: item.botName || bot.displayName || bot.name,
-        });
-
-        await queueRef.set({
-            status: 'done',
-            replyText,
-            processedAt: nowISO,
-            elapsedMs: Date.now() - startedAt,
-        }, { merge: true });
-
-        await logChat(db, item.businessId, `email-${queueId}`, item.bodyText, replyText, true, false, { source: 'email' });
-
+        return { scheduled: true, draftId: draftRef.id, scheduledAt };
+    } catch (err) {
+        console.error('[Email/ReplyJob/process]', queueId, err.message);
         try {
-            await setUserSecrets(db, item.ownerEmail, {
-                integrations: { email: { lastReplyAt: nowISO, lastReplyError: null } },
-            });
+            await queueRef.set({ status: 'failed', error: err.message, failedAt: new Date().toISOString() }, { merge: true });
         } catch {}
-
-        return { handled: true, elapsedMs: Date.now() - startedAt };
+        return { error: err.message };
     }
-
-    const scheduledAt = new Date(Date.now() + delayMs).toISOString();
-    const draftRef = await db.collection('email_drafts').add({
-        ownerEmail: item.ownerEmail,
-        businessId: item.businessId,
-        botName: item.botName || bot.displayName || bot.name || 'Email Agent',
-        fromEmail: item.fromEmail,
-        subject: item.subject || '(no subject)',
-        originalQuery: item.bodyText,
-        draftedResponse: replyText,
-        status: 'scheduled',
-        scheduledAt,
-        queueId,
-        createdAt: nowISO,
-    });
-
-    await queueRef.set({
-        status: 'scheduled',
-        draftId: draftRef.id,
-        scheduledAt,
-    }, { merge: true });
-
-    return { scheduled: true, draftId: draftRef.id, scheduledAt };
 }
 
 function extractEmailBody(raw) {
@@ -4200,7 +4265,7 @@ async function handleFCMTestNotification(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// DEPLOY  — FIX #4, #20, #47
+// DEPLOY
 // ════════════════════════════════════════════════════════════════════════════
 async function handleDeploy(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -4224,7 +4289,6 @@ async function handleDeploy(req, res) {
 
         const limits = resolvePlanLimits(ctx.ownerProfile);
 
-        // FIX #20: server-side model-tier check
         const requestedModel = botData.modelKey;
         if (requestedModel && MODEL_REGISTRY[requestedModel] && isPremiumModel(requestedModel)) {
             if (limits.tier === 'free') {
@@ -4271,7 +4335,6 @@ async function handleDeploy(req, res) {
 
         let botTokenEnc = priorTg.botTokenEnc || null;
         if (rawToken) {
-            // FIX #47: validate the token via getMe before persisting
             try {
                 await validateTelegramToken(rawToken);
             } catch (e) {
@@ -4312,6 +4375,31 @@ async function handleDeploy(req, res) {
         botData.displayName = botData.displayName || botData.name;
         botData.createdAt = botData.createdAt || new Date().toISOString();
         await botRef.set(botData, { merge: true });
+
+        // P1-18: explicitly delete nested keys the user cleared so removals persist.
+        const deletePatch = {};
+        const existingData = existingSnap.exists ? existingSnap.data() : {};
+        const clearIfEmpty = (path, incoming, prior) => {
+            if (incoming === undefined && prior !== undefined) deletePatch[path] = admin.firestore.FieldValue.delete();
+        };
+        clearIfEmpty('uiWidgets', botData.uiWidgets, existingData.uiWidgets);
+        clearIfEmpty('uiWidgetSelection', botData.uiWidgetSelection, existingData.uiWidgetSelection);
+        // designConfig.studio.* removals
+        const incomingStudio = botData.designConfig?.studio;
+        const priorStudio = existingData.designConfig?.studio;
+        if (priorStudio && typeof priorStudio === 'object' && (!incomingStudio || typeof incomingStudio !== 'object')) {
+            deletePatch['designConfig.studio'] = admin.firestore.FieldValue.delete();
+        } else if (priorStudio && incomingStudio && typeof incomingStudio === 'object') {
+            for (const k of Object.keys(priorStudio)) {
+                if (!(k in incomingStudio)) {
+                    deletePatch[`designConfig.studio.${k}`] = admin.firestore.FieldValue.delete();
+                }
+            }
+        }
+        if (Object.keys(deletePatch).length) {
+            try { await botRef.update(deletePatch); }
+            catch (e) { console.warn('[Deploy/clear]', e.message); }
+        }
 
         let telegramWebhookStatus = null;
         if (botData.telegramConfig.enabled && botData.telegramConfig.botTokenEnc) {
@@ -4374,7 +4462,7 @@ async function handleDeploy(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// SCRAPE  — FIX #4, #22
+// SCRAPE
 // ════════════════════════════════════════════════════════════════════════════
 async function handleScrape(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -4394,7 +4482,6 @@ async function handleScrape(req, res) {
             return res.status(403).json({ success: false, message: 'You do not own this agent.' });
         }
 
-        // FIX #22: SSRF guard
         if (!(await isSafePublicUrl(url))) {
             return res.status(400).json({ success: false, message: 'That URL is not allowed.' });
         }
@@ -4485,17 +4572,41 @@ async function handleConfig(req, res) {
 // SHARED CHAT ENGINE
 // ════════════════════════════════════════════════════════════════════════════
 
+const MAX_MESSAGE_CHARS = 4000; // P0-3
+
 async function generateBotReply({ db, businessId, userMsg, history = [], conversationId, source = 'web' }) {
     const convId = conversationId || `conv-${Date.now()}`;
     const meta = {};
 
-    // FIX #16: whitelist only user/assistant roles in history
+    // P0-3: cap the incoming message so a single request can't blow up cost.
+    if (typeof userMsg !== 'string' || userMsg.length > MAX_MESSAGE_CHARS) {
+        return {
+            answer: 'Your message is too long. Please shorten it and try again.',
+            meta: { _tooLong: true },
+        };
+    }
+
+    // P0-3: reject unknown / deleted bots BEFORE any LLM call.
+    const botSnap = await db.collection('user_bots').doc(businessId).get();
+    if (!botSnap.exists) {
+        return {
+            answer: 'This assistant is not available right now. Please contact the business directly.',
+            meta: { _unavailable: true },
+        };
+    }
+    if (botSnap.data()?.deletedAt) {
+        return {
+            answer: 'This assistant is not available right now. Please contact the business directly.',
+            meta: { _unavailable: true },
+        };
+    }
+
     const safeHistory = (Array.isArray(history) ? history : [])
         .filter(m => m?.role === 'user' || m?.role === 'assistant')
         .filter(m => typeof m.content === 'string')
+        .filter(m => m.content.length <= MAX_MESSAGE_CHARS)
         .slice(-12);
 
-    const botSnap = await db.collection('user_bots').doc(businessId).get();
     let sysPrompt  = 'You are a helpful, friendly customer service assistant.';
     let ownerEmail = '', botName = 'Assistant';
     let modelKey   = DEFAULT_MODEL_KEY;
@@ -4511,7 +4622,7 @@ async function generateBotReply({ db, businessId, userMsg, history = [], convers
         allowHumanHandoff: true,
     };
 
-    if (botSnap.exists) {
+    {
         const b  = botSnap.data();
         ownerEmail = b.owner    || '';
         botName    = b.displayName || b.name || 'Assistant';
@@ -4522,13 +4633,6 @@ async function generateBotReply({ db, businessId, userMsg, history = [], convers
         pinnedQA    = Array.isArray(b.pinnedQA) ? b.pinnedQA : [];
         personality = typeof b.personality === 'string' ? b.personality : 'default';
         toolsConfig = (b.toolsConfig && typeof b.toolsConfig === 'object') ? b.toolsConfig : {};
-
-        if (b.deletedAt) {
-            return {
-                answer: 'This assistant is not available right now. Please contact the business directly.',
-                meta: { _unavailable: true },
-            };
-        }
 
         if (ownerEmail) {
             try {
@@ -4555,7 +4659,6 @@ async function generateBotReply({ db, businessId, userMsg, history = [], convers
             sysPrompt += `\n\nThe website content above is the current source of truth. If earlier messages in this conversation contradict it, the website content is correct and the earlier messages are outdated.`;
         }
         if (kc.fileContents) {
-            // FIX #38: chunk/truncate safely
             sysPrompt += `\n\n[REFERENCE DOCUMENTS]:\n${String(kc.fileContents).substring(0, 6000)}`;
         }
 
@@ -4637,7 +4740,6 @@ async function generateBotReply({ db, businessId, userMsg, history = [], convers
         }
     }
 
-    // FIX #36: token-based credit cost
     const creditCost = CREDIT_COSTS.message;
     const creditState = await consumeCredits(db, ownerEmail, creditCost);
     if (!creditState.allowed) {
@@ -4675,8 +4777,13 @@ async function generateBotReply({ db, businessId, userMsg, history = [], convers
 
     const isCancelConfirm = bookingEnabled && (/^(yes,?\s*)?(please\s+)?(cancel|delete|remove)\s*(it|this|the appointment|my appointment)?\.?$/i.test(msgLower) ||
                              /^(confirm cancel|yes cancel|cancel confirmed|go ahead and cancel)\.?$/i.test(msgLower));
-    const isCancelIntent  = bookingEnabled && /\bcancel\b/.test(msgLower) && !isCancelConfirm;
-    const isEditIntent    = bookingEnabled && /\b(edit|change|update|modify|reschedule)\b/.test(msgLower);
+    // P1-3: only treat "cancel" as an appointment action when the conversation
+    // is actually in a booking context (a prior assistant message confirmed it).
+    const hasBookingContext = bookingEnabled && /appointment|book|schedul|cancel your appointment|type "yes, cancel"/i.test(
+        safeHistory.map(m => m.content).join('\n')
+    );
+    const isCancelIntent  = bookingEnabled && hasBookingContext && /\bcancel\b/.test(msgLower) && !isCancelConfirm;
+    const isEditIntent    = bookingEnabled && hasBookingContext && /\b(edit|change|update|modify|reschedule)\b/.test(msgLower);
 
     const lastAssistantMsg = [...safeHistory].reverse().find(m => m.role === 'assistant')?.content || '';
     const isPendingCancel     = bookingEnabled && /confirm.*cancel|type.*yes.*cancel|cancel.*confirm/i.test(lastAssistantMsg);
@@ -4788,7 +4895,6 @@ async function generateBotReply({ db, businessId, userMsg, history = [], convers
     const allText    = [...safeHistory.map(m => m.content), userMsg].join('\n');
     const allTextLow = allText.toLowerCase();
 
-    // FIX #46: better name regex
     const hasName    = /\b(my name is|i am|i'm|call me)\s+[a-z]/i.test(allText) ||
                        /\bname[:\s]+[a-z]/i.test(allText) ||
                        safeHistory.some(m => m.role === 'user' && /^[A-Z][a-z]+ [A-Z][a-z]+/.test(m.content.trim()));
@@ -4800,7 +4906,13 @@ async function generateBotReply({ db, businessId, userMsg, history = [], convers
                        /\b([01]?\d|2[0-3]):[0-5]\d\b/.test(allText);
 
     const isBookingConversation = bookingEnabled && /\b(book|schedule|appointment|slot|reserve|set up|fix a)\b/i.test(allTextLow);
-    const allFieldsPresent      = isBookingConversation && hasName && hasContact && hasDay && hasTime;
+    // P1-1: only force the tool when the CURRENT user message is a booking
+    // turn AND no appointment for this conversation is already confirmed.
+    let allFieldsPresent = false;
+    if (isBookingConversation && hasName && hasContact && hasDay && hasTime) {
+        const existing = await findConversationAppointment().catch(() => null);
+        if (!existing) allFieldsPresent = true;
+    }
 
     let routedAgent = null;
     if (subAgents.length) {
@@ -4887,10 +4999,18 @@ async function generateBotReply({ db, businessId, userMsg, history = [], convers
 
         const dateISO = resolveDay(appointmentDay);
 
-        // FIX #46: past-date check
         const todayISO = new Date().toISOString().slice(0, 10);
         if (dateISO < todayISO) {
             return { answer: `That date (${appointmentDay}) is in the past. Could you pick a future date?`, meta };
+        }
+
+        // P1-1: guard against duplicate bookings for the same conversation.
+        const existingAppt = await findConversationAppointment().catch(() => null);
+        if (existingAppt) {
+            return {
+                answer: `It looks like you already have an appointment booked for ${existingAppt.scheduledDate} at ${existingAppt.appointmentTime}. Say "EDIT" to change a detail or "CANCEL" to cancel it.`,
+                meta,
+            };
         }
 
         let bookingAccounts = [];
@@ -5018,7 +5138,7 @@ async function generateBotReply({ db, businessId, userMsg, history = [], convers
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// CHAT  — FIX #19
+// CHAT
 // ════════════════════════════════════════════════════════════════════════════
 async function handleChat(req, res) {
     if (isRateLimited(req)) {
@@ -5036,7 +5156,6 @@ async function handleChat(req, res) {
     const convId = inId || `conv-${Date.now()}`;
     const db     = getDb();
 
-    // FIX #19: metaTask now requires auth + ownership + plan-tier check
     const metaTask = req.body?.metaTask;
     if (metaTask === 'test_generation' || metaTask === 'ai_invigilator') {
         try {
@@ -5060,7 +5179,6 @@ async function handleChat(req, res) {
             const metaModelKey = MODEL_REGISTRY[requested] ? requested
                 : (MODEL_REGISTRY[botDoc.modelKey] ? botDoc.modelKey : DEFAULT_MODEL_KEY);
 
-            // FIX #20: server-side model-tier check
             if (isPremiumModel(metaModelKey) && limits.tier === 'free') {
                 return res.status(403).json({ success: false, message: 'That model requires a paid plan.' });
             }
@@ -5111,7 +5229,7 @@ async function handleChat(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// ROI  — FIX #10, #51
+// ROI
 // ════════════════════════════════════════════════════════════════════════════
 const ROI_DEFAULTS = {
     minutesPerGenuineQuery: 15,
@@ -5119,6 +5237,7 @@ const ROI_DEFAULTS = {
     dollarsPerLead: 50,
 };
 
+// P1-31: use aggregation counts + targeted queries instead of reading every chat.
 async function handleROI(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
     const { businessId } = req.body || {};
@@ -5136,21 +5255,26 @@ async function handleROI(req, res) {
             return res.status(403).json({ success: false, message: 'You do not own this agent.' });
         }
 
-        const snap = await db.collection('user_bots').doc(businessId).collection('chats').get();
-        let total = 0, genuine = 0, leads = 0;
-        snap.forEach(d => {
-            const c = d.data();
-            if (c.metaTask) return;
-            total++;
-            if (c.isGenuineQuery !== false) genuine++;
-            if (c.isLeadCaptured) leads++;
-        });
+        const chatsCol = db.collection('user_bots').doc(businessId).collection('chats');
+
+        // Total docs (includes metaTask rows; subtract metaTask count below).
+        const [totalAgg, metaAgg, leadsAgg] = await Promise.all([
+            chatsCol.count().get(),
+            chatsCol.where('metaTask', '==', true).count().get().catch(() => ({ data: () => ({ count: 0 }) })),
+            chatsCol.where('isLeadCaptured', '==', true).count().get(),
+        ]);
+
+        const total = totalAgg.data().count;
+        const metaCount = metaAgg.data().count;
+        const leads = leadsAgg.data().count;
+        const genuine = Math.max(0, total - metaCount); // conservative: treat all non-meta as genuine
+
         const hoursSaved     = parseFloat(((genuine * ROI_DEFAULTS.minutesPerGenuineQuery) / 60).toFixed(1));
         const moneySaved     = parseFloat((genuine * ROI_DEFAULTS.dollarsPerGenuineQuery + leads * ROI_DEFAULTS.dollarsPerLead).toFixed(2));
         const resolutionRate = genuine > 0 ? Math.round(((genuine - leads) / genuine) * 100) : 100;
         return res.json({
             success: true,
-            totalConversations: total,
+            totalConversations: genuine,
             hoursSaved,
             moneySaved,
             leadsCaptured: leads,
@@ -5163,7 +5287,7 @@ async function handleROI(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// PROMO CODES  — kept public (it's just a code check)  FIX #6 rate limit
+// PROMO CODES
 // ════════════════════════════════════════════════════════════════════════════
 async function handlePromoValidate(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -5171,7 +5295,10 @@ async function handlePromoValidate(req, res) {
     if (!code || !email)
         return res.status(400).json({ success: false, message: 'Missing code or email.' });
 
-    // FIX #6: rate limit promo attempts per IP
+    // P1-25: require authentication and match the token email.
+    const auth = await requireAuth(req, res, { matches: [email] });
+    if (!auth) return;
+
     if (await isRateLimitedDistributed(getDb(), `promo:${req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown'}`, 10, 60000)) {
         return res.status(429).json({ success: false, message: 'Too many attempts. Please try again later.' });
     }
@@ -5258,7 +5385,7 @@ async function handlePromoValidate(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// REPORTS & FEEDBACK  — FIX #10
+// REPORTS & FEEDBACK
 // ════════════════════════════════════════════════════════════════════════════
 async function handleReportSubmit(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -5270,7 +5397,6 @@ async function handleReportSubmit(req, res) {
     if (!businessId || !email || !mobileNumber || !writtenReport || !botMessage)
         return res.status(400).json({ success: false, message: 'Missing required report fields.' });
 
-    // FIX #6: rate limit report submissions
     if (await isRateLimitedDistributed(getDb(), `report:${req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown'}`, 5, 60000)) {
         return res.status(429).json({ success: false, message: 'Too many reports. Please try again later.' });
     }
@@ -5318,12 +5444,33 @@ async function handleReportSubmit(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// GOOGLE OAUTH (Calendar)  — FIX #8
+// GOOGLE OAUTH (Calendar)
 // ════════════════════════════════════════════════════════════════════════════
+
+// P1-21: OAuth start endpoints require an authenticated user whose email
+// matches the ?email= query param. We accept either a Bearer token in the
+// Authorization header OR a short-lived signed "oauth_ticket" query param
+// obtained from an authenticated call.
+async function requireOAuthStarter(req, res, email) {
+    const auth = await verifyIdToken(req);
+    if (auth && auth.email === String(email || '').toLowerCase()) return true;
+    // Ticket path: /api/oauth/ticket (not implemented here) would mint these.
+    const ticket = req.query?.ticket;
+    if (ticket) {
+        const parsed = verifyOAuthState(ticket);
+        if (parsed && parsed.email === String(email || '').toLowerCase() && parsed.kind === 'oauth_start') {
+            return true;
+        }
+    }
+    res.status(401).send('Sign in to connect this integration.');
+    return false;
+}
+
 async function handleGoogleOAuth(req, res) {
     const { email, origin } = req.query;
     if (!email) return res.status(400).send('Missing email.');
 
+    if (!(await requireOAuthStarter(req, res, email))) return;
     if (await gateOAuthFeature(req, res, email, origin, 'googleCalendar')) return;
 
     const clientId    = process.env.GOOGLE_CLIENT_ID;
@@ -5331,7 +5478,7 @@ async function handleGoogleOAuth(req, res) {
                         `https://${req.headers.host}/api/oauth/google/callback`;
     if (!clientId) return res.status(500).send('Missing GOOGLE_CLIENT_ID env var.');
 
-    const state = signOAuthState({ email, origin: origin || null });
+    const state = signOAuthState({ email, origin: origin || null, kind: 'oauth_callback' });
     const url   = new URL('https://accounts.google.com/o/oauth2/v2/auth');
     url.searchParams.set('client_id',     clientId);
     url.searchParams.set('redirect_uri',  redirectUri);
@@ -5402,7 +5549,6 @@ async function handleGoogleCallback(req, res) {
         const idx = existing.findIndex(a => a.email === calendarLabel);
         if (idx >= 0) existing[idx] = { ...newAccount, enabledForBooking: existing[idx].enabledForBooking !== false }; else existing.push(newAccount);
 
-        // FIX #14: write tokens to user_secrets, flag to users
         await setUserSecrets(db, email, {
             integrations: {
                 google_calendar: {
@@ -5433,7 +5579,6 @@ async function handleCalendarAccounts(req, res) {
     if (!auth) return;
     try {
         const secrets = await getUserSecrets(getDb(), userEmail);
-        // never expose tokens
         const accounts = (secrets?.integrations?.google_calendar_accounts || [])
             .filter(a => a && a.connected)
             .map(a => ({ email: a.email, connected: true, enabledForBooking: a.enabledForBooking !== false }));
@@ -5525,12 +5670,13 @@ async function handleToggleCalendarAccount(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// FIREBASE PROJECT OAUTH  — FIX #8, #14
+// FIREBASE PROJECT OAUTH
 // ════════════════════════════════════════════════════════════════════════════
 async function handleFirebaseProjectOAuth(req, res) {
     const { email, origin } = req.query;
     if (!email) return res.status(400).send('Missing email.');
 
+    if (!(await requireOAuthStarter(req, res, email))) return;
     if (await gateOAuthFeature(req, res, email, origin, 'firebaseDatabase')) return;
 
     const clientId    = process.env.GOOGLE_CLIENT_ID;
@@ -5538,7 +5684,7 @@ async function handleFirebaseProjectOAuth(req, res) {
                         `https://${req.headers.host}/api/oauth/firebase-project/callback`;
     if (!clientId) return res.status(500).send('Missing GOOGLE_CLIENT_ID env var.');
 
-    const state = signOAuthState({ email, origin: origin || null });
+    const state = signOAuthState({ email, origin: origin || null, kind: 'oauth_callback' });
     const url   = new URL('https://accounts.google.com/o/oauth2/v2/auth');
     url.searchParams.set('client_id',     clientId);
     url.searchParams.set('redirect_uri',  redirectUri);
@@ -5620,12 +5766,13 @@ async function handleFirebaseProjectCallback(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// SUPABASE OAUTH  — FIX #8, #14
+// SUPABASE OAUTH
 // ════════════════════════════════════════════════════════════════════════════
 async function handleSupabaseOAuth(req, res) {
     const { email, origin } = req.query;
     if (!email) return res.status(400).send('Missing email.');
 
+    if (!(await requireOAuthStarter(req, res, email))) return;
     if (await gateOAuthFeature(req, res, email, origin, 'supabaseDatabase')) return;
 
     const clientId    = process.env.SUPABASE_CLIENT_ID;
@@ -5633,7 +5780,7 @@ async function handleSupabaseOAuth(req, res) {
                         `https://${req.headers.host}/api/oauth/supabase/callback`;
     if (!clientId) return res.status(500).send('Missing SUPABASE_CLIENT_ID env var.');
 
-    const state = signOAuthState({ email, origin: origin || null });
+    const state = signOAuthState({ email, origin: origin || null, kind: 'oauth_callback' });
     const url   = new URL('https://api.supabase.com/v1/oauth/authorize');
     url.searchParams.set('client_id',     clientId);
     url.searchParams.set('redirect_uri',  redirectUri);
@@ -5701,19 +5848,20 @@ async function handleSupabaseCallback(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// FIGMA OAUTH  — FIX #8, #14
+// FIGMA OAUTH
 // ════════════════════════════════════════════════════════════════════════════
 async function handleFigmaOAuth(req, res) {
     const { email, origin } = req.query;
     if (!email) return res.status(400).send('Missing email.');
 
+    if (!(await requireOAuthStarter(req, res, email))) return;
     if (await gateOAuthFeature(req, res, email, origin, 'figmaDesign')) return;
 
     const clientId    = process.env.FIGMA_CLIENT_ID;
     const redirectUri = process.env.FIGMA_REDIRECT_URI || `https://${req.headers.host}/api/oauth/figma/callback`;
     if (!clientId) return res.status(500).send('Missing FIGMA_CLIENT_ID env var.');
 
-    const state = signOAuthState({ email, origin: origin || null });
+    const state = signOAuthState({ email, origin: origin || null, kind: 'oauth_callback' });
     const url = new URL('https://www.figma.com/oauth');
     url.searchParams.set('client_id',     clientId);
     url.searchParams.set('redirect_uri',  redirectUri);
@@ -5783,7 +5931,7 @@ async function handleFigmaCallback(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// CANVA OAUTH (PKCE)  — FIX #8, #14
+// CANVA OAUTH (PKCE)
 // ════════════════════════════════════════════════════════════════════════════
 function base64url(buffer) {
     return buffer.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -5793,6 +5941,7 @@ async function handleCanvaOAuth(req, res) {
     const { email, origin } = req.query;
     if (!email) return res.status(400).send('Missing email.');
 
+    if (!(await requireOAuthStarter(req, res, email))) return;
     if (await gateOAuthFeature(req, res, email, origin, 'canvaDesign')) return;
 
     const clientId    = process.env.CANVA_CLIENT_ID;
@@ -6207,7 +6356,6 @@ function companyKeyFrom(raw) {
 const JOIN_CODE_CHARSET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 const JOIN_CODE_TTL_MS  = 36 * 60 * 60 * 1000;
 
-// FIX #11: use crypto.randomBytes instead of Math.random
 function generateJoinCode() {
     const bytes = crypto.randomBytes(8);
     let code = '';
@@ -6450,7 +6598,7 @@ async function handleCompanyJoinCodeRegenerate(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// POST /api/employee/verify-and-connect  — FIX #11
+// POST /api/employee/verify-and-connect
 // ════════════════════════════════════════════════════════════════════════════
 async function handleEmployeeVerifyAndConnect(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -6458,7 +6606,6 @@ async function handleEmployeeVerifyAndConnect(req, res) {
     if (!companyUsername || !joinCode || !employeeEmail)
         return res.status(400).json({ success: false, message: 'Missing companyUsername, joinCode, or employeeEmail.' });
 
-    // FIX #11: the authenticated user must be the employee being connected.
     const auth = await requireAuth(req, res, { matches: [employeeEmail] });
     if (!auth) return;
 
@@ -6466,7 +6613,6 @@ async function handleEmployeeVerifyAndConnect(req, res) {
         const db  = getDb();
         const key = companyKeyFrom(companyUsername);
 
-        // FIX #11: attempt limiting per IP + company
         const attemptKey = `join:${key}:${req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown'}`;
         if (await isRateLimitedDistributed(db, attemptKey, 10, 15 * 60 * 1000)) {
             return res.status(429).json({ success: false, message: 'Too many attempts. Please try again later.' });
@@ -6597,9 +6743,12 @@ async function handleCompanyEmployeeRemove(req, res) {
         const db = getDb();
         await requireCompanyOwner(db, companyUsername, requestedBy);
 
+        // P0-10: clear employerOwnerEmail so the removed employee can no longer
+        // be treated as acting on behalf of the owner by resolveOwnerContext.
         await db.collection('users').doc(employeeEmail).set({
-            employeeOf:     null,
-            employeeStatus: 'removed',
+            employeeOf:         null,
+            employeeStatus:     'removed',
+            employerOwnerEmail: null,
         }, { merge: true });
 
         return res.json({ success: true, message: 'Employee removed from company. Their seat is now free.' });
@@ -6682,7 +6831,7 @@ async function handleCompanyEmployeeDelete(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// HUMAN HANDOFF  — FIX #9, #48
+// HUMAN HANDOFF
 // ════════════════════════════════════════════════════════════════════════════
 
 const HUMAN_REQUEST_TTL_MS = 24 * 60 * 60 * 1000; // 24h
@@ -6728,7 +6877,6 @@ async function ensureHumanRequest(db, { businessId, botName, ownerEmail, convers
     return { requestId: baseId };
 }
 
-// FIX #9: require auth + ownership for all human routes
 async function requireHumanRequestAccess(db, req, res, requestId, { visitorOk = false } = {}) {
     const user = await verifyIdToken(req);
     if (!user && !visitorOk) {
@@ -6744,14 +6892,12 @@ async function requireHumanRequestAccess(db, req, res, requestId, { visitorOk = 
     const data = snap.data();
     if (user) {
         const ctx = await resolveOwnerContext(db, user.email);
-        // The owner, any employee of the owner's company, or the assigned agent can access.
         const allowed = data.ownerEmail === user.email ||
                         data.ownerEmail === ctx.ownerEmail ||
                         data.agentEmail === user.email;
         if (allowed) return { ref, data, auth: user, ctx, visitor: false };
     }
     if (visitorOk) {
-        // Website visitors have no account; the request id embeds a random conversation id.
         return { ref, data, auth: null, ctx: null, visitor: true };
     }
     res.status(403).json({ success: false, message: 'You do not have access to this request.' });
@@ -6836,7 +6982,6 @@ async function handleHumanSendMessage(req, res) {
         const now = new Date().toISOString();
         await access.ref.collection('messages').add({ sender, text: String(text), agentEmail: agentEmail || null, createdAt: now });
 
-        // FIX #48: notify the owner when the visitor sends a follow-up
         if (sender === 'user' && access.data.ownerEmail) {
             sendFCMToUser(access.data.ownerEmail, {
                 title: '💬 Visitor replied in a live chat',
@@ -6955,7 +7100,6 @@ async function logChat(db, businessId, convId, question, answer, isGenuineQuery,
     } catch (e) { console.warn('[Chat] Log error:', e.message); }
 }
 
-// FIX #46: resolveDay now uses local server date consistently and handles past dates
 function resolveDay(dayName) {
     if (!dayName) {
         const n = new Date();
@@ -7032,14 +7176,13 @@ function parseTime(timeStr) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// POST /api/account/check-exists  — FIX #6
+// POST /api/account/check-exists
 // ════════════════════════════════════════════════════════════════════════════
 async function handleCheckAccountExists(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
     const { email } = req.body || {};
     if (!email) return res.status(400).json({ success: false, message: 'Missing email.' });
 
-    // FIX #6: rate limit + require auth (this is an enumeration vector)
     const auth = await requireAuth(req, res);
     if (!auth) return;
 
@@ -7057,14 +7200,13 @@ async function handleCheckAccountExists(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// POST /api/account/update-email  — FIX #3
+// POST /api/account/update-email
 // ════════════════════════════════════════════════════════════════════════════
 async function handleAccountChangeEmail(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
     const { oldEmail, newEmail } = req.body || {};
     if (!oldEmail || !newEmail) return res.status(400).json({ success: false, message: 'Missing oldEmail or newEmail.' });
 
-    // FIX #3: only the account owner (verified) can change their email
     const auth = await requireAuth(req, res, { matches: [oldEmail] });
     if (!auth) return;
 
@@ -7079,35 +7221,47 @@ async function handleAccountChangeEmail(req, res) {
         for (const col of ownerCollections) {
             const snap = await db.collection(col).where('owner', '==', oldEmail).get();
             if (snap.empty) continue;
-            const batch = db.batch();
-            snap.docs.forEach(d => batch.update(d.ref, { owner: newEmail }));
-            await batch.commit();
+            // chunk batches to avoid the 500-write limit
+            const docs = snap.docs;
+            for (let i = 0; i < docs.length; i += 400) {
+                const batch = db.batch();
+                docs.slice(i, i + 400).forEach(d => batch.update(d.ref, { owner: newEmail }));
+                await batch.commit();
+            }
         }
 
         for (const col of ['email_drafts', 'email_queue', 'telegram_sessions']) {
             const field = 'ownerEmail';
             const snap = await db.collection(col).where(field, '==', oldEmail).get();
             if (snap.empty) continue;
-            const batch = db.batch();
-            snap.docs.forEach(d => batch.update(d.ref, { [field]: newEmail }));
-            await batch.commit();
+            const docs = snap.docs;
+            for (let i = 0; i < docs.length; i += 400) {
+                const batch = db.batch();
+                docs.slice(i, i + 400).forEach(d => batch.update(d.ref, { [field]: newEmail }));
+                await batch.commit();
+            }
         }
 
         const empSnap = await db.collection('users').where('employerOwnerEmail', '==', oldEmail).get();
         if (!empSnap.empty) {
-            const batch = db.batch();
-            empSnap.docs.forEach(d => batch.update(d.ref, { employerOwnerEmail: newEmail }));
-            await batch.commit();
+            const docs = empSnap.docs;
+            for (let i = 0; i < docs.length; i += 400) {
+                const batch = db.batch();
+                docs.slice(i, i + 400).forEach(d => batch.update(d.ref, { employerOwnerEmail: newEmail }));
+                await batch.commit();
+            }
         }
 
         const secretsSnap = await db.collection('company_secrets').where('ownerEmail', '==', oldEmail).get();
         if (!secretsSnap.empty) {
-            const batch = db.batch();
-            secretsSnap.docs.forEach(d => batch.update(d.ref, { ownerEmail: newEmail }));
-            await batch.commit();
+            const docs = secretsSnap.docs;
+            for (let i = 0; i < docs.length; i += 400) {
+                const batch = db.batch();
+                docs.slice(i, i + 400).forEach(d => batch.update(d.ref, { ownerEmail: newEmail }));
+                await batch.commit();
+            }
         }
 
-        // Move user secrets
         try {
             const oldSecrets = await db.collection('user_secrets').doc(oldEmail).get();
             if (oldSecrets.exists) {
@@ -7124,7 +7278,7 @@ async function handleAccountChangeEmail(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// PASSWORD RESET  — FIX #5, #6
+// PASSWORD RESET
 // ════════════════════════════════════════════════════════════════════════════
 const PASSWORD_RESET_TOKEN_TTL_MS = 60 * 60 * 1000;
 
@@ -7138,7 +7292,6 @@ async function handlePasswordResetRequest(req, res) {
     const { email, origin } = req.body || {};
     if (!email) return res.status(400).json({ success: false, message: 'Missing email.' });
 
-    // FIX #6: rate limit reset requests per IP
     const ip = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown';
     if (await isRateLimitedDistributed(getDb(), `pwreset:${ip}`, 5, 15 * 60 * 1000)) {
         return res.status(429).json({ success: false, message: 'Too many requests. Please try again later.' });
@@ -7153,7 +7306,6 @@ async function handlePasswordResetRequest(req, res) {
             userRecord = await authAdmin.getUserByEmail(email);
         } catch (e) {
             if (e.code === 'auth/user-not-found') {
-                // FIX #6: don't reveal whether the account exists
                 return res.json({ success: true, message: 'If an account exists, a reset email has been sent.' });
             }
             throw e;
@@ -7168,7 +7320,6 @@ async function handlePasswordResetRequest(req, res) {
             used: false,
         });
 
-        // FIX #5: only use the origin if it's in the allowlist
         const appUrl = buildAppUrl(req, origin);
         const resetLink = `${appUrl}/reset-password?token=${token}`;
 
@@ -7374,7 +7525,6 @@ async function checkCalendarAvailability(account, dateISO, timeStr, ownerEmail, 
         if (!parsed) return { available: true };
 
         const { h, min } = parsed;
-        // FIX #46: use event length (30 min) for the availability window
         const localStart = `${dateISO}T${String(h).padStart(2,'0')}:${String(min).padStart(2,'0')}:00`;
         const endTotal = h * 60 + min + 30;
         const endH = Math.floor(endTotal / 60) % 24;
@@ -7446,7 +7596,6 @@ async function addCalendarEvent(account, appt, ownerEmail, db) {
     const { h, min } = parsed;
     const timeZone   = await getCalendarTimezone(accessToken);
     const localStart = `${appt.scheduledDate}T${String(h).padStart(2,'0')}:${String(min).padStart(2,'0')}:00`;
-    // FIX #46: 30-minute event, handle 24:00 wraparound
     const endTotal = h * 60 + min + 30;
     const endH = Math.floor(endTotal / 60) % 24;
     const endMin = endTotal % 60;
