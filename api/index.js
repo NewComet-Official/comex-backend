@@ -1471,6 +1471,7 @@ export default async function handler(req, res) {
     if (path === '/api/password-reset/confirm')   return handlePasswordResetConfirm(req, res);
 
     // ── Auth-required routes ──
+    if (path === '/api/oauth/ticket')             return handleOAuthTicket(req, res);
     if (path === '/api/scrape')                   return handleScrape(req, res);
     if (path === '/api/deploy')                   return handleDeploy(req, res);
     if (path === '/api/calculate-roi')            return handleROI(req, res);
@@ -5464,6 +5465,21 @@ async function requireOAuthStarter(req, res, email) {
     }
     res.status(401).send('Sign in to connect this integration.');
     return false;
+}
+
+// POST /api/oauth/ticket — mints a short-lived signed ticket so the browser can
+// start an OAuth redirect (page navigations can't send an Authorization header).
+async function handleOAuthTicket(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const auth = await requireAuth(req, res);
+    if (!auth) return;
+    try {
+        const ticket = signOAuthState({ email: auth.email, kind: 'oauth_start' });
+        return res.json({ success: true, ticket });
+    } catch (err) {
+        console.error('[OAuth/Ticket]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
 }
 
 async function handleGoogleOAuth(req, res) {
