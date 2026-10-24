@@ -101,7 +101,8 @@ async function verifyIdToken(req) {
         return {
             uid: decoded.uid,
             email: (decoded.email || '').toLowerCase(),
-            email_verified: !!decoded.email_verified,
+            // Social providers (Google/GitHub/Microsoft) are trusted; only email+password needs the verification step.
+            email_verified: !!decoded.email_verified || (decoded.firebase && decoded.firebase.sign_in_provider !== 'password'),
         };
     } catch (e) {
         console.warn('[Auth] verifyIdToken failed:', e.message);
@@ -1472,6 +1473,7 @@ export default async function handler(req, res) {
 
     // ── Auth-required routes ──
     if (path === '/api/oauth/ticket')             return handleOAuthTicket(req, res);
+    if (path === '/api/email-verification/send')  return handleEmailVerificationSend(req, res);
     if (path === '/api/scrape')                   return handleScrape(req, res);
     if (path === '/api/deploy')                   return handleDeploy(req, res);
     if (path === '/api/calculate-roi')            return handleROI(req, res);
@@ -5469,6 +5471,54 @@ async function requireOAuthStarter(req, res, email) {
 
 // POST /api/oauth/ticket — mints a short-lived signed ticket so the browser can
 // start an OAuth redirect (page navigations can't send an Authorization header).
+// POST /api/email-verification/send — branded verification email (via Resend) that links
+// to OUR /verify-email page instead of Firebase's default hosted screen.
+async function handleEmailVerificationSend(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const auth = await requireAuth(req, res, { allowUnverified: true });
+    if (!auth) return;
+    try {
+        if (auth.email_verified) return res.json({ success: true, alreadyVerified: true });
+        const db = getDb();
+        if (await isRateLimitedDistributed(db, `verifyemail:${auth.email}`, 5, 15 * 60 * 1000)) {
+            return res.status(429).json({ success: false, message: 'Too many verification emails requested. Please wait a few minutes.' });
+        }
+        const link = await getAuthAdmin().generateEmailVerificationLink(auth.email);
+        const oobCode = new URL(link).searchParams.get('oobCode');
+        if (!oobCode) throw new Error('Could not generate a verification link.');
+
+        const appUrl = buildAppUrl(req, req.body?.origin);
+        const verifyLink = `${appUrl}/verify-email?oobCode=${encodeURIComponent(oobCode)}`;
+        const safeEmail = String(auth.email).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+        await getResend().emails.send({
+            from: process.env.RESEND_FROM_EMAIL || 'Mebor AI <onboarding@resend.dev>',
+            to: auth.email,
+            subject: 'Verify your email for Mebor AI',
+            html: `
+<div style="max-width:520px;margin:0 auto;font-family:'Segoe UI',-apple-system,BlinkMacSystemFont,Roboto,Helvetica,Arial,sans-serif;color:#0f172a;background:#ffffff;border:1px solid #e2e8f0;border-radius:20px;padding:40px 36px;box-sizing:border-box;">
+  <div style="margin-bottom:28px;font-size:22px;font-weight:800;letter-spacing:-0.5px;">Mebor<span style="color:#5b3df5;"> AI</span></div>
+  <h2 style="margin:0 0 16px 0;font-size:24px;font-weight:700;line-height:1.3;">Verify your email address</h2>
+  <p style="margin:0 0 24px 0;font-size:15px;line-height:1.6;color:#475569;">Welcome! Confirm that <strong style="color:#334155;">${safeEmail}</strong> is yours to activate your Mebor AI account.</p>
+  <div style="text-align:center;margin-bottom:28px;">
+    <a href="${verifyLink}" target="_blank" style="display:inline-block;padding:14px 32px;background:linear-gradient(135deg,#5b3df5 0%,#7c3aed 100%);color:#ffffff;text-decoration:none;font-weight:700;font-size:15px;border-radius:100px;box-shadow:0 6px 20px rgba(91,61,245,0.35);">Verify Email &rarr;</a>
+  </div>
+  <div style="background:#f8fafc;border-left:4px solid #5b3df5;border-radius:8px;padding:14px 16px;margin-bottom:24px;">
+    <p style="margin:0;font-size:13px;line-height:1.5;color:#64748b;">If you didn't create a Mebor AI account, you can safely ignore this email.</p>
+  </div>
+  <div style="border-top:1px solid #f1f5f9;padding-top:20px;">
+    <p style="margin:0 0 8px 0;font-size:12px;color:#94a3b8;">Button not working? Paste this link into your browser:</p>
+    <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px 12px;word-break:break-all;"><a href="${verifyLink}" style="font-size:12px;color:#5b3df5;">${verifyLink}</a></div>
+  </div>
+</div>`,
+        });
+        return res.json({ success: true });
+    } catch (err) {
+        console.error('[EmailVerification/Send]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
 async function handleOAuthTicket(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
     const auth = await requireAuth(req, res);
@@ -5499,7 +5549,7 @@ async function handleGoogleOAuth(req, res) {
     url.searchParams.set('client_id',     clientId);
     url.searchParams.set('redirect_uri',  redirectUri);
     url.searchParams.set('response_type', 'code');
-    url.searchParams.set('scope',         'https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/calendar.events');
+    url.searchParams.set('scope',         'openid email https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/calendar.events');
     url.searchParams.set('access_type',   'offline');
     url.searchParams.set('prompt',        'consent');
     url.searchParams.set('state',         state);
@@ -5706,6 +5756,8 @@ async function handleFirebaseProjectOAuth(req, res) {
     url.searchParams.set('redirect_uri',  redirectUri);
     url.searchParams.set('response_type', 'code');
     url.searchParams.set('scope', [
+        'openid',
+        'email',
         'https://www.googleapis.com/auth/firebase.readonly',
         'https://www.googleapis.com/auth/datastore',
     ].join(' '));
