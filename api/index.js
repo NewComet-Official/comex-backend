@@ -5491,30 +5491,42 @@ async function handleEmailVerificationSend(req, res) {
         const verifyLink = `${appUrl}/verify-email?oobCode=${encodeURIComponent(oobCode)}`;
         const safeEmail = String(auth.email).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-        await getResend().emails.send({
-    from: process.env.RESEND_FROM_EMAIL || 'Mebor AI <noreply@meboragents.com>',
-    to: auth.email,
-    subject: 'Verify your email for Mebor AI',
-    html: `
-<div style="max-width:520px;margin:0 auto;font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#17150f;background:#ffffff;border:1px solid #e8e3da;border-radius:22px;padding:40px 36px;box-sizing:border-box;box-shadow:0 12px 28px -6px rgba(21,18,31,0.08);">
-  <div style="margin-bottom:28px;font-size:22px;font-weight:800;letter-spacing:-0.03em;color:#17150f;">Mebor<span style="color:#b4531a;"> AI</span></div>
-  <h2 style="margin:0 0 16px 0;font-size:24px;font-weight:700;line-height:1.25;letter-spacing:-0.03em;color:#17150f;">Verify your email address</h2>
-  <p style="margin:0 0 24px 0;font-size:15px;line-height:1.6;color:#6b665c;">Welcome! Confirm that <strong style="color:#17150f;font-weight:700;">${safeEmail}</strong> is yours to activate your Mebor AI account.</p>
-  <div style="text-align:center;margin-bottom:28px;">
-    <a href="${verifyLink}" target="_blank" style="display:inline-block;padding:14px 32px;background:linear-gradient(135deg,#3a352b 0%,#1c1a15 100%);color:#ffffff;text-decoration:none;font-weight:700;font-size:15px;border-radius:100px;box-shadow:0 6px 20px rgba(28,26,21,0.22);">Verify Email &rarr;</a>
-  </div>
-  <div style="background:#faf8f4;border-left:4px solid #b4531a;border-radius:8px;padding:14px 16px;margin-bottom:24px;">
-    <p style="margin:0;font-size:13px;line-height:1.5;color:#6b665c;">If you didn't create a Mebor AI account, you can safely ignore this email.</p>
-  </div>
-  <div style="border-top:1px solid #e8e3da;padding-top:20px;">
-    <p style="margin:0 0 8px 0;font-size:12px;color:#6b665c;">Button not working? Paste this link into your browser:</p>
-    <div style="background:#f3f0ea;border:1px solid #e8e3da;border-radius:8px;
-        return res.json({ success: true });
-    } catch (err) {
-        console.error('[EmailVerification/Send]', err.message);
-        return res.status(500).json({ success: false, message: err.message });
-    }
+        try {
+    // 1. Double check your fallback string if process.env.RESEND_FROM_EMAIL is empty
+    const fromEmail = process.env.RESEND_FROM_EMAIL || 'Mebor AI <noreply@meboragents.com>';
+
+    await getResend().emails.send({
+        from: fromEmail,
+        to: auth.email,
+        subject: 'Verify your email for Mebor AI',
+        html: `
+        <div style="max-width:520px;margin:0 auto;font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#17150f;background:#ffffff;border:1px solid #e8e3da;border-radius:22px;padding:40px 36px;box-sizing:border-box;box-shadow:0 12px 28px -6px rgba(21,18,31,0.08);">
+          <div style="margin-bottom:28px;font-size:22px;font-weight:800;letter-spacing:-0.03em;color:#17150f;">Mebor<span style="color:#b4531a;"> AI</span></div>
+          <h2 style="margin:0 0 16px 0;font-size:24px;font-weight:700;line-height:1.25;letter-spacing:-0.03em;color:#17150f;">Verify your email address</h2>
+          <p style="margin:0 0 24px 0;font-size:15px;line-height:1.6;color:#6b665c;">Welcome! Confirm that <strong style="color:#17150f;font-weight:700;">${safeEmail}</strong> is yours to activate your Mebor AI account.</p>
+          <div style="text-align:center;margin-bottom:28px;">
+            <a href="${verifyLink}" target="_blank" style="display:inline-block;padding:14px 32px;background:linear-gradient(135deg,#3a352b 0%,#1c1a15 100%);color:#ffffff;text-decoration:none;font-weight:700;font-size:15px;border-radius:100px;box-shadow:0 6px 20px rgba(28,26,21,0.22);">Verify Email &rarr;</a>
+          </div>
+          <div style="background:#faf8f4;border-left:4px solid #b4531a;border-radius:8px;padding:14px 16px;margin-bottom:24px;">
+            <p style="margin:0;font-size:13px;line-height:1.5;color:#6b665c;">If you didn't create a Mebor AI account, you can safely ignore this email.</p>
+          </div>
+          <div style="border-top:1px solid #e8e3da;padding-top:20px;">
+            <p style="margin:0 0 8px 0;font-size:12px;color:#6b665c;">Button not working? Paste this link into your browser:</p>
+            <div style="background:#f3f0ea;border:1px solid #e8e3da;border-radius:8px;padding:10px;word-break:break-all;font-size:12px;color:#b4531a;">
+              ${verifyLink}
+            </div>
+          </div>
+        </div>
+        ` // <-- Added the closing backtick to properly close the html template literal
+    });
+
+    return res.json({ success: true });
+
+} catch (err) {
+    console.error('[EmailVerification/Send]', err.message);
+    return res.status(500).json({ success: false, message: err.message });
 }
+
 
 async function handleOAuthTicket(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
