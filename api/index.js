@@ -1388,7 +1388,7 @@ async function toolSendEmail(ctx, { to, subject, body }) {
     const esc = s => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     try {
         await getResend().emails.send({
-            from: process.env.RESEND_FROM_EMAIL || 'Mebor AI <onboarding@resend.dev>',
+            from: process.env.RESEND_FROM_EMAIL || 'Mebor AI <noreply@meboragents.com>',
             to: recipient,
             subject: `[${ctx.botName}] ${String(subject || 'Message').substring(0, 120)}`,
             html: `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.6;white-space:pre-wrap;">${esc(body).substring(0, 4000)}</div><p style="color:#94a3b8;font-size:12px;">Sent by ${esc(ctx.botName)} (AI assistant).</p>`,
@@ -5492,7 +5492,7 @@ async function handleEmailVerificationSend(req, res) {
         const safeEmail = String(auth.email).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
         await getResend().emails.send({
-    from: process.env.RESEND_FROM_EMAIL || 'Mebor AI <onboarding@resend.dev>',
+    from: process.env.RESEND_FROM_EMAIL || 'Mebor AI <noreply@meboragents.com>',
     to: auth.email,
     subject: 'Verify your email for Mebor AI',
     html: `
@@ -7390,7 +7390,7 @@ async function handlePasswordResetRequest(req, res) {
 
         const resend = getResend();
         await resend.emails.send({
-            from: process.env.RESEND_FROM_EMAIL || 'Mebor AI <onboarding@resend.dev>',
+            from: process.env.RESEND_FROM_EMAIL || 'Mebor AI <noreply@meboragents.com>',
             to: email,
             subject: 'Reset your Mebor AI password',
             html: `
