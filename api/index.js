@@ -1391,7 +1391,7 @@ async function toolSendEmail(ctx, { to, subject, body }) {
             from: process.env.RESEND_FROM_EMAIL || 'Mebor AI <noreply@meboragents.com>',
             to: recipient,
             subject: `[${ctx.botName}] ${String(subject || 'Message').substring(0, 120)}`,
-            html: `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.6;white-space:pre-wrap;">${esc(body).substring(0, 4000)}</div><p style="color:#94a3b8;font-size:12px;">Sent by ${esc(ctx.botName)} (AI assistant).</p>`,
+            html: `<div style="font-family:'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;font-size:14px;line-height:1.6;white-space:pre-wrap;">${esc(body).substring(0, 4000)}</div><p style="color:#94a3b8;font-size:12px;">Sent by ${esc(ctx.botName)} (AI assistant).</p>`,
         });
         return { success: true, message: `Email sent to ${recipient}.` };
     } catch (e) { return { success: false, error: `Email failed: ${e.message}` }; }
@@ -2823,15 +2823,15 @@ function markdownToEmailHtml(raw) {
 }
 
 function buildAiEmailBadgeHtml() {
-    return `<div style="display:inline-block; padding:6px 14px; border-radius:100px; background:#EAF8F0; color:#16A34A; font-size:12px; font-weight:800; font-family:'Segoe UI', Arial, sans-serif; letter-spacing:0.01em; margin-top:16px;">&#10022;&nbsp; Auto-replied with AI</div>`;
+    return `<div style="display:inline-block; padding:6px 14px; border-radius:100px; background:#EAF8F0; color:#16A34A; font-size:12px; font-weight:800; font-family:'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; letter-spacing:0.01em; margin-top:16px;">&#10022;&nbsp; Auto-replied with AI</div>`;
 }
 
 function buildEmailHtmlBody(replyText, botName) {
     const safeName = (botName || 'Support Bot').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     const initial = safeName.trim().charAt(0).toUpperCase() || 'A';
-    return `<div style="font-family:'Google Sans Flex', 'Google Sans', 'Segoe UI', Helvetica, Arial, sans-serif; font-size:14px; line-height:1.65; color:#334155; max-width:600px; background:#ffffff; border:1px solid #e2e8f0; border-radius:18px; padding:20px 22px; box-shadow:0 10px 28px -8px rgba(15,23,42,0.08); box-sizing:border-box;">
+    return `<div style="font-family:'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size:14px; line-height:1.65; color:#334155; max-width:600px; background:#ffffff; border:1px solid #e2e8f0; border-radius:18px; padding:20px 22px; box-shadow:0 10px 28px -8px rgba(15,23,42,0.08); box-sizing:border-box;">
         <div style="display:flex; align-items:center; gap:12px; margin-bottom:14px;">
-            <div style="width:38px;height:38px;border-radius:50%;background:#e2e8f0;color:#475569;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:15px;font-family:'Google Sans Flex', 'Google Sans', 'Segoe UI', Arial, sans-serif;">${initial}</div>
+            <div style="width:38px;height:38px;border-radius:50%;background:#e2e8f0;color:#475569;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:15px;font-family:'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;">${initial}</div>
             <div style="font-weight:800;color:#0f172a;font-size:15px;">${safeName}</div>
         </div>
         ${markdownToEmailHtml(replyText)}
@@ -5469,8 +5469,6 @@ async function requireOAuthStarter(req, res, email) {
     return false;
 }
 
-// POST /api/oauth/ticket — mints a short-lived signed ticket so the browser can
-// start an OAuth redirect (page navigations can't send an Authorization header).
 // POST /api/email-verification/send — branded verification email (via Resend) that links
 // to OUR /verify-email page instead of Firebase's default hosted screen.
 async function handleEmailVerificationSend(req, res) {
@@ -5491,18 +5489,16 @@ async function handleEmailVerificationSend(req, res) {
         const verifyLink = `${appUrl}/verify-email?oobCode=${encodeURIComponent(oobCode)}`;
         const safeEmail = String(auth.email).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-        try {
-    // 1. Double check your fallback string if process.env.RESEND_FROM_EMAIL is empty
-    const fromEmail = process.env.RESEND_FROM_EMAIL || 'Mebor AI <noreply@meboragents.com>';
+        const fromEmail = process.env.RESEND_FROM_EMAIL || 'Mebor AI <noreply@meboragents.com>';
 
     await getResend().emails.send({
         from: fromEmail,
         to: auth.email,
         subject: 'Verify your email for Mebor AI',
         html: `
-        <div style="max-width:520px;margin:0 auto;font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#17150f;background:#ffffff;border:1px solid #e8e3da;border-radius:22px;padding:40px 36px;box-sizing:border-box;box-shadow:0 12px 28px -6px rgba(21,18,31,0.08);">
-          <div style="margin-bottom:28px;font-size:22px;font-weight:800;letter-spacing:-0.03em;color:#17150f;">Mebor<span style="color:#b4531a;"> AI</span></div>
-          <h2 style="margin:0 0 16px 0;font-size:24px;font-weight:700;line-height:1.25;letter-spacing:-0.03em;color:#17150f;">Verify your email address</h2>
+        <div style="max-width:520px;margin:0 auto;font-family:'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;color:#17150f;background:#ffffff;border:1px solid #e8e3da;border-radius:22px;padding:40px 36px;box-sizing:border-box;box-shadow:0 12px 28px -6px rgba(21,18,31,0.08);">
+          <div style="margin-bottom:28px;font-family:'Onest', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;font-size:22px;font-weight:800;letter-spacing:-0.03em;color:#17150f;">Mebor<span style="color:#b4531a;"> AI</span></div>
+          <h2 style="margin:0 0 16px 0;font-family:'Onest', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;font-size:24px;font-weight:700;line-height:1.25;letter-spacing:-0.03em;color:#17150f;">Verify your email address</h2>
           <p style="margin:0 0 24px 0;font-size:15px;line-height:1.6;color:#6b665c;">Welcome! Confirm that <strong style="color:#17150f;font-weight:700;">${safeEmail}</strong> is yours to activate your Mebor AI account.</p>
           <div style="text-align:center;margin-bottom:28px;">
             <a href="${verifyLink}" target="_blank" style="display:inline-block;padding:14px 32px;background:linear-gradient(135deg,#3a352b 0%,#1c1a15 100%);color:#ffffff;text-decoration:none;font-weight:700;font-size:15px;border-radius:100px;box-shadow:0 6px 20px rgba(28,26,21,0.22);">Verify Email &rarr;</a>
@@ -5520,14 +5516,15 @@ async function handleEmailVerificationSend(req, res) {
         ` // <-- Added the closing backtick to properly close the html template literal
     });
 
-    return res.json({ success: true });
-
-} catch (err) {
-    console.error('[EmailVerification/Send]', err.message);
-    return res.status(500).json({ success: false, message: err.message });
+        return res.json({ success: true });
+    } catch (err) {
+        console.error('[EmailVerification/Send]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
 }
 
-
+// POST /api/oauth/ticket — mints a short-lived signed ticket so the browser can
+// start an OAuth redirect (page navigations can't send an Authorization header).
 async function handleOAuthTicket(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
     const auth = await requireAuth(req, res);
@@ -7406,13 +7403,13 @@ async function handlePasswordResetRequest(req, res) {
             to: email,
             subject: 'Reset your Mebor AI password',
             html: `
-                <div style="max-width: 520px; margin: 0 auto; font-family: 'Google Sans Flex', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #0f172a; background-color: #ffffff; border: 1px solid #e2e8f0; border-radius: 20px; padding: 40px 36px; box-shadow: 0 10px 25px -5px rgba(15, 23, 42, 0.05); box-sizing: border-box;">
+                <div style="max-width: 520px; margin: 0 auto; font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #0f172a; background-color: #ffffff; border: 1px solid #e2e8f0; border-radius: 20px; padding: 40px 36px; box-shadow: 0 10px 25px -5px rgba(15, 23, 42, 0.05); box-sizing: border-box;">
   <div style="display: flex; align-items: center; margin-bottom: 28px;">
-    <span style="margin-left: 12px; font-size: 22px; font-weight: 800; color: #0f172a; letter-spacing: -0.5px;">
+    <span style="margin-left: 12px; font-family: 'Onest', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 22px; font-weight: 800; color: #0f172a; letter-spacing: -0.5px;">
       Mebor<span style="color: #5b3df5;"> AI</span>
     </span>
   </div>
-  <h2 style="margin: 0 0 16px 0; font-size: 24px; font-weight: 700; color: #0f172a; letter-spacing: -0.3px; line-height: 1.3;">
+  <h2 style="margin: 0 0 16px 0; font-family: 'Onest', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 24px; font-weight: 700; color: #0f172a; letter-spacing: -0.3px; line-height: 1.3;">
     Reset your password
   </h2>
   <p style="margin: 0 0 24px 0; font-size: 15px; line-height: 1.6; color: #475569;">
