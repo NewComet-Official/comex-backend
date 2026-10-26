@@ -562,7 +562,7 @@
     // White label branding link
     const brandFooter = document.createElement('div');
     brandFooter.className = 'cc-brand-footer';
-    brandFooter.innerHTML = 'Powered by <a href="#" target="_blank">Comex AI</a>';
+    brandFooter.innerHTML = 'Powered by <a href="#" target="_blank">MeborAgents</a>';
     win.appendChild(brandFooter);
 
     document.body.appendChild(win);
