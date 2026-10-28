@@ -1480,8 +1480,28 @@ const {
     handleGoogleChatDisconnect,
     runGoogleChatReplyJob,
 } = createGoogleChatHandlers({
-    admin, getDb, getUserSecrets, setUserSecrets, publicIntegrationFlag,
-    requireAuth
+    admin,
+    getDb,
+    getUserSecrets,
+    setUserSecrets,
+    publicIntegrationFlag,
+    requireAuth,
+    requireOAuthStarter,
+    gateOAuthFeature,
+    verifyOAuthState,
+    signOAuthState,
+    buildAppUrl,
+    parseAutoSendDelay,
+    CREDIT_COSTS,
+    resolveOwnerContext,
+    resolvePlanLimits,
+    consumeCredits,
+    refreshGenericGoogleToken,
+    sendFCMToUser,
+    logChat,
+    generateBotReply,
+    normalizeChannels,
+});
     
 export default async function handler(req, res) {
     const path = req.url.split('?')[0].replace(/\/$/, '');
@@ -4762,10 +4782,12 @@ async function generateBotReply({ db, businessId, userMsg, history = [], convers
         sysPrompt += `\n\nAUTONOMOUS ACTIONS:\n- You have access to real, live tools/actions that call external systems on this business's behalf (e.g. checking an order status, updating a record, triggering a webhook).\n- Call the matching tool whenever the user's request matches what that tool does, using the AI Description of each tool to decide when it applies.\n- Extract every required parameter directly from the conversation. If a required parameter is missing, ask the user for it before calling the tool.\n- After a tool result comes back, use it to give a clear, natural-language answer — never show the user raw JSON.\n- If a tool call fails or times out, apologize briefly and let the user know the action could not be completed right now.`;
     }
 
-    if (source === 'email') {
+        if (source === 'email') {
         sysPrompt += `\n\nTHIS IS AN EMAIL REPLY. The user's message arrived via email. Write a clear, professional reply. Do NOT mention chat, widgets, or "typing". Include a brief sign-off. Format your response using Markdown where it improves clarity — use **bold** for key terms, names, or important values, and use "-" bullet points or "1." numbered lists for multi-part answers — since this reply is rendered as a richly formatted HTML email.`;
     } else if (source === 'telegram') {
         sysPrompt += `\n\nTHIS IS A TELEGRAM CONVERSATION. Keep replies natural and concise. Avoid markdown that Telegram can't render — plain text with short paragraphs works best.`;
+    } else if (source === 'googlechat') {
+        sysPrompt += `\n\nTHIS IS A GOOGLE CHAT CONVERSATION. Keep replies conversational and short — Google Chat strips most Markdown, so plain text with short paragraphs works best. Bold via *asterisks* is fine; avoid headings, tables, and code fences.`;
     }
 
     const wantsHuman = humanHandoffEnabled && /speak to human support|connect (me )?(to )?(a )?human|talk to (a )?(human|person|someone|agent|representative)|(human|real) (agent|person)|customer service rep|talk to (someone|somebody) real/i.test(userMsg);
