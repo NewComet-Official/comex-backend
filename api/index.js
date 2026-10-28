@@ -1,6 +1,8 @@
 import admin from 'firebase-admin';
+import { createGoogleChatHandlers } from './googleChat.js';
 import crypto from 'crypto';
 import dns from 'dns';
+import { OAuth2Client } from 'google-auth-library';
 import { Resend } from 'resend';
 import { ImapFlow } from 'imapflow';
 import nodemailer from 'nodemailer';
@@ -54,6 +56,7 @@ const PUBLIC_ROUTE_PREFIXES = [
     '/api/human/',
     '/api/report/submit',
     '/api/telegram/webhook/',
+    '/api/google-chat/webhook',
     '/api/webhooks/whop',
     '/api/email/poll-worker',
     '/api/password-reset/',
@@ -255,6 +258,7 @@ const FEATURE_CATALOG = {
     pushNotifications:  { label: 'Desktop Push Notifications',              plans: ['team', 'teamplus', 'enterprise'] },
     emailAgent:         { label: 'Email Agent (IMAP/SMTP Inbox)',           plans: ['team', 'teamplus', 'enterprise'] },
     telegramAgent:      { label: 'Telegram Channel',                        plans: ['teamplus', 'enterprise'] },
+    googleChatAgent:    { label: 'Google Chat Channel (user-auth)',         plans: ['team', 'teamplus', 'enterprise'] },
     firebaseDatabase:   { label: 'Firebase Live Database Source',           plans: ['teamplus', 'enterprise'] },
     supabaseDatabase:   { label: 'Supabase Live Database Source',           plans: ['teamplus', 'enterprise'] },
     canvaDesign:        { label: 'Canva Design Import',                     plans: ['teamplus', 'enterprise'] },
@@ -265,7 +269,7 @@ const FEATURE_CATALOG = {
 const DB_SERVICE_FEATURE = { firebase: 'firebaseDatabase', supabase: 'supabaseDatabase' };
 const DESIGN_SERVICE_FEATURE = { canva: 'canvaDesign', figma: 'figmaDesign' };
 
-const ALL_CHANNELS = ['widget', 'email', 'telegram'];
+const ALL_CHANNELS = ['widget', 'email', 'telegram', 'googlechat'];
 
 function normalizeChannels(botData) {
     let channels = Array.isArray(botData?.channels)
@@ -274,14 +278,17 @@ function normalizeChannels(botData) {
 
     if (!channels.length) {
         const m = botData?.agentBuildMode || 'widget';
-        const map = {
-            widget:            ['widget'],
-            email:             ['email'],
-            telegram:          ['telegram'],
-            both:              ['widget', 'email'],
-            'widget+telegram': ['widget', 'telegram'],
-            'email+telegram':  ['email', 'telegram'],
-            all:               ['widget', 'email', 'telegram'],
+                const map = {
+            widget:              ['widget'],
+            email:               ['email'],
+            telegram:            ['telegram'],
+            googlechat:          ['googlechat'],
+            both:                ['widget', 'email'],
+            'widget+telegram':   ['widget', 'telegram'],
+            'widget+googlechat': ['widget', 'googlechat'],
+            'email+telegram':    ['email', 'telegram'],
+            'email+googlechat':  ['email', 'googlechat'],
+            all:                 ['widget', 'email', 'telegram', 'googlechat'],
         };
         channels = map[m] || ['widget'];
     }
@@ -295,13 +302,17 @@ function normalizeChannels(botData) {
 
 function deriveBuildMode(channels) {
     const c = channels || [];
-    const w = c.includes('widget'), e = c.includes('email'), t = c.includes('telegram');
-    if (w && e && t) return 'all';
+    const w = c.includes('widget'), e = c.includes('email');
+    const t = c.includes('telegram'), g = c.includes('googlechat');
+    if (w && e && t && g) return 'all';
     if (w && e)      return 'both';
     if (w && t)      return 'widget+telegram';
+    if (w && g)      return 'widget+googlechat';
     if (e && t)      return 'email+telegram';
+    if (e && g)      return 'email+googlechat';
     if (e)           return 'email';
     if (t)           return 'telegram';
+    if (g)           return 'googlechat';
     return 'widget';
 }
 
@@ -431,9 +442,13 @@ function sanitizeBotDataForPlan(botData, limits) {
         filtered = filtered.filter(c => c !== 'email');
         stripped.push('emailAgent');
     }
-    if (!f.telegramAgent && filtered.includes('telegram')) {
+        if (!f.telegramAgent && filtered.includes('telegram')) {
         filtered = filtered.filter(c => c !== 'telegram');
         stripped.push('telegramAgent');
+    }
+    if (!f.googleChatAgent && filtered.includes('googlechat')) {
+        filtered = filtered.filter(c => c !== 'googlechat');
+        stripped.push('googleChatAgent');
     }
     if (!filtered.length) filtered = ['widget'];
 
@@ -1454,6 +1469,20 @@ async function runAgentLoop({ modelKey, sysPrompt, history, userMsg, tools, ctx 
 // ROUTER
 // ════════════════════════════════════════════════════════════════════════════
 
+const {
+    handleGoogleChatOAuth,
+    handleGoogleChatCallback,
+    handleGoogleChatWebhook,
+    handleGoogleChatPending,
+    handleGoogleChatApprove,
+    handleGoogleChatReject,
+    handleGoogleChatStatus,
+    handleGoogleChatDisconnect,
+    runGoogleChatReplyJob,
+} = createGoogleChatHandlers({
+    admin, getDb, getUserSecrets, setUserSecrets, publicIntegrationFlag,
+    requireAuth
+    
 export default async function handler(req, res) {
     const path = req.url.split('?')[0].replace(/\/$/, '');
     cors(req, res, path);
@@ -1467,6 +1496,7 @@ export default async function handler(req, res) {
     if (path.startsWith('/api/telegram/webhook/')) return handleTelegramWebhook(req, res, path);
     if (path === '/api/webhooks/whop')            return handleWhopWebhook(req, res);
     if (path === '/api/email/poll-worker')        return handleEmailPollWorker(req, res);
+    if (path === '/api/google-chat/webhook')      return handleGoogleChatWebhook(req, res);
     if (path === '/api/password-reset/request')   return handlePasswordResetRequest(req, res);
     if (path === '/api/password-reset/verify')    return handlePasswordResetVerify(req, res);
     if (path === '/api/password-reset/confirm')   return handlePasswordResetConfirm(req, res);
@@ -1483,6 +1513,13 @@ export default async function handler(req, res) {
     if (path === '/api/fcm-test-notification')    return handleFCMTestNotification(req, res);
     if (path === '/api/appointment/cancel')       return handleAppointmentCancel(req, res);
     if (path === '/api/appointment/edit')         return handleAppointmentEdit(req, res);
+    if (path === '/api/oauth/google-chat')               return handleGoogleChatOAuth(req, res);
+    if (path === '/api/oauth/google-chat/callback')      return handleGoogleChatCallback(req, res);
+    if (path === '/api/google-chat/pending')             return handleGoogleChatPending(req, res);
+    if (path === '/api/google-chat/approve')             return handleGoogleChatApprove(req, res);
+    if (path === '/api/google-chat/reject')              return handleGoogleChatReject(req, res);
+    if (path === '/api/google-chat/status')              return handleGoogleChatStatus(req, res);
+    if (path === '/api/google-chat/disconnect')          return handleGoogleChatDisconnect(req, res);
     if (path === '/api/oauth/google')             return handleGoogleOAuth(req, res);
     if (path === '/api/oauth/google/callback')    return handleGoogleCallback(req, res);
     if (path === '/api/disconnect-calendar')      return handleDisconnectCalendar(req, res);
@@ -3233,13 +3270,15 @@ async function handleEmailPollWorker(req, res) {
     try {
         const db = getDb();
         const startedAt = Date.now();
-        const fetchResult = await runEmailFetchJob(db, startedAt);
+                const fetchResult = await runEmailFetchJob(db, startedAt);
         const replyResult = await runEmailReplyJob(db, startedAt);
+        const gchatResult = await runGoogleChatReplyJob(db, startedAt);
         return res.json({
             success: true,
             elapsedMs: Date.now() - startedAt,
             fetch: fetchResult,
             reply: replyResult,
+            googleChat: gchatResult,
         });
     } catch (err) {
         console.error('[Email/Tick]', err.message);
@@ -4351,7 +4390,7 @@ async function handleDeploy(req, res) {
 
         let webhookSecret = priorTg.webhookSecret || crypto.randomBytes(24).toString('hex');
 
-        botData.channels = incomingChannels;
+                botData.channels = incomingChannels;
         botData.agentBuildMode = deriveBuildMode(incomingChannels);
         botData.telegramConfig = {
             enabled: incomingTgEnabled,
@@ -4360,6 +4399,16 @@ async function handleDeploy(req, res) {
             webhookSecret,
             lastRegisteredAt: priorTg.lastRegisteredAt || null,
         };
+
+        if (incomingChannels.includes('googlechat')) {
+            const gc = botData.googleChatConfig || {};
+            botData.googleChatConfig = {
+                requireHumanApproval: gc.requireHumanApproval !== false,
+                autoSendDelay: /^\d{1,3}:\d{2}:\d{2}$/.test(String(gc.autoSendDelay || ''))
+                    ? gc.autoSendDelay
+                    : '00:00:02',
+            };
+        }
 
         if (incomingChannels.includes('email')) {
             const ec = botData.emailConfig || {};
