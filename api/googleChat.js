@@ -427,13 +427,31 @@ export function createGoogleChatHandlers({
         }
     }
 
+    // GET /api/google-chat/status?ownerEmail=            -> connection info
+    // GET /api/google-chat/status?ownerEmail=&stats=1    -> also returns { stats: { [businessId]: { pending, sent } } }
     async function handleGoogleChatStatus(req, res) {
-        const { ownerEmail } = req.query;
+        const { ownerEmail, stats } = req.query;
         if (!ownerEmail) return res.status(400).json({ success: false, message: 'Missing ownerEmail.' });
         const auth = await requireAuth(req, res, { matches: [ownerEmail] });
         if (!auth) return;
         try {
-            const secrets = await getUserSecrets(getDb(), ownerEmail);
+            const db = getDb();
+
+            if (stats) {
+                const out = {};
+                const snap = await db.collection('google_chat_drafts')
+                    .where('ownerEmail', '==', ownerEmail).get();
+                snap.forEach(d => {
+                    const x = d.data();
+                    if (!x.businessId) return;
+                    const row = (out[x.businessId] ||= { pending: 0, sent: 0 });
+                    if (x.status === 'pending') row.pending++;
+                    else if (x.status === 'sent') row.sent++;
+                });
+                return res.json({ success: true, stats: out });
+            }
+
+            const secrets = await getUserSecrets(db, ownerEmail);
             const gc = secrets?.integrations?.google_chat;
             if (!gc?.connected) return res.json({ success: true, connected: false });
             return res.json({
