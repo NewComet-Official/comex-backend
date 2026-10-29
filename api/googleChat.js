@@ -1,3 +1,170 @@
+// googleChat.js — full file
+
+// ─────────────────────────────────────────────────────────────
+// CORS / preflight helpers
+// ─────────────────────────────────────────────────────────────
+function _gchatCorsHeaders(origin) {
+    return {
+        'Access-Control-Allow-Origin': origin || '*',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+        'Access-Control-Max-Age': '86400',
+        'Vary': 'Origin',
+    };
+}
+
+function _gchatApplyCors(req, res) {
+    const headers = _gchatCorsHeaders(req.headers?.origin);
+    Object.entries(headers).forEach(([k, v]) => res.setHeader(k, v));
+}
+
+// ─────────────────────────────────────────────────────────────
+// OPTIONS (preflight) — must be registered for /status and /pending
+// ─────────────────────────────────────────────────────────────
+async function handleGoogleChatOptions(req, res) {
+    _gchatApplyCors(req, res);
+    return res.status(204).end();
+}
+
+// ─────────────────────────────────────────────────────────────
+// GET /api/google-chat/status?ownerEmail=…[&stats=1]
+// ─────────────────────────────────────────────────────────────
+async function handleGoogleChatStatus(req, res) {
+    _gchatApplyCors(req, res);
+
+    if (req.method !== 'GET') {
+        return res.status(405).json({ success: false, message: 'Method not allowed' });
+    }
+
+    const ownerEmail = String(req.query?.ownerEmail || '').trim();
+    if (!ownerEmail) {
+        return res.status(400).json({ success: false, connected: false, message: 'ownerEmail is required' });
+    }
+
+    try {
+        const db = getDb();
+
+        // Read the authoritative connection record from user_secrets (same place
+        // the OAuth callback writes it). Fall back to the public `users` doc.
+        let gc = null;
+        try {
+            const secretsSnap = await db.collection('user_secrets').doc(ownerEmail).get();
+            if (secretsSnap.exists) gc = secretsSnap.data()?.integrations?.google_chat || null;
+        } catch (e) {
+            console.warn('[GoogleChat/Status/secrets]', e.message);
+        }
+
+        if (!gc) {
+            try {
+                const userSnap = await db.collection('users').doc(ownerEmail).get();
+                if (userSnap.exists) gc = userSnap.data()?.integrations?.google_chat || null;
+            } catch (e) {
+                console.warn('[GoogleChat/Status/users]', e.message);
+            }
+        }
+
+        const connected = !!gc?.connected;
+
+        let stats = null;
+        if (connected && String(req.query?.stats) === '1') {
+            stats = {};
+            try {
+                const botsSnap = await db.collection('user_bots').where('owner', '==', ownerEmail).get();
+                const gchatBotIds = new Set();
+
+                botsSnap.forEach(d => {
+                    const b = d.data();
+                    if (b.deletedAt) return;
+                    if (!normalizeChannels(b).includes('googlechat')) return;
+                    gchatBotIds.add(d.id);
+                    stats[d.id] = { pending: 0, sent: 0 };
+                });
+
+                if (gchatBotIds.size) {
+                    // Pending drafts
+                    try {
+                        const pendSnap = await db.collection('google_chat_drafts')
+                            .where('ownerEmail', '==', ownerEmail)
+                            .get();
+                        pendSnap.forEach(d => {
+                            const v = d.data();
+                            if (!stats[v.businessId]) stats[v.businessId] = { pending: 0, sent: 0 };
+                            if (v.status === 'pending') stats[v.businessId].pending++;
+                            if (v.status === 'sent' || v.status === 'scheduled') stats[v.businessId].sent++;
+                        });
+                    } catch (e) {
+                        console.warn('[GoogleChat/Status/drafts]', e.message);
+                    }
+                }
+            } catch (e) {
+                console.warn('[GoogleChat/Status/bots]', e.message);
+            }
+        }
+
+        return res.status(200).json({
+            success: true,
+            connected,
+            accountLabel: gc?.accountLabel || gc?.email || null,
+            spaceName: gc?.space_name || null,
+            stats,
+        });
+    } catch (e) {
+        console.error('[GoogleChat/Status]', e.message);
+        // Non-fatal: return a well-shaped payload so the client doesn't turn this into "Network Error"
+        return res.status(200).json({ success: true, connected: false, stats: {} });
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// GET /api/google-chat/pending?ownerEmail=…
+// ─────────────────────────────────────────────────────────────
+async function handleGoogleChatPending(req, res) {
+    _gchatApplyCors(req, res);
+
+    if (req.method !== 'GET') {
+        return res.status(405).json({ success: false, pending: [] });
+    }
+
+    const ownerEmail = String(req.query?.ownerEmail || '').trim();
+    if (!ownerEmail) {
+        return res.status(400).json({ success: false, pending: [], message: 'ownerEmail is required' });
+    }
+
+    try {
+        const db = getDb();
+        const snap = await db.collection('google_chat_drafts')
+            .where('ownerEmail', '==', ownerEmail)
+            .where('status', '==', 'pending')
+            .get();
+
+        const pending = [];
+        snap.forEach(d => {
+            const v = d.data();
+            pending.push({
+                id: d.id,
+                businessId: v.businessId || '',
+                botName: v.botName || v.businessId || 'Google Chat Agent',
+                spaceName: v.spaceName || '',
+                originalMessage: v.originalMessage || '',
+                draftedResponse: v.draftedResponse || '',
+                createdAt: v.createdAt || null,
+            });
+        });
+
+        // Newest first — matches what the dashboard renders
+        pending.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+
+        return res.status(200).json({ success: true, pending });
+    } catch (e) {
+        console.error('[GoogleChat/Pending]', e.message);
+        // Non-fatal: empty list rather than a hard failure
+        return res.status(200).json({ success: true, pending: [] });
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// POST /api/google-chat/webhook  (UNCHANGED)
+// ─────────────────────────────────────────────────────────────
 async function handleGoogleChatWebhook(req, res) {
         if (req.method !== 'POST') return res.status(405).json({});
         if (!(await verifyGoogleChatRequest(req))) return res.status(401).json({ text: 'Unauthorized.' });
@@ -213,3 +380,13 @@ async function handleGoogleChatWebhook(req, res) {
         }
         return result;
     }
+
+// ─────────────────────────────────────────────────────────────
+// Exports
+// ─────────────────────────────────────────────────────────────
+module.exports = {
+    handleGoogleChatWebhook,
+    handleGoogleChatStatus,
+    handleGoogleChatPending,
+    handleGoogleChatOptions,
+};
