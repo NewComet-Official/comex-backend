@@ -6471,12 +6471,18 @@ async function refreshGenericGoogleToken(authObj, ownerEmail, db, key) {
     if (authObj.refresh_token && authObj.expiry_date) {
         const expiryMs = new Date(authObj.expiry_date).getTime();
         if (!isNaN(expiryMs) && expiryMs < Date.now() + 60000) {
+            
+            // Use the Chat-specific credentials if refreshing a Chat token
+            const isChat = key === 'google_chat';
+            const cId = isChat ? process.env.GOOGLE_CLIENT_ID_CHAT : process.env.GOOGLE_CLIENT_ID;
+            const cSec = isChat ? process.env.GOOGLE_CLIENT_SECRET_CHAT : process.env.GOOGLE_CLIENT_SECRET;
+
             const r = await fetch('https://oauth2.googleapis.com/token', {
                 method:  'POST',
                 headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
                 body:    new URLSearchParams({
-                    client_id:     process.env.GOOGLE_CLIENT_ID,
-                    client_secret: process.env.GOOGLE_CLIENT_SECRET,
+                    client_id:     cId,
+                    client_secret: cSec,
                     refresh_token: authObj.refresh_token,
                     grant_type:    'refresh_token',
                 }),
