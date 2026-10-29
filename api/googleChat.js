@@ -20,10 +20,10 @@ export function createGoogleChatHandlers({
         if (!(await requireOAuthStarter(req, res, email))) return;
         if (await gateOAuthFeature(req, res, email, origin, 'googleChatAgent')) return;
 
-        const clientId    = process.env.GOOGLE_CLIENT_ID;
+        const clientId    = process.env.GOOGLE_CLIENT_ID_CHAT;
         const redirectUri = process.env.GOOGLE_CHAT_REDIRECT_URI ||
                             `https://${req.headers.host}/api/oauth/google-chat/callback`;
-        if (!clientId) return res.status(500).send('Missing GOOGLE_CLIENT_ID env var.');
+        if (!clientId) return res.status(500).send('Missing GOOGLE_CLIENT_ID_CHAT env var.');
 
         const state = signOAuthState({ email, origin: origin || null, kind: 'oauth_callback' });
         const url   = new URL('https://accounts.google.com/o/oauth2/v2/auth');
@@ -51,11 +51,11 @@ export function createGoogleChatHandlers({
         const { email, origin } = parsed;
         if (await gateOAuthFeature(req, res, email, origin, 'googleChatAgent')) return;
 
-        const clientId     = process.env.GOOGLE_CLIENT_ID;
-        const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+        const clientId     = process.env.GOOGLE_CLIENT_ID_CHAT;
+        const clientSecret = process.env.GOOGLE_CLIENT_SECRET_CHAT;
         const redirectUri  = process.env.GOOGLE_CHAT_REDIRECT_URI ||
                              `https://${req.headers.host}/api/oauth/google-chat/callback`;
-        if (!clientId || !clientSecret) return res.status(500).send('Missing Google OAuth env vars.');
+        if (!clientId || !clientSecret) return res.status(500).send('Missing Google Chat OAuth env vars.');
 
         try {
             const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
