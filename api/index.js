@@ -39,8 +39,8 @@ function getAuthAdmin() {
 // === CORS: public routes get *, authenticated routes get allowlist ===
 const DEFAULT_ALLOWED_ORIGINS = [
     process.env.APP_URL,
-    'https://mebor-ai.com',
-    'https://www.mebor-ai.com',
+    'https://meboragents.com',
+    'https://www.meboragents.com',
 ].filter(Boolean);
 
 function getAllowedOrigins() {
@@ -269,7 +269,7 @@ const FEATURE_CATALOG = {
 const DB_SERVICE_FEATURE = { firebase: 'firebaseDatabase', supabase: 'supabaseDatabase' };
 const DESIGN_SERVICE_FEATURE = { canva: 'canvaDesign', figma: 'figmaDesign' };
 
-const ALL_CHANNELS = ['widget', 'email', 'telegram', 'googlechat'];
+const ALL_CHANNELS = ['widget', 'email', 'telegram', 'googlechat', 'helppage];
 
 function normalizeChannels(botData) {
     let channels = Array.isArray(botData?.channels)
@@ -277,19 +277,26 @@ function normalizeChannels(botData) {
         : [];
 
     if (!channels.length) {
-        const m = botData?.agentBuildMode || 'widget';
-                const map = {
-            widget:              ['widget'],
-            email:               ['email'],
-            telegram:            ['telegram'],
-            googlechat:          ['googlechat'],
-            both:                ['widget', 'email'],
-            'widget+telegram':   ['widget', 'telegram'],
-            'widget+googlechat': ['widget', 'googlechat'],
-            'email+telegram':    ['email', 'telegram'],
-            'email+googlechat':  ['email', 'googlechat'],
-            all:                 ['widget', 'email', 'telegram', 'googlechat'],
-        };
+    const m = botData?.agentBuildMode || 'widget';
+    const map = {
+        widget:              ['widget'],
+        email:               ['email'],
+        telegram:            ['telegram'],
+        googlechat:          ['googlechat'],
+        helppage:            ['helppage'],
+        both:                ['widget', 'email'],
+        'widget+telegram':   ['widget', 'telegram'],
+        'widget+googlechat': ['widget', 'googlechat'],
+        'widget+helppage':   ['widget', 'helppage'],
+        'email+telegram':    ['email', 'telegram'],
+        'email+googlechat':  ['email', 'googlechat'],
+        'email+helppage':    ['email', 'helppage'],
+        'telegram+helppage': ['telegram', 'helppage'],
+        'googlechat+helppage': ['googlechat', 'helppage'],
+        all:                 ['widget', 'email', 'telegram', 'googlechat', 'helppage'],
+    };
+    channels = map[m] || ['widget'];
+}
         channels = map[m] || ['widget'];
     }
 
@@ -1047,7 +1054,7 @@ async function callLLM({ modelKey, messages, toolChoice, allFieldsPresent, enabl
             headers: {
                 'Content-Type':  'application/json',
                 'Authorization': `Bearer ${apiKey}`,
-                'HTTP-Referer':  process.env.APP_URL || 'https://mebor-ai.com',
+                'HTTP-Referer':  process.env.APP_URL || 'https://meboragents.com',
                 'X-Title':       'Mebor AI',
             },
             body: JSON.stringify({ ...body, model: m.id }),
