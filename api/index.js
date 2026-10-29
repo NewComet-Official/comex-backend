@@ -269,7 +269,7 @@ const FEATURE_CATALOG = {
 const DB_SERVICE_FEATURE = { firebase: 'firebaseDatabase', supabase: 'supabaseDatabase' };
 const DESIGN_SERVICE_FEATURE = { canva: 'canvaDesign', figma: 'figmaDesign' };
 
-const ALL_CHANNELS = ['widget', 'email', 'telegram', 'googlechat', 'helppage];
+const ALL_CHANNELS = ['widget', 'email', 'telegram', 'googlechat', 'helppage'];
 
 function normalizeChannels(botData) {
     let channels = Array.isArray(botData?.channels)
@@ -277,26 +277,21 @@ function normalizeChannels(botData) {
         : [];
 
     if (!channels.length) {
-    const m = botData?.agentBuildMode || 'widget';
-    const map = {
-        widget:              ['widget'],
-        email:               ['email'],
-        telegram:            ['telegram'],
-        googlechat:          ['googlechat'],
-        helppage:            ['helppage'],
-        both:                ['widget', 'email'],
-        'widget+telegram':   ['widget', 'telegram'],
-        'widget+googlechat': ['widget', 'googlechat'],
-        'widget+helppage':   ['widget', 'helppage'],
-        'email+telegram':    ['email', 'telegram'],
-        'email+googlechat':  ['email', 'googlechat'],
-        'email+helppage':    ['email', 'helppage'],
-        'telegram+helppage': ['telegram', 'helppage'],
-        'googlechat+helppage': ['googlechat', 'helppage'],
-        all:                 ['widget', 'email', 'telegram', 'googlechat', 'helppage'],
-    };
-    channels = map[m] || ['widget'];
-}
+        const m = botData?.agentBuildMode || 'widget';
+        const map = {
+            widget: ['widget'], email: ['email'], telegram: ['telegram'],
+            googlechat: ['googlechat'], helppage: ['helppage'],
+            both: ['widget', 'email'],
+            'widget+telegram': ['widget', 'telegram'],
+            'widget+googlechat': ['widget', 'googlechat'],
+            'widget+helppage': ['widget', 'helppage'],
+            'email+telegram': ['email', 'telegram'],
+            'email+googlechat': ['email', 'googlechat'],
+            'email+helppage': ['email', 'helppage'],
+            'telegram+helppage': ['telegram', 'helppage'],
+            'googlechat+helppage': ['googlechat', 'helppage'],
+            all: ['widget', 'email', 'telegram', 'googlechat', 'helppage'],
+        };
         channels = map[m] || ['widget'];
     }
 
