@@ -3,9 +3,8 @@ async function handleGoogleChatWebhook(req, res) {
         if (!(await verifyGoogleChatRequest(req))) return res.status(401).json({ text: 'Unauthorized.' });
 
         const raw = req.body || {};
-        // Support both classic Chat event format and Workspace Add-on format
         const chatPayload = raw.chat?.messagePayload || raw;
-        const eventType = raw.type || (raw.chat?.addedToSpacePayload ? 'ADDED_TO_SPACE' : ( raw.chat?.messagePayload ? 'MESSAGE' : null ));
+        const eventType = raw.type || (raw.chat?.addedToSpacePayload ? 'ADDED_TO_SPACE' : (raw.chat?.messagePayload ? 'MESSAGE' : null));
 
         if (eventType === 'ADDED_TO_SPACE') {
             return res.json({ text: 'Thanks for adding me! Ask me anything about this business.' });
@@ -21,7 +20,6 @@ async function handleGoogleChatWebhook(req, res) {
         const db = getDb();
         let ownerEmail = null;
 
-        // 1. Look up in user_secrets (where space_name and connectedAt are actually stored!)
         try {
             const secretsSnap = await db.collection('user_secrets').get();
             const candidates = [];
@@ -36,7 +34,6 @@ async function handleGoogleChatWebhook(req, res) {
                 }
             });
 
-            // 2. If no user is bound to this space yet, bind the most recently connected user
             if (!ownerEmail && candidates.length) {
                 candidates.sort((a, b) => (b.connectedAt || '').localeCompare(a.connectedAt || ''));
                 ownerEmail = candidates[0].email;
@@ -79,7 +76,6 @@ async function handleGoogleChatWebhook(req, res) {
                 status: 'pending', createdAt: new Date().toISOString(),
             });
 
-            // Process immediately so the draft appears in the Google Chat Dashboard right away!
             await runGoogleChatReplyJob(db, Date.now());
         } catch (e) {
             console.error('[GoogleChat/Webhook/enqueue]', e.message);
@@ -91,7 +87,6 @@ async function handleGoogleChatWebhook(req, res) {
     async function runGoogleChatReplyJob(db, startedAt) {
         const result = { processed: 0, results: [] };
 
-        // 1. Send due scheduled drafts (avoid composite index by filtering scheduledAt in memory)
         try {
             const nowISO = new Date().toISOString();
             const schedSnap = await db.collection('google_chat_drafts')
@@ -115,7 +110,6 @@ async function handleGoogleChatWebhook(req, res) {
             }
         } catch (e) { console.warn('[GoogleChat/ScheduledScan]', e.message); }
 
-        // 2. Fetch pending queue items (avoid composite index requirement by sorting in memory)
         let pendingDocs = [];
         try {
             const pendingSnap = await db.collection('google_chat_queue')
