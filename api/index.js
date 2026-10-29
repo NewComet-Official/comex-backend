@@ -1480,6 +1480,7 @@ const {
     handleGoogleChatReject,
     handleGoogleChatStatus,
     handleGoogleChatDisconnect,
+    handleGoogleChatOptions,
     runGoogleChatReplyJob,
 } = createGoogleChatHandlers({
     admin,
@@ -1535,13 +1536,30 @@ export default async function handler(req, res) {
     if (path === '/api/fcm-test-notification')    return handleFCMTestNotification(req, res);
     if (path === '/api/appointment/cancel')       return handleAppointmentCancel(req, res);
     if (path === '/api/appointment/edit')         return handleAppointmentEdit(req, res);
-    if (path === '/api/oauth/google-chat')               return handleGoogleChatOAuth(req, res);
-    if (path === '/api/oauth/google-chat/callback')      return handleGoogleChatCallback(req, res);
-    if (path === '/api/google-chat/pending')             return handleGoogleChatPending(req, res);
-    if (path === '/api/google-chat/approve')             return handleGoogleChatApprove(req, res);
-    if (path === '/api/google-chat/reject')              return handleGoogleChatReject(req, res);
-    if (path === '/api/google-chat/status')              return handleGoogleChatStatus(req, res);
-    if (path === '/api/google-chat/disconnect')          return handleGoogleChatDisconnect(req, res);
+// ── Google Chat routes (guarded: never let a missing handler return an empty 500) ──
+const _gchatRoutes = {
+    '/api/oauth/google-chat':          handleGoogleChatOAuth,
+    '/api/oauth/google-chat/callback': handleGoogleChatCallback,
+    '/api/google-chat/pending':        handleGoogleChatPending,
+    '/api/google-chat/approve':        handleGoogleChatApprove,
+    '/api/google-chat/reject':         handleGoogleChatReject,
+    '/api/google-chat/status':         handleGoogleChatStatus,
+    '/api/google-chat/disconnect':     handleGoogleChatDisconnect,
+};
+if (_gchatRoutes[path]) {
+    const fn = _gchatRoutes[path];
+    if (typeof fn !== 'function') {
+        console.error(`[Router] Google Chat handler for ${path} is missing — check googleChat.js exports.`);
+        return res.status(500).json({
+            success: false,
+            message: 'Google Chat endpoint is not configured on this deployment.',
+        });
+    }
+    if (req.method === 'OPTIONS' && typeof handleGoogleChatOptions === 'function') {
+        return handleGoogleChatOptions(req, res);
+    }
+    return fn(req, res);
+}
     if (path === '/api/oauth/google')             return handleGoogleOAuth(req, res);
     if (path === '/api/oauth/google/callback')    return handleGoogleCallback(req, res);
     if (path === '/api/disconnect-calendar')      return handleDisconnectCalendar(req, res);
