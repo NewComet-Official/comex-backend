@@ -57,6 +57,7 @@ const PUBLIC_ROUTE_PREFIXES = [
     '/api/report/submit',
     '/api/telegram/webhook/',
     '/api/google-chat/webhook',
+    '/api/slack/events',
     '/api/webhooks/whop',
     '/api/email/poll-worker',
     '/api/password-reset/',
@@ -259,6 +260,7 @@ const FEATURE_CATALOG = {
     emailAgent:         { label: 'Email Agent (IMAP/SMTP Inbox)',           plans: ['team', 'teamplus', 'enterprise'] },
     telegramAgent:      { label: 'Telegram Channel',                        plans: ['teamplus', 'enterprise'] },
     googleChatAgent:    { label: 'Google Chat Channel (user-auth)',         plans: ['team', 'teamplus', 'enterprise'] },
+    slackAgent:         { label: 'Slack Channel',                           plans: ['teamplus', 'enterprise'] },
     firebaseDatabase:   { label: 'Firebase Live Database Source',           plans: ['teamplus', 'enterprise'] },
     supabaseDatabase:   { label: 'Supabase Live Database Source',           plans: ['teamplus', 'enterprise'] },
     canvaDesign:        { label: 'Canva Design Import',                     plans: ['teamplus', 'enterprise'] },
@@ -269,7 +271,7 @@ const FEATURE_CATALOG = {
 const DB_SERVICE_FEATURE = { firebase: 'firebaseDatabase', supabase: 'supabaseDatabase' };
 const DESIGN_SERVICE_FEATURE = { canva: 'canvaDesign', figma: 'figmaDesign' };
 
-const ALL_CHANNELS = ['widget', 'email', 'telegram', 'googlechat', 'helppage'];
+const ALL_CHANNELS = ['widget', 'email', 'telegram', 'googlechat', 'slack', 'helppage'];
 
 function normalizeChannels(botData) {
     let channels = Array.isArray(botData?.channels)
@@ -280,7 +282,7 @@ function normalizeChannels(botData) {
         const m = botData?.agentBuildMode || 'widget';
         const map = {
             widget: ['widget'], email: ['email'], telegram: ['telegram'],
-            googlechat: ['googlechat'], helppage: ['helppage'],
+            googlechat: ['googlechat'], slack: ['slack'], helppage: ['helppage'],
             both: ['widget', 'email'],
             'widget+telegram': ['widget', 'telegram'],
             'widget+googlechat': ['widget', 'googlechat'],
@@ -290,7 +292,7 @@ function normalizeChannels(botData) {
             'email+helppage': ['email', 'helppage'],
             'telegram+helppage': ['telegram', 'helppage'],
             'googlechat+helppage': ['googlechat', 'helppage'],
-            all: ['widget', 'email', 'telegram', 'googlechat', 'helppage'],
+            all: ['widget', 'email', 'telegram', 'googlechat', 'slack', 'helppage'],
         };
         channels = map[m] || ['widget'];
     }
@@ -305,7 +307,7 @@ function normalizeChannels(botData) {
 function deriveBuildMode(channels) {
     const c = channels || [];
     const w = c.includes('widget'), e = c.includes('email');
-    const t = c.includes('telegram'), g = c.includes('googlechat');
+    const t = c.includes('telegram'), g = c.includes('googlechat'), sl = c.includes('slack');
     if (w && e && t && g) return 'all';
     if (w && e)      return 'both';
     if (w && t)      return 'widget+telegram';
@@ -315,6 +317,7 @@ function deriveBuildMode(channels) {
     if (e)           return 'email';
     if (t)           return 'telegram';
     if (g)           return 'googlechat';
+    if (sl)          return 'slack';
     return 'widget';
 }
 
@@ -451,6 +454,10 @@ function sanitizeBotDataForPlan(botData, limits) {
     if (!f.googleChatAgent && filtered.includes('googlechat')) {
         filtered = filtered.filter(c => c !== 'googlechat');
         stripped.push('googleChatAgent');
+    }
+    if (!f.slackAgent && filtered.includes('slack')) {
+        filtered = filtered.filter(c => c !== 'slack');
+        stripped.push('slackAgent');
     }
     if (!filtered.length) filtered = ['widget'];
 
@@ -1520,6 +1527,7 @@ export default async function handler(req, res) {
     if (path === '/api/webhooks/whop')            return handleWhopWebhook(req, res);
     if (path === '/api/email/poll-worker')        return handleEmailPollWorker(req, res);
     if (path === '/api/google-chat/webhook')      return handleGoogleChatWebhook(req, res);
+    if (path === '/api/slack/events')             return handleSlackWebhook(req, res);
     if (path === '/api/password-reset/request')   return handlePasswordResetRequest(req, res);
     if (path === '/api/password-reset/verify')    return handlePasswordResetVerify(req, res);
     if (path === '/api/password-reset/confirm')   return handlePasswordResetConfirm(req, res);
@@ -1612,7 +1620,515 @@ if (_gchatRoutes[path]) {
     if (path === '/api/human/poll')            return handleHumanPoll(req, res);
     if (path === '/api/human/close')           return handleHumanClose(req, res);
 
+    // ── Slack routes ──
+    if (path === '/api/slack/status')          return handleSlackStatus(req, res);
+    if (path === '/api/slack/connect-manual')  return handleSlackConnectManual(req, res);
+    if (path === '/api/slack/disconnect')      return handleSlackDisconnect(req, res);
+    if (path === '/api/slack/pending')         return handleSlackPending(req, res);
+    if (path === '/api/slack/approve')         return handleSlackApprove(req, res);
+    if (path === '/api/slack/reject')          return handleSlackReject(req, res);
+
     return res.status(404).json({ success: false, message: `Unknown route: ${path}` });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// SLACK CHANNEL
+// ════════════════════════════════════════════════════════════════════════════
+
+const SLACK_API_BASE = 'https://slack.com/api';
+
+// Slack mrkdwn differs from Markdown: *bold*, no headings.
+function toSlackMrkdwn(text) {
+    return String(text || '')
+        .replace(/\*\*(.+?)\*\*/g, '*$1*')
+        .replace(/^#{1,6}\s+(.*)$/gm, '*$1*')
+        .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<$2|$1>');
+}
+
+async function callSlackApi(botToken, method, body) {
+    const r = await fetch(`${SLACK_API_BASE}/${method}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json; charset=utf-8', Authorization: `Bearer ${botToken}` },
+        body: JSON.stringify(body || {}),
+        signal: AbortSignal.timeout(8000),
+    });
+    let data = null;
+    try { data = await r.json(); } catch { /* handled below */ }
+    if (!r.ok || !data || data.ok === false) {
+        throw new Error(`Slack ${method} failed: ${data?.error || `HTTP ${r.status}`}`);
+    }
+    return data;
+}
+
+async function sendSlackMessage(botToken, channel, text, threadTs) {
+    const payload = {
+        channel,
+        text: toSlackMrkdwn(text).substring(0, 3900) || '(empty reply)',
+        unfurl_links: false,
+    };
+    if (threadTs) payload.thread_ts = threadTs;
+    return callSlackApi(botToken, 'chat.postMessage', payload);
+}
+
+// Read the raw request body BEFORE anything touches req.body, so the signature can be verified.
+async function readSlackRawBody(req) {
+    if (Buffer.isBuffer(req.rawBody)) return req.rawBody;
+    if (typeof req.rawBody === 'string') return Buffer.from(req.rawBody);
+    try {
+        let timer;
+        const buf = await Promise.race([
+            getRawBody(req),
+            new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('timeout')), 1500); }),
+        ]).finally(() => clearTimeout(timer));
+        if (buf && buf.length) return buf;
+    } catch { /* fall through */ }
+    return Buffer.from(typeof req.body === 'string' ? req.body : JSON.stringify(req.body || {}));
+}
+
+function verifySlackSignature(req, rawBody) {
+    const secret = process.env.SLACK_SIGNING_SECRET;
+    if (!secret) return { ok: false, status: 500, message: 'SLACK_SIGNING_SECRET is not set.' };
+    const ts = String(req.headers['x-slack-request-timestamp'] || '');
+    const sig = String(req.headers['x-slack-signature'] || '');
+    if (!ts || !sig) return { ok: false, status: 401, message: 'Missing Slack signature headers.' };
+    if (Math.abs(Date.now() / 1000 - Number(ts)) > 60 * 5) return { ok: false, status: 401, message: 'Stale Slack request.' };
+    const expected = 'v0=' + crypto.createHmac('sha256', secret).update(`v0:${ts}:${rawBody.toString('utf8')}`).digest('hex');
+    const a = Buffer.from(sig), b = Buffer.from(expected);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return { ok: false, status: 401, message: 'Invalid Slack signature.' };
+    return { ok: true };
+}
+
+async function findSlackOwnerByTeam(db, teamId) {
+    if (!teamId) return null;
+    const snap = await db.collection('user_secrets').where('integrations.slack.teamId', '==', teamId).limit(5).get();
+    let found = null;
+    snap.forEach(d => {
+        const sl = d.data()?.integrations?.slack;
+        if (sl?.connected && sl.botTokenEnc && !found) found = { ownerEmail: d.id, slack: sl };
+    });
+    return found;
+}
+
+async function getSlackChannelLabel(botToken, channelId, channelType) {
+    if (channelType === 'im') return 'Direct message';
+    try {
+        const r = await fetch(`${SLACK_API_BASE}/conversations.info?channel=${encodeURIComponent(channelId)}`, {
+            headers: { Authorization: `Bearer ${botToken}` },
+            signal: AbortSignal.timeout(4000),
+        });
+        const d = await r.json();
+        if (d.ok && d.channel?.name) return `#${d.channel.name}`;
+    } catch { /* best-effort */ }
+    return channelId;
+}
+
+// POST /api/slack/events  (public — verified by Slack signature)
+async function handleSlackWebhook(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ ok: false });
+
+    const rawBody = await readSlackRawBody(req);
+    const check = verifySlackSignature(req, rawBody);
+    if (!check.ok) {
+        console.warn('[Slack/Webhook]', check.message);
+        return res.status(check.status).json({ ok: false, message: check.message });
+    }
+
+    let body;
+    try { body = JSON.parse(rawBody.toString('utf8')); }
+    catch { body = (req.body && typeof req.body === 'object') ? req.body : {}; }
+
+    if (body.type === 'url_verification') {
+        return res.status(200).json({ challenge: body.challenge });
+    }
+
+    // Slack retries when we take >3s; the first delivery is already being handled.
+    if (req.headers['x-slack-retry-num']) return res.status(200).json({ ok: true });
+    if (body.type !== 'event_callback' || !body.event) return res.status(200).json({ ok: true });
+
+    const ev = body.event;
+    const teamId = body.team_id || ev.team;
+
+    try {
+        // Ignore bots, edits/joins/etc. and empty messages.
+        if (ev.bot_id || ev.subtype || !ev.user || !ev.text) return res.status(200).json({ ok: true });
+        const isMention = ev.type === 'app_mention';
+        const isDm = ev.type === 'message' && (ev.channel_type === 'im' || ev.channel_type === 'mpim');
+        if (!isMention && !isDm) return res.status(200).json({ ok: true });
+
+        const db = getDb();
+
+        // A channel mention can arrive as both "message" and "app_mention" — handle each ts once.
+        const evId = `${teamId}__${ev.channel}__${String(ev.ts).replace('.', '_')}`;
+        try {
+            await db.collection('slack_events').doc(evId).create({ receivedAt: new Date().toISOString() });
+        } catch { return res.status(200).json({ ok: true, duplicate: true }); }
+
+        const link = await findSlackOwnerByTeam(db, teamId);
+        if (!link) {
+            console.warn('[Slack/Webhook] No Mebor account linked to team', teamId);
+            return res.status(200).json({ ok: true });
+        }
+        const { ownerEmail, slack } = link;
+        if (slack.botUserId && ev.user === slack.botUserId) return res.status(200).json({ ok: true });
+
+        const ctx = await resolveOwnerContext(db, ownerEmail);
+        const limits = resolvePlanLimits(ctx.ownerProfile);
+        if (!limits.features.slackAgent) {
+            console.warn('[Slack/Webhook] Plan does not include Slack:', ownerEmail);
+            return res.status(200).json({ ok: true });
+        }
+
+        let agent = null;
+        const botsSnap = await db.collection('user_bots').where('owner', '==', ownerEmail).get();
+        botsSnap.forEach(d => {
+            const b = d.data();
+            if (b.deletedAt || agent) return;
+            if (normalizeChannels(b).includes('slack')) agent = { id: d.id, name: b.displayName || b.name || 'Assistant', data: b };
+        });
+        if (!agent) return res.status(200).json({ ok: true });
+
+        const botToken = decryptCredential(slack.botTokenEnc);
+        const userText = String(ev.text).replace(/<@[A-Z0-9]+>/g, '').trim();
+        if (!userText) return res.status(200).json({ ok: true });
+
+        const threadTs = ev.thread_ts || (isDm ? undefined : ev.ts);
+
+        const result = await generateBotReply({
+            db, businessId: agent.id, userMsg: userText, history: [],
+            conversationId: `slack-${teamId}-${ev.channel}`, source: 'slack',
+        });
+        const replyText = result?.answer || "Sorry, I couldn't respond just now.";
+
+        const sc = agent.data.slackConfig || {};
+        const requireApproval = sc.requireHumanApproval !== false;
+        const nowISO = new Date().toISOString();
+        const channelName = await getSlackChannelLabel(botToken, ev.channel, ev.channel_type);
+
+        const draftBase = {
+            ownerEmail, businessId: agent.id, botName: agent.name, teamId,
+            channelId: ev.channel, channelName, threadTs: threadTs || null,
+            slackUserId: ev.user, originalMessage: userText, draftedResponse: replyText,
+            createdAt: nowISO,
+        };
+
+        if (requireApproval) {
+            const ref = await db.collection('slack_drafts').add({ ...draftBase, status: 'pending' });
+            sendFCMToUser(ownerEmail, {
+                title: `💬 New Slack draft in ${channelName}`,
+                body: replyText.substring(0, 120),
+                url: '/slack-dashboard',
+                tag: `slack-approval-${ref.id}`,
+                type: 'slack_approval',
+            }).catch(e => console.error('[Slack/ApprovalFCM]', e.message));
+            return res.status(200).json({ ok: true });
+        }
+
+        const delayMs = parseAutoSendDelay(sc.autoSendDelay || '00:00:02');
+        if (delayMs <= 0) {
+            await sendSlackMessage(botToken, ev.channel, replyText, threadTs);
+            await db.collection('slack_drafts').add({ ...draftBase, status: 'sent', sentAt: nowISO, autoSent: true });
+            await logChat(db, agent.id, `slack-${teamId}-${ev.channel}`, userText, replyText, true, false, { source: 'slack' });
+        } else {
+            await db.collection('slack_drafts').add({
+                ...draftBase, status: 'scheduled', scheduledAt: new Date(Date.now() + delayMs).toISOString(),
+            });
+        }
+        return res.status(200).json({ ok: true });
+    } catch (err) {
+        console.error('[Slack/Webhook]', err.message);
+        // Always 200 so Slack does not hammer us with retries.
+        return res.status(200).json({ ok: true });
+    }
+}
+
+// Sends scheduled (auto-send) drafts that are due. Called from the poll worker tick.
+async function runSlackScheduledJob(db) {
+    const out = { sent: 0, failed: 0 };
+    try {
+        const nowISO = new Date().toISOString();
+        const snap = await db.collection('slack_drafts').where('status', '==', 'scheduled').get();
+        const due = snap.docs.filter(d => (d.data().scheduledAt || '') <= nowISO).slice(0, 5);
+        for (const d of due) {
+            const claimed = await db.runTransaction(async (tx) => {
+                const s = await tx.get(d.ref);
+                if (!s.exists || s.data().status !== 'scheduled') return false;
+                tx.set(d.ref, { status: 'sending' }, { merge: true });
+                return true;
+            }).catch(() => false);
+            if (!claimed) continue;
+            const draft = d.data();
+            try {
+                const secrets = await getUserSecrets(db, draft.ownerEmail);
+                const sl = secrets?.integrations?.slack;
+                if (!sl?.connected || !sl.botTokenEnc) throw new Error('slack-disconnected');
+                await sendSlackMessage(decryptCredential(sl.botTokenEnc), draft.channelId, draft.draftedResponse, draft.threadTs);
+                await d.ref.set({ status: 'sent', sentAt: new Date().toISOString(), autoSent: true }, { merge: true });
+                await logChat(db, draft.businessId, `slack-${draft.teamId}-${draft.channelId}`, draft.originalMessage || '', draft.draftedResponse, true, false, { source: 'slack' });
+                out.sent++;
+            } catch (e) {
+                console.error('[Slack/ScheduledSend]', d.id, e.message);
+                await d.ref.set({ status: 'failed', error: e.message, failedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
+                out.failed++;
+            }
+        }
+    } catch (e) { console.warn('[Slack/ScheduledScan]', e.message); }
+    return out;
+}
+
+// POST /api/slack/connect-manual  { ownerEmail, botToken, teamId }
+async function handleSlackConnectManual(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { ownerEmail, botToken, teamId } = req.body || {};
+    const token = String(botToken || '').trim();
+    const team = String(teamId || '').trim();
+    if (!ownerEmail || !token || !team)
+        return res.status(400).json({ success: false, message: 'Missing ownerEmail, botToken, or teamId.' });
+    if (!token.startsWith('xoxb-'))
+        return res.status(400).json({ success: false, message: 'That does not look like a Slack Bot Token (it should start with xoxb-).' });
+
+    const auth = await requireAuth(req, res, { matches: [ownerEmail] });
+    if (!auth) return;
+
+    try {
+        const db = getDb();
+        if (await denyIfFeatureLocked(res, db, ownerEmail, 'slackAgent')) return;
+
+        let info;
+        try {
+            const r = await fetch(`${SLACK_API_BASE}/auth.test`, {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${token}` },
+                signal: AbortSignal.timeout(8000),
+            });
+            info = await r.json();
+        } catch (e) {
+            return res.status(502).json({ success: false, message: `Could not reach Slack: ${e.message}` });
+        }
+        if (!info || !info.ok) {
+            return res.status(400).json({ success: false, message: `Slack rejected that token: ${info?.error || 'invalid_auth'}.` });
+        }
+        if (info.team_id && info.team_id !== team) {
+            return res.status(400).json({
+                success: false,
+                message: `That token belongs to workspace ${info.team_id}, not ${team}. Check the Team ID.`,
+            });
+        }
+
+        // One workspace can only be linked to one Mebor account.
+        const existing = await db.collection('user_secrets').where('integrations.slack.teamId', '==', team).limit(5).get();
+        let takenByOther = false;
+        existing.forEach(d => { if (d.id !== ownerEmail && d.data()?.integrations?.slack?.connected) takenByOther = true; });
+        if (takenByOther)
+            return res.status(409).json({ success: false, message: 'That Slack workspace is already connected to another Mebor account.' });
+
+        await setUserSecrets(db, ownerEmail, {
+            integrations: {
+                slack: {
+                    connected: true,
+                    accountLabel: info.team || team,
+                    teamId: team,
+                    botUserId: info.user_id || null,
+                    botTokenEnc: encryptCredential(token),
+                    connectedAt: new Date().toISOString(),
+                },
+            },
+        });
+        await db.collection('users').doc(ownerEmail).set({
+            integrations: { slack: publicIntegrationFlag(true) },
+        }, { merge: true });
+
+        return res.json({ success: true, message: 'Slack connected.', accountLabel: info.team || team });
+    } catch (err) {
+        console.error('[Slack/ConnectManual]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// GET /api/slack/status?ownerEmail=…[&stats=1]
+async function handleSlackStatus(req, res) {
+    if (req.method !== 'GET') return res.status(405).json({ success: false });
+    const ownerEmail = String(req.query?.ownerEmail || '').trim();
+    if (!ownerEmail) return res.status(400).json({ success: false, connected: false, message: 'ownerEmail is required.' });
+
+    const auth = await requireAuth(req, res, { matches: [ownerEmail] });
+    if (!auth) return;
+
+    try {
+        const db = getDb();
+        const secrets = await getUserSecrets(db, ownerEmail);
+        const sl = secrets?.integrations?.slack || null;
+        const connected = !!sl?.connected;
+
+        let stats = null;
+        if (String(req.query?.stats) === '1') {
+            stats = {};
+            try {
+                const botsSnap = await db.collection('user_bots').where('owner', '==', ownerEmail).get();
+                botsSnap.forEach(d => {
+                    const b = d.data();
+                    if (b.deletedAt || !normalizeChannels(b).includes('slack')) return;
+                    stats[d.id] = { pending: 0, sent: 0 };
+                });
+                const draftsSnap = await db.collection('slack_drafts').where('ownerEmail', '==', ownerEmail).get();
+                draftsSnap.forEach(d => {
+                    const v = d.data();
+                    if (!stats[v.businessId]) stats[v.businessId] = { pending: 0, sent: 0 };
+                    if (v.status === 'pending') stats[v.businessId].pending++;
+                    if (v.status === 'sent' || v.status === 'scheduled') stats[v.businessId].sent++;
+                });
+            } catch (e) { console.warn('[Slack/Status/stats]', e.message); }
+        }
+
+        return res.json({
+            success: true,
+            connected,
+            accountLabel: connected ? (sl.accountLabel || null) : null,
+            teamId: connected ? (sl.teamId || null) : null,
+            stats,
+        });
+    } catch (err) {
+        console.error('[Slack/Status]', err.message);
+        return res.status(200).json({ success: true, connected: false, stats: {} });
+    }
+}
+
+// POST /api/slack/disconnect  { ownerEmail }
+async function handleSlackDisconnect(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { ownerEmail } = req.body || {};
+    if (!ownerEmail) return res.status(400).json({ success: false, message: 'Missing ownerEmail.' });
+
+    const auth = await requireAuth(req, res, { matches: [ownerEmail] });
+    if (!auth) return;
+
+    try {
+        const db = getDb();
+        await setUserSecrets(db, ownerEmail, { integrations: { slack: null } });
+        await db.collection('users').doc(ownerEmail).set({
+            integrations: { slack: publicIntegrationFlag(false) },
+        }, { merge: true });
+
+        try {
+            const drafts = await db.collection('slack_drafts')
+                .where('ownerEmail', '==', ownerEmail)
+                .where('status', 'in', ['pending', 'scheduled'])
+                .get();
+            if (!drafts.empty) {
+                const batch = db.batch();
+                drafts.docs.forEach(d => batch.update(d.ref, { status: 'abandoned', abandonedAt: new Date().toISOString() }));
+                await batch.commit();
+            }
+        } catch (e) { console.warn('[Slack/Disconnect/drafts]', e.message); }
+
+        return res.json({ success: true, message: 'Slack disconnected.' });
+    } catch (err) {
+        console.error('[Slack/Disconnect]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// GET /api/slack/pending?ownerEmail=…
+async function handleSlackPending(req, res) {
+    if (req.method !== 'GET') return res.status(405).json({ success: false, pending: [] });
+    const ownerEmail = String(req.query?.ownerEmail || '').trim();
+    if (!ownerEmail) return res.status(400).json({ success: false, pending: [], message: 'ownerEmail is required.' });
+
+    const auth = await requireAuth(req, res, { matches: [ownerEmail] });
+    if (!auth) return;
+
+    try {
+        const db = getDb();
+        const snap = await db.collection('slack_drafts')
+            .where('ownerEmail', '==', ownerEmail)
+            .where('status', '==', 'pending')
+            .get();
+        const pending = [];
+        snap.forEach(d => {
+            const v = d.data();
+            pending.push({
+                id: d.id,
+                businessId: v.businessId || '',
+                botName: v.botName || v.businessId || 'Slack Agent',
+                channelName: v.channelName || v.channelId || '',
+                originalMessage: v.originalMessage || '',
+                draftedResponse: v.draftedResponse || '',
+                createdAt: v.createdAt || null,
+            });
+        });
+        pending.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+        return res.json({ success: true, pending });
+    } catch (err) {
+        console.error('[Slack/Pending]', err.message);
+        return res.status(200).json({ success: true, pending: [] });
+    }
+}
+
+// POST /api/slack/approve  { draftId, ownerEmail, finalResponse }
+async function handleSlackApprove(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { draftId, ownerEmail, finalResponse } = req.body || {};
+    if (!draftId || !ownerEmail || !finalResponse)
+        return res.status(400).json({ success: false, message: 'Missing draftId, ownerEmail, or finalResponse.' });
+
+    const auth = await requireAuth(req, res, { matches: [ownerEmail] });
+    if (!auth) return;
+
+    try {
+        const db = getDb();
+        const ref = db.collection('slack_drafts').doc(draftId);
+        const snap = await ref.get();
+        if (!snap.exists) return res.status(404).json({ success: false, message: 'Draft not found.' });
+        const draft = snap.data();
+        if (draft.ownerEmail !== ownerEmail)
+            return res.status(403).json({ success: false, message: 'You do not own this draft.' });
+        if (draft.status !== 'pending')
+            return res.status(409).json({ success: false, message: `This draft is already ${draft.status}.` });
+
+        const secrets = await getUserSecrets(db, ownerEmail);
+        const sl = secrets?.integrations?.slack;
+        if (!sl?.connected || !sl.botTokenEnc)
+            return res.status(400).json({ success: false, message: 'Slack is disconnected. Reconnect it before approving.' });
+
+        await sendSlackMessage(decryptCredential(sl.botTokenEnc), draft.channelId, finalResponse, draft.threadTs);
+
+        const now = new Date().toISOString();
+        await ref.set({ status: 'sent', finalResponse, approvedAt: now, sentAt: now, approvedBy: ownerEmail }, { merge: true });
+        await logChat(db, draft.businessId, `slack-${draft.teamId}-${draft.channelId}`, draft.originalMessage || '', finalResponse, true, false, { source: 'slack' });
+
+        return res.json({ success: true, message: 'Reply approved and sent.' });
+    } catch (err) {
+        console.error('[Slack/Approve]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// POST /api/slack/reject  { draftId, ownerEmail }
+async function handleSlackReject(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { draftId, ownerEmail } = req.body || {};
+    if (!draftId || !ownerEmail)
+        return res.status(400).json({ success: false, message: 'Missing draftId or ownerEmail.' });
+
+    const auth = await requireAuth(req, res, { matches: [ownerEmail] });
+    if (!auth) return;
+
+    try {
+        const db = getDb();
+        const ref = db.collection('slack_drafts').doc(draftId);
+        const snap = await ref.get();
+        if (!snap.exists) return res.status(404).json({ success: false, message: 'Draft not found.' });
+        const draft = snap.data();
+        if (draft.ownerEmail !== ownerEmail)
+            return res.status(403).json({ success: false, message: 'You do not own this draft.' });
+        if (draft.status !== 'pending')
+            return res.status(409).json({ success: false, message: `This draft is already ${draft.status}.` });
+
+        await ref.set({ status: 'rejected', rejectedAt: new Date().toISOString(), rejectedBy: ownerEmail }, { merge: true });
+        return res.json({ success: true });
+    } catch (err) {
+        console.error('[Slack/Reject]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -3313,12 +3829,14 @@ async function handleEmailPollWorker(req, res) {
                 const fetchResult = await runEmailFetchJob(db, startedAt);
         const replyResult = await runEmailReplyJob(db, startedAt);
         const gchatResult = await runGoogleChatReplyJob(db, startedAt);
+        const slackResult = await runSlackScheduledJob(db);
         return res.json({
             success: true,
             elapsedMs: Date.now() - startedAt,
             fetch: fetchResult,
             reply: replyResult,
             googleChat: gchatResult,
+            slack: slackResult,
         });
     } catch (err) {
         console.error('[Email/Tick]', err.message);
@@ -4450,6 +4968,16 @@ async function handleDeploy(req, res) {
             };
         }
 
+        if (incomingChannels.includes('slack')) {
+            const sc = botData.slackConfig || {};
+            botData.slackConfig = {
+                requireHumanApproval: sc.requireHumanApproval !== false,
+                autoSendDelay: /^\d{1,3}:\d{2}:\d{2}$/.test(String(sc.autoSendDelay || ''))
+                    ? sc.autoSendDelay
+                    : '00:00:02',
+            };
+        }
+
         if (incomingChannels.includes('email')) {
             const ec = botData.emailConfig || {};
             botData.emailConfig = {
@@ -4808,6 +5336,8 @@ async function generateBotReply({ db, businessId, userMsg, history = [], convers
         sysPrompt += `\n\nTHIS IS A TELEGRAM CONVERSATION. Keep replies natural and concise. Avoid markdown that Telegram can't render — plain text with short paragraphs works best.`;
     } else if (source === 'googlechat') {
         sysPrompt += `\n\nTHIS IS A GOOGLE CHAT CONVERSATION. Keep replies conversational and short — Google Chat strips most Markdown, so plain text with short paragraphs works best. Bold via *asterisks* is fine; avoid headings, tables, and code fences.`;
+    } else if (source === 'slack') {
+        sysPrompt += `\n\nTHIS IS A SLACK CONVERSATION. Keep replies conversational and concise. Slack uses its own mrkdwn: *single asterisks* for bold, and bullet lists with "-". Avoid headings, tables, and code fences.`;
     }
 
     const wantsHuman = humanHandoffEnabled && /speak to human support|connect (me )?(to )?(a )?human|talk to (a )?(human|person|someone|agent|representative)|(human|real) (agent|person)|customer service rep|talk to (someone|somebody) real/i.test(userMsg);
