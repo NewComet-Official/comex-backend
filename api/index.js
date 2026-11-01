@@ -1627,6 +1627,8 @@ if (_gchatRoutes[path]) {
     if (path === '/api/slack/pending')         return handleSlackPending(req, res);
     if (path === '/api/slack/approve')         return handleSlackApprove(req, res);
     if (path === '/api/slack/reject')          return handleSlackReject(req, res);
+    if (path === '/api/oauth/slack')           return handleSlackOAuth(req, res);
+    if (path === '/api/oauth/slack/callback')  return handleSlackOAuthCallback(req, res);
 
     return res.status(404).json({ success: false, message: `Unknown route: ${path}` });
 }
@@ -1875,6 +1877,145 @@ async function runSlackScheduledJob(db) {
     return out;
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// SLACK OAUTH (recommended path)
+// ════════════════════════════════════════════════════════════════════════════
+
+// GET /api/oauth/slack?email=…&origin=…[&ticket=…]
+async function handleSlackOAuth(req, res) {
+    const { email, origin } = req.query;
+    if (!email) return res.status(400).send('Missing email.');
+
+    if (!(await requireOAuthStarter(req, res, email))) return;
+    if (await gateOAuthFeature(req, res, email, origin, 'slackAgent')) return;
+
+    const clientId    = process.env.SLACK_CLIENT_ID;
+    const redirectUri = process.env.SLACK_REDIRECT_URI ||
+                        `https://${req.headers.host}/api/oauth/slack/callback`;
+    if (!clientId) return res.status(500).send('Missing SLACK_CLIENT_ID env var.');
+
+    const state = signOAuthState({ email, origin: origin || null, kind: 'oauth_callback' });
+    const url = new URL('https://slack.com/oauth/v2/authorize');
+    url.searchParams.set('client_id', clientId);
+    url.searchParams.set('redirect_uri', redirectUri);
+    url.searchParams.set('scope', [
+        'chat:write',
+        'chat:write.public',
+        'im:history',
+        'im:read',
+        'im:write',
+        'app_mentions:read',
+        'channels:history',
+        'groups:history',
+        'mpim:history',
+        'team:read',
+        'users:read',
+    ].join(','));
+    url.searchParams.set('state', state);
+
+    return res.redirect(302, url.toString());
+}
+
+// GET /api/oauth/slack/callback
+async function handleSlackOAuthCallback(req, res) {
+    const { code, state, error } = req.query;
+
+    const parsed = verifyOAuthState(state);
+    if (!parsed) return res.status(400).send('Invalid state parameter.');
+    const { email, origin } = parsed;
+
+    const appUrl = buildAppUrl(req, origin);
+    const failRedirect = (msg) => {
+        try {
+            const url = new URL(appUrl);
+            url.searchParams.set('slack_error', msg);
+            return res.redirect(302, url.toString());
+        } catch {
+            return res.status(400).send(`Slack connection failed: ${msg}`);
+        }
+    };
+
+    if (error) return failRedirect(String(error).substring(0, 200));
+    if (!code) return failRedirect('missing_code');
+
+    if (await gateOAuthFeature(req, res, email, origin, 'slackAgent')) return;
+
+    const clientId     = process.env.SLACK_CLIENT_ID;
+    const clientSecret = process.env.SLACK_CLIENT_SECRET;
+    const redirectUri  = process.env.SLACK_REDIRECT_URI ||
+                         `https://${req.headers.host}/api/oauth/slack/callback`;
+    if (!clientId || !clientSecret) {
+        console.error('[Slack/OAuth/Callback] Missing SLACK_CLIENT_ID or SLACK_CLIENT_SECRET.');
+        return failRedirect('oauth_not_configured');
+    }
+
+    try {
+        const tokenRes = await fetch('https://slack.com/api/oauth.v2.access', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+                client_id: clientId,
+                client_secret: clientSecret,
+                code,
+                redirect_uri: redirectUri,
+            }),
+        });
+        const tokens = await tokenRes.json().catch(() => ({}));
+        if (!tokens.ok || !tokens.access_token) {
+            console.error('[Slack/OAuth/Callback] Token exchange failed:', tokens.error || 'unknown');
+            return failRedirect(String(tokens.error || 'token_exchange_failed').substring(0, 200));
+        }
+
+        const teamId    = tokens.team?.id || tokens.team_id || null;
+        const teamName  = tokens.team?.name || teamId || 'Slack workspace';
+        const botUserId = tokens.bot_user_id || tokens.authed_user?.id || null;
+        const botToken  = tokens.access_token;
+
+        if (!teamId) return failRedirect('missing_team_id');
+
+        const db = getDb();
+
+        // One workspace can only be linked to one Mebor account.
+        const existing = await db.collection('user_secrets')
+            .where('integrations.slack.teamId', '==', teamId)
+            .limit(5)
+            .get();
+        let takenByOther = false;
+        existing.forEach(d => {
+            if (d.id !== email && d.data()?.integrations?.slack?.connected) takenByOther = true;
+        });
+        if (takenByOther) return failRedirect('workspace_already_connected');
+
+        await setUserSecrets(db, email, {
+            integrations: {
+                slack: {
+                    connected: true,
+                    accountLabel: teamName,
+                    teamId,
+                    botUserId,
+                    botTokenEnc: encryptCredential(botToken),
+                    connectedAt: new Date().toISOString(),
+                    authMethod: 'oauth',
+                },
+            },
+        });
+        await db.collection('users').doc(email).set({
+            integrations: { slack: publicIntegrationFlag(true) },
+        }, { merge: true });
+
+        try {
+            const url = new URL(appUrl);
+            url.searchParams.set('slack_connected', '1');
+            return res.redirect(302, url.toString());
+        } catch {
+            return res.status(200).send('Slack connected. You can close this tab.');
+        }
+    } catch (err) {
+        console.error('[Slack/OAuth/Callback]', err.message);
+        return failRedirect('server_error');
+    }
+}
+
 // POST /api/slack/connect-manual  { ownerEmail, botToken, teamId }
 async function handleSlackConnectManual(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
@@ -1930,6 +2071,7 @@ async function handleSlackConnectManual(req, res) {
                     botUserId: info.user_id || null,
                     botTokenEnc: encryptCredential(token),
                     connectedAt: new Date().toISOString(),
+                    authMethod: 'manual',
                 },
             },
         });
