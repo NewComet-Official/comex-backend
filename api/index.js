@@ -61,6 +61,8 @@ const PUBLIC_ROUTE_PREFIXES = [
     '/api/webhooks/whop',
     '/api/email/poll-worker',
     '/api/password-reset/',
+    '/api/shopify/webhook',
+    '/api/shopify/proxy',
 ];
 
 function isPublicRoute(path) {
@@ -261,6 +263,7 @@ const FEATURE_CATALOG = {
     telegramAgent:      { label: 'Telegram Channel',                        plans: ['teamplus', 'enterprise'] },
     googleChatAgent:    { label: 'Google Chat Channel (user-auth)',         plans: ['team', 'teamplus', 'enterprise'] },
     slackAgent:         { label: 'Slack Channel',                           plans: ['teamplus', 'enterprise'] },
+    shopifyAgent:       { label: 'Shopify Channel',                         plans: ['teamplus', 'enterprise'] },
     firebaseDatabase:   { label: 'Firebase Live Database Source',           plans: ['teamplus', 'enterprise'] },
     supabaseDatabase:   { label: 'Supabase Live Database Source',           plans: ['teamplus', 'enterprise'] },
     canvaDesign:        { label: 'Canva Design Import',                     plans: ['teamplus', 'enterprise'] },
@@ -271,7 +274,7 @@ const FEATURE_CATALOG = {
 const DB_SERVICE_FEATURE = { firebase: 'firebaseDatabase', supabase: 'supabaseDatabase' };
 const DESIGN_SERVICE_FEATURE = { canva: 'canvaDesign', figma: 'figmaDesign' };
 
-const ALL_CHANNELS = ['widget', 'email', 'telegram', 'googlechat', 'slack', 'helppage'];
+const ALL_CHANNELS = ['widget', 'email', 'telegram', 'googlechat', 'slack', 'shopify', 'helppage'];
 
 function normalizeChannels(botData) {
     let channels = Array.isArray(botData?.channels)
@@ -282,17 +285,19 @@ function normalizeChannels(botData) {
         const m = botData?.agentBuildMode || 'widget';
         const map = {
             widget: ['widget'], email: ['email'], telegram: ['telegram'],
-            googlechat: ['googlechat'], slack: ['slack'], helppage: ['helppage'],
+            googlechat: ['googlechat'], slack: ['slack'], shopify: ['shopify'], helppage: ['helppage'],
             both: ['widget', 'email'],
             'widget+telegram': ['widget', 'telegram'],
             'widget+googlechat': ['widget', 'googlechat'],
             'widget+helppage': ['widget', 'helppage'],
+            'widget+shopify': ['widget', 'shopify'],
             'email+telegram': ['email', 'telegram'],
             'email+googlechat': ['email', 'googlechat'],
             'email+helppage': ['email', 'helppage'],
             'telegram+helppage': ['telegram', 'helppage'],
             'googlechat+helppage': ['googlechat', 'helppage'],
-            all: ['widget', 'email', 'telegram', 'googlechat', 'slack', 'helppage'],
+            'shopify+helppage': ['shopify', 'helppage'],
+            all: ['widget', 'email', 'telegram', 'googlechat', 'slack', 'shopify', 'helppage'],
         };
         channels = map[m] || ['widget'];
     }
@@ -308,16 +313,19 @@ function deriveBuildMode(channels) {
     const c = channels || [];
     const w = c.includes('widget'), e = c.includes('email');
     const t = c.includes('telegram'), g = c.includes('googlechat'), sl = c.includes('slack');
+    const sh = c.includes('shopify');
     if (w && e && t && g) return 'all';
     if (w && e)      return 'both';
     if (w && t)      return 'widget+telegram';
     if (w && g)      return 'widget+googlechat';
+    if (w && sh)     return 'widget+shopify';
     if (e && t)      return 'email+telegram';
     if (e && g)      return 'email+googlechat';
     if (e)           return 'email';
     if (t)           return 'telegram';
     if (g)           return 'googlechat';
     if (sl)          return 'slack';
+    if (sh)          return 'shopify';
     return 'widget';
 }
 
@@ -458,6 +466,10 @@ function sanitizeBotDataForPlan(botData, limits) {
     if (!f.slackAgent && filtered.includes('slack')) {
         filtered = filtered.filter(c => c !== 'slack');
         stripped.push('slackAgent');
+    }
+    if (!f.shopifyAgent && filtered.includes('shopify')) {
+        filtered = filtered.filter(c => c !== 'shopify');
+        stripped.push('shopifyAgent');
     }
     if (!filtered.length) filtered = ['widget'];
 
@@ -1630,6 +1642,14 @@ if (_gchatRoutes[path]) {
     if (path === '/api/oauth/slack')           return handleSlackOAuth(req, res);
     if (path === '/api/oauth/slack/callback')  return handleSlackOAuthCallback(req, res);
 
+    // ── Shopify routes ──
+    if (path === '/api/oauth/shopify')             return handleShopifyOAuth(req, res);
+    if (path === '/api/oauth/shopify/callback')    return handleShopifyOAuthCallback(req, res);
+    if (path === '/api/shopify/status')            return handleShopifyStatus(req, res);
+    if (path === '/api/shopify/disconnect')        return handleShopifyDisconnect(req, res);
+    if (path === '/api/shopify/webhook')           return handleShopifyWebhook(req, res);
+    if (path === '/api/shopify/proxy')             return handleShopifyProxy(req, res);
+
     return res.status(404).json({ success: false, message: `Unknown route: ${path}` });
 }
 
@@ -2272,6 +2292,449 @@ async function handleSlackReject(req, res) {
         return res.status(500).json({ success: false, message: err.message });
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// SHOPIFY CHANNEL
+// ════════════════════════════════════════════════════════════════════════════
+
+const SHOPIFY_API_VERSION = '2024-10';
+
+function normalizeShopDomain(raw) {
+    let s = String(raw || '').trim().toLowerCase();
+    s = s.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+    if (!s.includes('.')) s = s + '.myshopify.com';
+    if (!/^[a-z0-9][a-z0-9-]*\.myshopify\.com$/.test(s)) return null;
+    return s;
+}
+
+function getShopifyScopes() {
+    return (process.env.SHOPIFY_SCOPES || 'read_orders,read_products,read_customers')
+        .split(',').map(s => s.trim()).filter(Boolean).join(',');
+}
+
+function verifyShopifyHmac(rawBody, hmacHeader, secret) {
+    if (!hmacHeader || !secret) return false;
+    const digest = crypto.createHmac('sha256', secret).update(rawBody).digest('base64');
+    const a = Buffer.from(digest);
+    const b = Buffer.from(String(hmacHeader));
+    if (a.length !== b.length) return false;
+    try { return crypto.timingSafeEqual(a, b); } catch { return false; }
+}
+
+async function readRawRequestBody(req) {
+    if (Buffer.isBuffer(req.rawBody)) return req.rawBody;
+    if (typeof req.rawBody === 'string') return Buffer.from(req.rawBody);
+    if (Buffer.isBuffer(req.body)) return req.body;
+    try {
+        const buf = await new Promise((resolve, reject) => {
+            const chunks = [];
+            req.on('data', c => chunks.push(c));
+            req.on('end', () => resolve(Buffer.concat(chunks)));
+            req.on('error', reject);
+        });
+        if (buf && buf.length) return buf;
+    } catch { /* fall through */ }
+    return Buffer.from(JSON.stringify(req.body || {}));
+}
+
+async function shopifyGraphql(shop, accessToken, query, variables) {
+    const url = `https://${shop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
+    const r = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'X-Shopify-Access-Token': accessToken,
+        },
+        body: JSON.stringify({ query, variables: variables || {} }),
+        signal: AbortSignal.timeout(10000),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(`Shopify GraphQL HTTP ${r.status}: ${JSON.stringify(data).substring(0, 300)}`);
+    if (Array.isArray(data.errors) && data.errors.length) {
+        throw new Error(`Shopify GraphQL errors: ${data.errors.map(e => e.message).join('; ')}`);
+    }
+    return data.data;
+}
+
+async function getShopifyProductSnapshot(shop, accessToken) {
+    try {
+        const data = await shopifyGraphql(shop, accessToken, `
+            query Products($first: Int!) {
+                products(first: $first, sortKey: UPDATED_AT, reverse: true) {
+                    edges {
+                        node {
+                            id title descriptionHtml productType vendor status
+                            priceRangeV2 { minVariantPrice { amount currencyCode } maxVariantPrice { amount currencyCode } }
+                            variants(first: 5) { edges { node { id title price sku inventoryQuantity } } }
+                        }
+                    }
+                }
+            }`, { first: 15 });
+        const products = (data?.products?.edges || []).map(e => e.node);
+        if (!products.length) return 'No products found in this store.';
+        return products.map(p => {
+            const price = p.priceRangeV2?.minVariantPrice;
+            const variants = (p.variants?.edges || []).map(v => v.node);
+            return `- ${p.title} (${p.productType || 'uncategorized'}, ${p.status}) — ${price ? `${price.amount} ${price.currencyCode}` : 'price N/A'}\n  ${(p.descriptionHtml || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').substring(0, 240)}\n  Variants: ${variants.map(v => `${v.title} (${v.price})${v.inventoryQuantity !== null && v.inventoryQuantity !== undefined ? ` · stock ${v.inventoryQuantity}` : ''}`).join(', ') || 'none'}`;
+        }).join('\n');
+    } catch (e) {
+        console.error('[Shopify/Products]', e.message);
+        return `(Could not read products: ${e.message})`;
+    }
+}
+
+async function getShopifyOrderSummary(shop, accessToken, customerEmail) {
+    if (!customerEmail) return null;
+    try {
+        const data = await shopifyGraphql(shop, accessToken, `
+            query CustomerOrders($q: String!, $first: Int!) {
+                customers(first: $first, query: $q) {
+                    edges {
+                        node {
+                            id displayName email
+                            orders(first: 5, sortKey: CREATED_AT, reverse: true) {
+                                edges {
+                                    node {
+                                        id name createdAt displayFulfillmentStatus displayFinancialStatus
+                                        totalPriceSet { shopMoney { amount currencyCode } }
+                                        lineItems(first: 5) { edges { node { title quantity } } }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }`, { q: `email:${customerEmail}`, first: 1 });
+        const customer = data?.customers?.edges?.[0]?.node;
+        if (!customer) return null;
+        const orders = (customer.orders?.edges || []).map(e => e.node);
+        return {
+            customerName: customer.displayName,
+            customerEmail: customer.email,
+            orders: orders.map(o => ({
+                name: o.name,
+                createdAt: o.createdAt,
+                fulfillment: o.displayFulfillmentStatus,
+                financial: o.displayFinancialStatus,
+                total: o.totalPriceSet?.shopMoney
+                    ? `${o.totalPriceSet.shopMoney.amount} ${o.totalPriceSet.shopMoney.currencyCode}`
+                    : null,
+                items: (o.lineItems?.edges || []).map(li => `${li.node.title} × ${li.node.quantity}`),
+            })),
+        };
+    } catch (e) {
+        console.error('[Shopify/Orders]', e.message);
+        return null;
+    }
+}
+
+// GET /api/oauth/shopify?email=…&shop=…&origin=…
+async function handleShopifyOAuth(req, res) {
+    const { email, shop, origin } = req.query;
+    if (!email) return res.status(400).send('Missing email.');
+    const shopDomain = normalizeShopDomain(shop);
+    if (!shopDomain) return res.status(400).send('Invalid Shopify shop domain.');
+
+    if (!(await requireOAuthStarter(req, res, email))) return;
+    if (await gateOAuthFeature(req, res, email, origin, 'shopifyAgent')) return;
+
+    const clientId    = process.env.SHOPIFY_API_KEY;
+    const redirectUri = process.env.SHOPIFY_REDIRECT_URI ||
+                        `https://${req.headers.host}/api/oauth/shopify/callback`;
+    if (!clientId) return res.status(500).send('Missing SHOPIFY_API_KEY env var.');
+
+    const state = signOAuthState({ email, shop: shopDomain, origin: origin || null, kind: 'oauth_callback' });
+    const url = new URL(`https://${shopDomain}/admin/oauth/authorize`);
+    url.searchParams.set('client_id',    clientId);
+    url.searchParams.set('scope',        getShopifyScopes());
+    url.searchParams.set('redirect_uri', redirectUri);
+    url.searchParams.set('state',        state);
+
+    return res.redirect(302, url.toString());
+}
+
+// GET /api/oauth/shopify/callback?code=…&shop=…&state=…&hmac=…
+async function handleShopifyOAuthCallback(req, res) {
+    const { code, shop, state, hmac } = req.query;
+    if (!code || !shop || !state) return res.status(400).send('Missing code, shop, or state.');
+
+    const parsed = verifyOAuthState(state);
+    if (!parsed) return res.status(400).send('Invalid state parameter.');
+    const { email, origin } = parsed;
+
+    const shopDomain = normalizeShopDomain(shop);
+    if (!shopDomain) return res.status(400).send('Invalid shop domain.');
+
+    // Verify Shopify's callback HMAC over sorted query params (excluding hmac/signature)
+    const secret = process.env.SHOPIFY_API_SECRET;
+    if (!secret) return res.status(500).send('Missing SHOPIFY_API_SECRET env var.');
+    if (hmac) {
+        const params = { ...req.query };
+        delete params.hmac;
+        delete params.signature;
+        const message = Object.keys(params).sort().map(k => `${k}=${Array.isArray(params[k]) ? params[k].join(',') : params[k]}`).join('&');
+        const digest = crypto.createHmac('sha256', secret).update(message).digest('hex');
+        const a = Buffer.from(digest);
+        const b = Buffer.from(String(hmac));
+        if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+            return res.status(401).send('Invalid Shopify HMAC.');
+        }
+    }
+
+    if (await gateOAuthFeature(req, res, email, origin, 'shopifyAgent')) return;
+
+    const appUrl = buildAppUrl(req, origin);
+    const failRedirect = (msg) => {
+        try {
+            const url = new URL(appUrl);
+            url.searchParams.set('shopify_error', String(msg).substring(0, 200));
+            return res.redirect(302, url.toString());
+        } catch {
+            return res.status(400).send(`Shopify connection failed: ${msg}`);
+        }
+    };
+
+    try {
+        const clientId     = process.env.SHOPIFY_API_KEY;
+        const clientSecret = process.env.SHOPIFY_API_SECRET;
+        if (!clientId || !clientSecret) return failRedirect('oauth_not_configured');
+
+        const tokenRes = await fetch(`https://${shopDomain}/admin/oauth/access_token`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ client_id: clientId, client_secret: clientSecret, code }),
+        });
+        const tokens = await tokenRes.json().catch(() => ({}));
+        if (!tokenRes.ok || !tokens.access_token) {
+            console.error('[Shopify/OAuth/Callback] Token exchange failed:', tokens);
+            return failRedirect(tokens.error || tokens.error_description || 'token_exchange_failed');
+        }
+
+        const db = getDb();
+
+        // One shop can only be linked to one Mebor account.
+        const existing = await db.collection('user_secrets')
+            .where('integrations.shopify.shop', '==', shopDomain)
+            .limit(5).get();
+        let takenByOther = false;
+        existing.forEach(d => {
+            if (d.id !== email && d.data()?.integrations?.shopify?.connected) takenByOther = true;
+        });
+        if (takenByOther) return failRedirect('shop_already_connected');
+
+        const scopes = String(tokens.scope || getShopifyScopes()).split(',').map(s => s.trim()).filter(Boolean);
+
+        await setUserSecrets(db, email, {
+            integrations: {
+                shopify: {
+                    connected: true,
+                    shop: shopDomain,
+                    accountLabel: shopDomain.replace('.myshopify.com', ''),
+                    accessTokenEnc: encryptCredential(tokens.access_token),
+                    scopes,
+                    connectedAt: new Date().toISOString(),
+                    authMethod: 'oauth',
+                },
+            },
+        });
+        await db.collection('users').doc(email).set({
+            integrations: { shopify: publicIntegrationFlag(true) },
+        }, { merge: true });
+
+        // Best-effort: register webhooks. Do not fail OAuth if this errors.
+        try {
+            const accessToken = tokens.access_token;
+            const webhookBase = (process.env.PUBLIC_BACKEND_URL || process.env.APP_URL || `https://${req.headers.host}`).replace(/\/+$/, '');
+            const topics = [
+                { topic: 'ORDERS_CREATE',   address: `${webhookBase}/api/shopify/webhook` },
+                { topic: 'ORDERS_UPDATED',  address: `${webhookBase}/api/shopify/webhook` },
+                { topic: 'CUSTOMERS_CREATE', address: `${webhookBase}/api/shopify/webhook` },
+                { topic: 'APP_UNINSTALLED', address: `${webhookBase}/api/shopify/webhook` },
+            ];
+            for (const t of topics) {
+                try {
+                    await shopifyGraphql(shopDomain, accessToken, `
+                        mutation RegisterWebhook($topic: WebhookSubscriptionTopic!, $address: URL!) {
+                            webhookSubscriptionCreate(topic: $topic, webhookSubscription: { callbackUrl: $address, format: JSON }) {
+                                userErrors { field message }
+                                webhookSubscription { id }
+                            }
+                        }`, { topic: t.topic, address: t.address });
+                } catch (e) {
+                    console.warn('[Shopify/WebhookRegister]', t.topic, e.message);
+                }
+            }
+        } catch (e) {
+            console.warn('[Shopify/WebhookRegister]', e.message);
+        }
+
+        try {
+            const url = new URL(appUrl);
+            url.searchParams.set('shopify_connected', '1');
+            return res.redirect(302, url.toString());
+        } catch {
+            return res.status(200).send('Shopify connected. You can close this tab.');
+        }
+    } catch (err) {
+        console.error('[Shopify/OAuth/Callback]', err.message);
+        return failRedirect('server_error');
+    }
+}
+
+// GET /api/shopify/status?ownerEmail=…
+async function handleShopifyStatus(req, res) {
+    const ownerEmail = String(req.query?.ownerEmail || '').trim();
+    if (!ownerEmail) return res.status(400).json({ success: false, connected: false, message: 'ownerEmail is required.' });
+
+    const auth = await requireAuth(req, res, { matches: [ownerEmail] });
+    if (!auth) return;
+
+    try {
+        const db = getDb();
+        const secrets = await getUserSecrets(db, ownerEmail);
+        const sh = secrets?.integrations?.shopify || null;
+        const connected = !!sh?.connected;
+        return res.json({
+            success: true,
+            connected,
+            accountLabel: connected ? (sh.accountLabel || sh.shop || null) : null,
+            shop: connected ? (sh.shop || null) : null,
+            scopes: connected ? (sh.scopes || []) : [],
+        });
+    } catch (err) {
+        console.error('[Shopify/Status]', err.message);
+        return res.status(200).json({ success: true, connected: false });
+    }
+}
+
+// POST /api/shopify/disconnect { ownerEmail }
+async function handleShopifyDisconnect(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { ownerEmail } = req.body || {};
+    if (!ownerEmail) return res.status(400).json({ success: false, message: 'Missing ownerEmail.' });
+
+    const auth = await requireAuth(req, res, { matches: [ownerEmail] });
+    if (!auth) return;
+
+    try {
+        const db = getDb();
+        await setUserSecrets(db, ownerEmail, { integrations: { shopify: null } });
+        await db.collection('users').doc(ownerEmail).set({
+            integrations: { shopify: publicIntegrationFlag(false) },
+        }, { merge: true });
+        return res.json({ success: true, message: 'Shopify disconnected.' });
+    } catch (err) {
+        console.error('[Shopify/Disconnect]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// POST /api/shopify/webhook  (public — verified via HMAC)
+async function handleShopifyWebhook(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ ok: false });
+
+    const secret = process.env.SHOPIFY_API_SECRET;
+    if (!secret) {
+        console.error('[Shopify/Webhook] SHOPIFY_API_SECRET is not set — rejecting.');
+        return res.status(500).json({ ok: false });
+    }
+
+    const rawBody = await readRawRequestBody(req);
+    const hmac = req.headers['x-shopify-hmac-sha256'];
+    if (!verifyShopifyHmac(rawBody, hmac, secret)) {
+        console.warn('[Shopify/Webhook] HMAC mismatch — rejecting.');
+        return res.status(401).json({ ok: false });
+    }
+
+    const topic = String(req.headers['x-shopify-topic'] || '');
+    const shop  = normalizeShopDomain(req.headers['x-shopify-shop-domain'] || '');
+    let payload = {};
+    try { payload = JSON.parse(rawBody.toString('utf8')); } catch { payload = {}; }
+
+    try {
+        const db = getDb();
+        if (topic === 'app/uninstalled') {
+            if (shop) {
+                const snap = await db.collection('user_secrets')
+                    .where('integrations.shopify.shop', '==', shop).limit(5).get();
+                for (const d of snap.docs) {
+                    if (d.data()?.integrations?.shopify?.connected) {
+                        await setUserSecrets(db, d.id, { integrations: { shopify: null } });
+                        await db.collection('users').doc(d.id).set({
+                            integrations: { shopify: publicIntegrationFlag(false) },
+                        }, { merge: true });
+                    }
+                }
+            }
+            return res.json({ ok: true });
+        }
+
+        // Persist events in a small store-owned collection for future analytics
+        if (shop) {
+            await db.collection('shopify_events').add({
+                shop, topic,
+                payload: { id: payload.id, admin_graphql_api_id: payload.admin_graphql_api_id || null },
+                receivedAt: new Date().toISOString(),
+            }).catch(() => {});
+        }
+
+        return res.json({ ok: true });
+    } catch (err) {
+        console.error('[Shopify/Webhook]', err.message);
+        return res.json({ ok: true });
+    }
+}
+
+// GET /api/shopify/proxy  (public — signature verified from query string)
+async function handleShopifyProxy(req, res) {
+    const { shop, signature, path_prefix, timestamp } = req.query;
+    const shopDomain = normalizeShopDomain(shop);
+    if (!shopDomain || !signature) return res.status(400).send('Invalid proxy request.');
+
+    const secret = process.env.SHOPIFY_API_SECRET;
+    if (!secret) return res.status(500).send('Missing SHOPIFY_API_SECRET.');
+
+    // Shopify app-proxy signature: sorted query string excluding `signature`
+    const params = { ...req.query };
+    delete params.signature;
+    const message = Object.keys(params).sort()
+        .map(k => `${k}=${Array.isArray(params[k]) ? params[k].join(',') : params[k]}`)
+        .join('');
+    const digest = crypto.createHmac('sha256', secret).update(message).digest('hex');
+    const a = Buffer.from(digest);
+    const b = Buffer.from(String(signature));
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+        return res.status(401).send('Invalid proxy signature.');
+    }
+
+    // Find which Mebor owner has this shop connected + their first shopify-enabled agent
+    try {
+        const db = getDb();
+        const snap = await db.collection('user_secrets')
+            .where('integrations.shopify.shop', '==', shopDomain).limit(5).get();
+        if (snap.empty) return res.status(404).send('Shop not connected.');
+
+        let ownerEmail = null;
+        for (const d of snap.docs) {
+            if (d.data()?.integrations?.shopify?.connected) { ownerEmail = d.id; break; }
+        }
+        if (!ownerEmail) return res.status(404).send('Shop not connected.');
+
+        const botsSnap = await db.collection('user_bots').where('owner', '==', ownerEmail).get();
+        let agent = null;
+        botsSnap.forEach(d => {
+            if (agent) return;
+            const b = d.data();
+            if (!b.deletedAt && normalizeChannels(b).includes('shopify')) {
+                agent = { id: d.id, data: b };
+            }
+        });
+        if (!agent) return res.status(404).send('No Shopify agent configured.');
+
+        const scriptUrl = `${(process.env.PUBLIC_BACKEND_URL || process.env.APP_URL || `https://${req.headers.host}`).replace(/\/+$/, '')}/widget.js`;
+        res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+        res.setHeader('Cache-Control', 'public, max-age=300');
+        return res.send(`(
 
 // ════════════════════════════════════════════════════════════════════════════
 // GET /api/models
@@ -5441,6 +5904,36 @@ async function generateBotReply({ db, businessId, userMsg, history = [], convers
                 .map(({ s, text }) => `--- ${s.service.toUpperCase()} project "${s.projectName || s.projectId}" ---\n${text}`)
                 .join('\n\n');
             sysPrompt += `\n\n[CONNECTED DATABASES — LIVE DATA SNAPSHOT]:\nBelow is a read-only, cached-up-to-5-min sample of data from the databases linked to this agent (limited number of collections/tables and rows). Use it to answer questions accurately. If something isn't shown in the sample, say you don't have visibility into it instead of guessing.\n\n${list}`;
+        }
+
+        // ── Shopify storefront context ──
+        if (ownerEmail && planLimits.features.shopifyAgent) {
+            try {
+                const secrets = await getUserSecrets(db, ownerEmail);
+                const sh = secrets?.integrations?.shopify;
+                if (sh?.connected && sh.accessTokenEnc) {
+                    const accessToken = decryptCredential(sh.accessTokenEnc);
+                    const shopDomain = sh.shop;
+                    const productsSnapshot = await getShopifyProductSnapshot(shopDomain, accessToken);
+                    let shopifyBlock = `[SHOPIFY STORE — ${shopDomain}]\nLive products (up to 15, most recently updated):\n${productsSnapshot}`;
+
+                    const emailMatch = String(userMsg).match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/);
+                    if (emailMatch) {
+                        const orders = await getShopifyOrderSummary(shopDomain, accessToken, emailMatch[0]);
+                        if (orders) {
+                            shopifyBlock += `\n\nCustomer lookup for ${orders.customerName || emailMatch[0]}:\n` +
+                                (orders.orders.length
+                                    ? orders.orders.map(o => `- ${o.name} (${o.createdAt?.slice(0,10)}) — ${o.total || 'N/A'} · fulfillment: ${o.fulfillment || 'n/a'} · payment: ${o.financial || 'n/a'}\n  Items: ${(o.items || []).join(', ') || 'none'}`).join('\n')
+                                    : 'No recent orders found for this customer.');
+                        }
+                    }
+
+                    shopifyBlock += `\n\nRules for Shopify answers:\n- Only quote real product names, prices, variant titles and order statuses that appear above.\n- If the customer asks about an order and their email is not in this conversation, politely ask for the email used at checkout.\n- Never invent stock numbers, delivery dates or refund eligibility.`;
+                    sysPrompt += `\n\n${shopifyBlock}`;
+                }
+            } catch (e) {
+                console.warn('[Chat/ShopifyContext]', e.message);
+            }
         }
     }
 
