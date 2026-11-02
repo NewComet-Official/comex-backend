@@ -83,14 +83,17 @@ function cors(req, res, path) {
 
     // Standard Auth routes
     if (origin) {
-        // If it's in the allowed list, allow it. If NOT, we still set the origin
-        // so the browser doesn't throw a generic 500, but the backend requireAuth will block it.
-        if (allowed.includes(origin)) {
+        // If it's in the allowed list OR it's a localhost/127.0.0.1 address OR the production domain, allow it.
+        const isLocal = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
+        const isProd = origin === 'https://meboragents.com' || origin === 'https://www.meboragents.com';
+        
+        if (allowed.includes(origin) || isLocal || isProd) {
             res.setHeader('Access-Control-Allow-Origin', origin);
             res.setHeader('Vary', 'Origin');
             res.setHeader('Access-Control-Allow-Credentials', 'true');
         } else {
-            // Fallback to prevent CORS 500 errors, but requireAuth will still 401/403.
+            // Fallback: Set the header anyway so the browser doesn't block the response.
+            // The backend's requireAuth will still safely reject unauthorized API calls.
             res.setHeader('Access-Control-Allow-Origin', origin);
             res.setHeader('Vary', 'Origin');
             res.setHeader('Access-Control-Allow-Credentials', 'true');
