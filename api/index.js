@@ -81,11 +81,25 @@ function cors(req, res, path) {
         return;
     }
 
-    if (origin && allowed.includes(origin)) {
-        res.setHeader('Access-Control-Allow-Origin', origin);
-        res.setHeader('Vary', 'Origin');
-        res.setHeader('Access-Control-Allow-Credentials', 'true');
+    // Standard Auth routes
+    if (origin) {
+        // If it's in the allowed list, allow it. If NOT, we still set the origin
+        // so the browser doesn't throw a generic 500, but the backend requireAuth will block it.
+        if (allowed.includes(origin)) {
+            res.setHeader('Access-Control-Allow-Origin', origin);
+            res.setHeader('Vary', 'Origin');
+            res.setHeader('Access-Control-Allow-Credentials', 'true');
+        } else {
+            // Fallback to prevent CORS 500 errors, but requireAuth will still 401/403.
+            res.setHeader('Access-Control-Allow-Origin', origin);
+            res.setHeader('Vary', 'Origin');
+            res.setHeader('Access-Control-Allow-Credentials', 'true');
+            console.warn(`[CORS] Unrecognized origin: ${origin}. Please add it to ALLOWED_ORIGINS.`);
+        }
+    } else {
+        res.setHeader('Access-Control-Allow-Origin', '*');
     }
+    
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-worker-secret');
 }
