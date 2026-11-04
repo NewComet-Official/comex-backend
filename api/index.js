@@ -5100,15 +5100,16 @@ async function handleDeploy(req, res) {
             lastRegisteredAt: priorTg.lastRegisteredAt || null,
         };
 
-        if (incomingChannels.includes('googlechat')) {
-            const gc = botData.googleChatConfig || {};
-            botData.googleChatConfig = {
-                requireHumanApproval: gc.requireHumanApproval !== false,
-                autoSendDelay: /^\d{1,3}:\d{2}:\d{2}$/.test(String(gc.autoSendDelay || ''))
-                    ? gc.autoSendDelay
-                    : '00:00:02',
-            };
-        }
+    if (incomingChannels.includes('googlechat')) {
+        const gc = botData.googleChatConfig || {};
+        botData.googleChatConfig = {
+            requireHumanApproval: gc.requireHumanApproval !== false,
+            autoSendDelay: /^\d{1,3}:\d{2}:\d{2}$/.test(String(gc.autoSendDelay || ''))
+                ? gc.autoSendDelay
+                : '00:00:02',
+            greetingMessage: gc.greetingMessage || 'Hello! I am your AI assistant. How can I help you today? (Type "help" for commands)'
+        };
+    }
 
         if (incomingChannels.includes('slack')) {
             const sc = botData.slackConfig || {};
