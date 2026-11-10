@@ -932,21 +932,68 @@
             <div style="padding:14px 16px;">${body}${c.footer ? `<div style="margin-top:10px;font-size:.72rem;opacity:.65;">${t(c.footer)}</div>` : ''}</div></div>`;
     }
 
+    // POST a widget submission to the backend. The backend reads the widget's
+    // `config.actions` and executes every mapped action (lead/appointment/email/webhook).
+    async function submitWidget(widget, values) {
+        const r = await fetch('https://comex-backend.vercel.app/api/widget/submit', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                businessId,
+                widgetId: widget.id,
+                values,
+                conversationId,
+            }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok || !data.success) throw new Error(data.message || 'Submission failed.');
+        return data;
+    }
+
     function appendWidget(def, ctx) {
         const row = document.createElement('div');
         row.className = 'cc-widget-row';
         row.innerHTML = widgetToHtml(def, ctx);
+
+        // Custom-HTML widgets keep their postMessage bridge.
         const _cf = row.querySelector('iframe.cw-custom');
         if (_cf) _cf.__send = t => { inputEl.value = t; sendMessage(); };
+
         const btn = row.querySelector('.cw-submit');
-        if (btn) btn.onclick = () => {
+        if (btn) btn.onclick = async () => {
             const v = {};
-            row.querySelectorAll('input[data-key]').forEach(i => { v[i.dataset.key] = i.value.trim(); });
-            if (!v.name || !v.contact || !v.date || !v.time) { btn.textContent = 'Please fill every field'; setTimeout(() => { btn.textContent = (def.config && def.config.button) || 'Submit'; }, 1600); return; }
+            row.querySelectorAll('input[data-key], textarea[data-key], select[data-key]')
+               .forEach(i => { v[i.dataset.key] = i.value.trim(); });
+
+            // Only the fields the widget actually declares are required.
+            const required = (def.config && def.config.fields) || [];
+            const missing = required.filter(f => !v[f.key] && f.type !== 'textarea');
+            if (missing.length) {
+                const original = btn.textContent;
+                btn.textContent = 'Please fill: ' + missing.map(f => f.label).join(', ');
+                setTimeout(() => { btn.textContent = original; }, 1800);
+                return;
+            }
+
             btn.disabled = true; btn.textContent = 'Sending…';
-            inputEl.value = `My name is ${v.name}. My contact is ${v.contact}. I'd like to book an appointment on ${v.date} at ${v.time}.`;
-            sendMessage();
+            try {
+                await submitWidget(def, v);
+                btn.textContent = '✓ Sent';
+                // No chat message — the widget itself is the acknowledgement.
+                if (def.category === 'appointment_form') {
+                    const banner = document.createElement('div');
+                    banner.className = 'cc-system-note';
+                    banner.textContent = 'Your details were submitted. A team member will follow up shortly.';
+                    chatBox.insertBefore(banner, typingEl);
+                    chatBox.scrollTop = chatBox.scrollHeight;
+                }
+            } catch (e) {
+                btn.disabled = false;
+                btn.textContent = 'Try again';
+                setTimeout(() => { btn.textContent = (def.config && def.config.button) || 'Submit'; }, 1800);
+            }
         };
+
         chatBox.insertBefore(row, typingEl);
         chatBox.scrollTop = chatBox.scrollHeight;
     }
@@ -962,7 +1009,11 @@
             appendWidget(first('appointment_booked'), { date: g(/Date:\s*(.+)/), time: g(/Time:\s*(.+)/), name: g(/Name:\s*(.+)/), contact: g(/Contact:\s*(.+)/) });
             return;
         }
-        if (first('appointment_form') && config.behaviorConfig.allowAppointmentBooking && /\b(book|appointment|schedule|reserve)\b/i.test(userMsg || '')) appendWidget(first('appointment_form'), {});
+        if (first('appointment_form') && config.behaviorConfig.allowAppointmentBooking && /\b(book|appointment|schedule|reserve)\b/i.test(userMsg || '')) {
+            // Short contextual line — never the full widget data, just the prompt.
+            appendMsg("Okay — fill in the form below and I'll book it for you.", false, { noRegenerate: true, noReport: true });
+            appendWidget(first('appointment_form'), {});
+        }
     }
 
     // ── Human handoff: poll for agent replies ────────────────────────────────
@@ -1288,8 +1339,21 @@
             }
 
             const reply = data.answer || data.reply || "Sorry, I couldn't process that.";
-            appendMsg(reply, false);
+
+            // If the reply is a structured "APPOINTMENT BOOKED" block AND a widget
+            // is configured for it, show the widget alone — not the raw block.
+            const isStructuredBooking = /APPOINTMENT BOOKED/.test(reply)
+                && ((config.uiWidgets && config.uiWidgets.appointment_booked) || []).length > 0;
+
+            // If the reply is the raw confirmation of a form submission, don't duplicate it.
+            const isEmptyEcho = !reply.trim() || /^\s*$/.test(reply);
+
+            if (!isStructuredBooking && !isEmptyEcho) {
+                appendMsg(reply, false);
+            }
+
             renderBotWidgets(reply, data, text);
+
             chatHistory.push({ role: 'assistant', content: reply });
             saveSession();
 
