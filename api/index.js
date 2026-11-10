@@ -269,6 +269,8 @@ const FEATURE_CATALOG = {
 };
 
 const DB_SERVICE_FEATURE = { firebase: 'firebaseDatabase', supabase: 'supabaseDatabase' };
+// Max chars of uploaded-file text injected into the system prompt per message (was 6000).
+const MAX_FILE_CONTEXT_CHARS = 25000;
 const DESIGN_SERVICE_FEATURE = { canva: 'canvaDesign', figma: 'figmaDesign' };
 
 const ALL_CHANNELS = ['widget', 'email', 'telegram', 'googlechat', 'slack', 'helppage'];
@@ -5422,7 +5424,7 @@ async function generateBotReply({ db, businessId, userMsg, history = [], convers
             sysPrompt += `\n\nThe website content above is the current source of truth. If earlier messages in this conversation contradict it, the website content is correct and the earlier messages are outdated.`;
         }
         if (kc.fileContents) {
-            sysPrompt += `\n\n[REFERENCE DOCUMENTS]:\n${String(kc.fileContents).substring(0, 6000)}`;
+            sysPrompt += `\n\n[REFERENCE DOCUMENTS]:\n${String(kc.fileContents).substring(0, MAX_FILE_CONTEXT_CHARS)}`;
         }
 
         const dbSources = (kc.databaseSources || []).filter(s => {
