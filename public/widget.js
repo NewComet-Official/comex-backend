@@ -896,7 +896,34 @@
         ctx = ctx || {};
         const raw = String((def.config || {}).html || '').replace(/\{\{(\w+)\}\}/g, (m, k) => ctx[k] !== undefined ? escW(ctx[k]) : '');
         const d = '<!doctype html><html><head><meta charset="utf-8"><style>html,body{margin:0;font-family:inherit}</style></head><body>' + raw +
-            '<script>window.sendToChat=function(t){parent.postMessage({ccSend:String(t)},"*")};function h(){parent.postMessage({ccHeight:document.documentElement.scrollHeight},"*")}try{new ResizeObserver(h).observe(document.body)}catch(e){}addEventListener("load",h);<\/script></body></html>';
+            '<script>' +
+            'window.sendToChat=function(t){parent.postMessage({ccSend:String(t)},"*")};' +
+            'function collectAndSubmit(root,btn){' +
+            'var fields={},emptyReq=false;' +
+            'var els=(root||document).querySelectorAll("input,select,textarea");' +
+            'els.forEach(function(el,idx){' +
+            'var t=(el.getAttribute("type")||"text").toLowerCase();' +
+            'if(["hidden","submit","button","reset","image"].indexOf(t)!==-1)return;' +
+            'var k=el.getAttribute("name")||el.getAttribute("data-key")||el.id||el.getAttribute("placeholder")||("field_"+(idx+1));' +
+            'k=String(k).trim().toLowerCase().replace(/[^a-z0-9_]+/g,"_").replace(/^_+|_+$/g,"")||("field_"+(idx+1));' +
+            'var v=t==="checkbox"?el.checked:(t==="radio"?(el.checked?el.value:undefined):el.value);' +
+            'if(v===undefined)return;' +
+            'if(el.hasAttribute("required")&&!String(v).trim())emptyReq=true;' +
+            'fields[k]=typeof v==="string"?v.trim():v;' +
+            '});' +
+            'if(emptyReq){if(btn){var o=btn.textContent;btn.textContent="Please fill required fields";setTimeout(function(){btn.textContent=o;},1500);}return;}' +
+            'if(btn){btn.disabled=true;btn.textContent="Saving…";}' +
+            'parent.postMessage({ccWidgetSubmit:{fields:fields}},"*");' +
+            '}' +
+            'document.addEventListener("submit",function(ev){ev.preventDefault();collectAndSubmit(ev.target,ev.target.querySelector("button[type=submit],input[type=submit],button"));});' +
+            'document.addEventListener("click",function(ev){' +
+            'var b=ev.target.closest("[data-cc-submit],button[type=submit]");' +
+            'if(b&&!b.closest("form")){ev.preventDefault();collectAndSubmit(document,b);}' +
+            'else if(!b){var anyBtn=ev.target.closest("button");if(anyBtn&&!anyBtn.getAttribute("onclick")&&!anyBtn.closest("form")&&document.querySelectorAll("input,select,textarea").length>0){ev.preventDefault();collectAndSubmit(document,anyBtn);}}' +
+            '});' +
+            'function h(){parent.postMessage({ccHeight:document.documentElement.scrollHeight},"*")}' +
+            'try{new ResizeObserver(h).observe(document.body)}catch(e){}addEventListener("load",h);' +
+            '<\/script></body></html>';
         return `<iframe class="cw-custom" sandbox="allow-scripts allow-forms" srcdoc="${d.replace(/&/g, '&amp;').replace(/"/g, '&quot;')}" style="width:100%;max-width:340px;height:120px;border:0;background:transparent;display:block;"></iframe>`;
     }
     window.addEventListener('message', e => {
@@ -905,6 +932,7 @@
         if (!fr) return;
         if (e.data.ccHeight) fr.style.height = Math.min(800, Math.max(40, e.data.ccHeight)) + 'px';
         if (typeof e.data.ccSend === 'string' && fr.__send) fr.__send(e.data.ccSend);
+        if (e.data.ccWidgetSubmit && fr.__submit) fr.__submit(e.data.ccWidgetSubmit.fields);
     });
 
 
@@ -932,37 +960,133 @@
             <div style="padding:14px 16px;">${body}${c.footer ? `<div style="margin-top:10px;font-size:.72rem;opacity:.65;">${t(c.footer)}</div>` : ''}</div></div>`;
     }
 
+    async function submitWidgetToDatabase(def, fields, rowEl) {
+        try {
+            const r = await fetch('https://comex-backend.vercel.app/api/widget/submit', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    businessId,
+                    conversationId,
+                    widgetId: def.id || null,
+                    widgetName: (def.config && def.config.title) || def.name || def.category,
+                    category: def.category || 'custom',
+                    fields,
+                }),
+            });
+            const data = await r.json();
+            const defs = config.uiWidgets || {};
+            const bookedDef = (defs.appointment_booked || [])[0];
+
+            // If this was an appointment booking and an appointment_booked widget exists, replace/show the booked widget directly without sending a chat message!
+            if (data.success && data._widget && data._widget.category === 'appointment_booked' && bookedDef) {
+                if (rowEl) rowEl.remove();
+                appendWidget(bookedDef, data._widget.ctx || fields);
+                saveSession();
+                return;
+            }
+
+            // Otherwise render a clean inline confirmation card in place of the form (no noisy user chat bubble!)
+            if (rowEl) {
+                const accent = colW(def.config && def.config.accent, themeColor);
+                rowEl.innerHTML = `<div class="cw-card" style="width:100%;background:#fff;color:#0f172a;border-radius:16px;border:1px solid ${accent}44;padding:16px;box-shadow:0 10px 26px -10px ${accent}44;">
+                    <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;color:${accent};font-weight:800;font-size:.92rem;">
+                        ${iconHtml('svg:check')} <span>Submitted &amp; Saved</span>
+                    </div>
+                    <div style="font-size:.8rem;color:#475569;line-height:1.5;">
+                        ${Object.entries(fields).map(([k, v]) => `<div><strong style="color:#0f172a;">${escW(k)}:</strong> ${escW(v)}</div>`).join('')}
+                    </div>
+                </div>`;
+            }
+            saveSession();
+        } catch (err) {
+            if (rowEl) {
+                const btn = rowEl.querySelector('.cw-submit');
+                if (btn) { btn.disabled = false; btn.textContent = 'Retry Submit'; }
+            }
+        }
+    }
+
     function appendWidget(def, ctx) {
         const row = document.createElement('div');
         row.className = 'cc-widget-row';
         row.innerHTML = widgetToHtml(def, ctx);
         const _cf = row.querySelector('iframe.cw-custom');
-        if (_cf) _cf.__send = t => { inputEl.value = t; sendMessage(); };
+        if (_cf) {
+            _cf.__send = t => { inputEl.value = t; sendMessage(); };
+            _cf.__submit = fields => submitWidgetToDatabase(def, fields, row);
+        }
         const btn = row.querySelector('.cw-submit');
         if (btn) btn.onclick = () => {
             const v = {};
-            row.querySelectorAll('input[data-key]').forEach(i => { v[i.dataset.key] = i.value.trim(); });
-            if (!v.name || !v.contact || !v.date || !v.time) { btn.textContent = 'Please fill every field'; setTimeout(() => { btn.textContent = (def.config && def.config.button) || 'Submit'; }, 1600); return; }
-            btn.disabled = true; btn.textContent = 'Sending…';
-            inputEl.value = `My name is ${v.name}. My contact is ${v.contact}. I'd like to book an appointment on ${v.date} at ${v.time}.`;
-            sendMessage();
+            let missing = false;
+            row.querySelectorAll('input[data-key], select[data-key], textarea[data-key]').forEach(i => {
+                v[i.dataset.key] = i.value.trim();
+                if (!v[i.dataset.key]) missing = true;
+            });
+            if (missing) {
+                btn.textContent = 'Please fill every field';
+                setTimeout(() => { btn.textContent = (def.config && def.config.button) || 'Submit'; }, 1600);
+                return;
+            }
+            btn.disabled = true;
+            btn.textContent = 'Saving…';
+            submitWidgetToDatabase(def, v, row);
         };
         chatBox.insertBefore(row, typingEl);
         chatBox.scrollTop = chatBox.scrollHeight;
     }
 
-    function renderBotWidgets(reply, data, userMsg) {
+    function resolveWidgetMatch(reply, data, userMsg) {
         const defs = config.uiWidgets || {};
         const first = c => (defs[c] || [])[0];
         const pick = (c, id) => (defs[c] || []).find(d => d.id === id) || first(c);
         const w = data && data._widget;
-        if (w && w.category && pick(w.category, w.id)) { appendWidget(pick(w.category, w.id), w.ctx || {}); return; }
+
+        // 1. Explicit backend _widget payload (e.g. appointment_booked or custom category)
+        if (w && w.category && pick(w.category, w.id)) {
+            const def = pick(w.category, w.id);
+            const ctxMsg = (def.config && def.config.contextMessage) || '';
+            return { def, ctx: w.ctx || {}, contextText: ctxMsg || null };
+        }
+
+        // 2. Appointment Booked confirmation text fallback -> suppress raw text, show only widget
         if (/APPOINTMENT BOOKED/.test(reply) && first('appointment_booked')) {
             const g = re => (reply.match(re) || [])[1] || '';
-            appendWidget(first('appointment_booked'), { date: g(/Date:\s*(.+)/), time: g(/Time:\s*(.+)/), name: g(/Name:\s*(.+)/), contact: g(/Contact:\s*(.+)/) });
-            return;
+            const def = first('appointment_booked');
+            return {
+                def,
+                ctx: { date: g(/Date:\s*(.+)/), time: g(/Time:\s*(.+)/), name: g(/Name:\s*(.+)/), contact: g(/Contact:\s*(.+)/) },
+                contextText: null,
+            };
         }
-        if (first('appointment_form') && config.behaviorConfig.allowAppointmentBooking && /\b(book|appointment|schedule|reserve)\b/i.test(userMsg || '')) appendWidget(first('appointment_form'), {});
+
+        // 3. Appointment Form trigger -> show short context intro + form widget (instead of long chatty questions)
+        if (first('appointment_form') && config.behaviorConfig.allowAppointmentBooking && /\b(book|appointment|schedule|reserve)\b/i.test(userMsg || '')) {
+            const def = first('appointment_form');
+            const customCtx = def.config && def.config.contextMessage;
+            return {
+                def,
+                ctx: {},
+                contextText: customCtx !== undefined && customCtx !== '' ? customCtx : 'Okay, fill the following form for booking:',
+            };
+        }
+
+        // 4. Unlimited custom categories matched by triggerKeywords
+        const msgLow = String(userMsg || '').toLowerCase();
+        for (const cat of Object.keys(defs)) {
+            if (['appointment_booked', 'appointment_form', 'human_joined'].includes(cat)) continue;
+            for (const def of (defs[cat] || [])) {
+                const kwRaw = (def.config && def.config.triggerKeywords) || '';
+                const kws = kwRaw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+                if (kws.length && kws.some(k => msgLow.includes(k))) {
+                    const ctxMsg = (def.config && def.config.contextMessage) || '';
+                    return { def, ctx: {}, contextText: ctxMsg || null };
+                }
+            }
+        }
+
+        return null;
     }
 
     // ── Human handoff: poll for agent replies ────────────────────────────────
@@ -1288,8 +1412,15 @@
             }
 
             const reply = data.answer || data.reply || "Sorry, I couldn't process that.";
-            appendMsg(reply, false);
-            renderBotWidgets(reply, data, text);
+            const matchedWidget = resolveWidgetMatch(reply, data, text);
+            if (matchedWidget) {
+                if (matchedWidget.contextText) {
+                    appendMsg(matchedWidget.contextText, false, { noRegenerate: true, noReport: true });
+                }
+                appendWidget(matchedWidget.def, matchedWidget.ctx);
+            } else {
+                appendMsg(reply, false);
+            }
             chatHistory.push({ role: 'assistant', content: reply });
             saveSession();
 
