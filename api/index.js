@@ -60,6 +60,7 @@ const PUBLIC_ROUTE_PREFIXES = [
     '/api/slack/events',
     '/api/webhooks/whop',
     '/api/email/poll-worker',
+    '/api/knowledge/ingest-worker',
     '/api/password-reset/',
 ];
 
@@ -1177,15 +1178,21 @@ async function syncBotWebsite(db, businessId, bot, { force = false } = {}) {
         return { error: msg };
     }
 
-    const mainText  = main.value.substring(0, 15000);
-    const linksText = extras
+    // Full text (capped generously) feeds the retrieval index; the short
+    // versions below are what small agents still stuff into the prompt.
+    const fullMain  = main.value.substring(0, RAG_MAX_SITE_CHARS);
+    const mainText  = fullMain.substring(0, 15000);
+    const linkBlocks = extras
         .map((e, i) => (e.status === 'fulfilled' && e.value.length >= 20)
-            ? `[Source: ${links[i]}]\n${e.value.substring(0, 4000)}`
+            ? { src: links[i], text: e.value.substring(0, RAG_MAX_LINK_CHARS) }
             : null)
-        .filter(Boolean)
+        .filter(Boolean);
+    const fullLinksText = linkBlocks.map(l => `[Source: ${l.src}]\n${l.text}`).join('\n\n');
+    const linksText = linkBlocks
+        .map(l => `[Source: ${l.src}]\n${l.text.substring(0, 4000)}`)
         .join('\n\n');
 
-    const hash = crypto.createHash('sha256').update(mainText + '||' + linksText).digest('hex');
+    const hash = crypto.createHash('sha256').update('v2||' + fullMain + '||' + fullLinksText).digest('hex');
 
     if (hash === bot.contextHash) {
         bot.lastSyncedAt = nowISO;
@@ -1201,7 +1208,496 @@ async function syncBotWebsite(db, businessId, bot, { force = false } = {}) {
         context: mainText, linksContext: linksText, contextHash: hash,
         lastSyncedAt: nowISO, lastSyncError: null,
     }, { merge: true });
+    await db.collection('bot_knowledge').doc(businessId).set({
+        siteText: fullMain, linksText: fullLinksText, updatedAt: nowISO,
+    }, { merge: true });
     return { changed: true };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// HYBRID KNOWLEDGE PIPELINE (stuff small knowledge bases, retrieve large ones)
+// ════════════════════════════════════════════════════════════════════════════
+// Small agents (< RAG_THRESHOLD_CHARS of total knowledge) keep the original
+// behaviour: everything is placed in the system prompt. Larger agents are
+// chunked, embedded and stored in Firestore (vector index), and only the top
+// chunks are injected per message, next to a short fixed business summary.
+//
+// Collections:
+//   bot_knowledge/{botId}      full scraped text (siteText, linksText) + ingest progress/lock
+//   knowledge_chunks/{id}      { botId, idx, title, text, runKey, embedding(vector) }
+// Fields written on user_bots/{botId}:
+//   ragKey, ragMode ('stuff' | 'rag'), ragStatus ('ready' | 'indexing' | 'error'),
+//   ragChunkCount, ragSummary, ragSources, ragIndexedAt, ragKickedAt
+//
+// Required one-time Firestore index (vector search with a botId pre-filter):
+//   gcloud firestore indexes composite create --project=<PROJECT> \
+//     --collection-group=knowledge_chunks --query-scope=COLLECTION \
+//     --field-config=field-path=botId,order=ASCENDING \
+//     --field-config=field-path=embedding,vector-config='{"dimension":"1536","flat":"{}"}'
+// Without that index retrieval transparently falls back to an in-memory cosine
+// scan of the agent's own chunks (slower, still correct).
+
+const RAG_THRESHOLD_CHARS      = Number(process.env.RAG_THRESHOLD_CHARS) || 12000;
+const RAG_CHUNK_TARGET_CHARS   = 2400;   // ≈ 600 tokens
+const RAG_CHUNK_MAX_CHARS      = 3200;   // ≈ 800 tokens
+const RAG_CHUNK_OVERLAP_CHARS  = 240;    // 10% of target
+const RAG_TOP_K                = 6;
+const RAG_MAX_SITE_CHARS       = 120000; // stored/indexed per site
+const RAG_MAX_LINK_CHARS       = 20000;  // stored/indexed per reference link
+const RAG_MAX_CHUNKS           = 3000;
+const RAG_EMBED_MODEL          = process.env.RAG_EMBED_MODEL || 'openai/text-embedding-3-small';
+const RAG_EMBED_BATCH          = 64;
+const RAG_WORKER_BUDGET_MS     = 40000;
+const RAG_DEPLOY_BUDGET_MS     = 20000;
+const RAG_KICK_COOLDOWN_MS     = 2 * 60 * 1000;
+const RAG_FILE_MARKER_RE       = /^=== FILE: (.+?) ===[ \t]*$/gm;
+
+const ragSha = (s) => crypto.createHash('sha1').update(String(s)).digest('hex');
+
+// ── Chunking ────────────────────────────────────────────────────────────────
+function ragTailOverlap(prev) {
+    if (!prev) return '';
+    const t = prev.slice(-RAG_CHUNK_OVERLAP_CHARS);
+    const sp = t.search(/\s/);
+    return sp > 0 ? t.slice(sp + 1) : t;
+}
+
+function ragChunkProse(text, title) {
+    const clean = String(text || '').replace(/\r/g, '').trim();
+    if (!clean) return [];
+    const hardMax = RAG_CHUNK_MAX_CHARS - RAG_CHUNK_OVERLAP_CHARS;
+
+    const units = [];
+    for (const line of clean.split(/\n+/).map(s => s.trim()).filter(Boolean)) {
+        if (line.length <= RAG_CHUNK_TARGET_CHARS) { units.push(line); continue; }
+        // Scraped website text is one long line: split on sentence boundaries.
+        const sentences = line.match(/[^.!?]+[.!?]+["')\]]*\s*|[^.!?]+$/g) || [line];
+        for (const s of sentences) {
+            let t = s.trim();
+            while (t.length > hardMax) {
+                let cut = t.lastIndexOf(' ', RAG_CHUNK_TARGET_CHARS);
+                if (cut < RAG_CHUNK_TARGET_CHARS / 2) cut = RAG_CHUNK_TARGET_CHARS;
+                units.push(t.slice(0, cut).trim());
+                t = t.slice(cut).trim();
+            }
+            if (t) units.push(t);
+        }
+    }
+
+    const bodies = [];
+    let cur = '';
+    for (const u of units) {
+        if (cur && cur.length + u.length + 1 > RAG_CHUNK_TARGET_CHARS) {
+            bodies.push(cur);
+            cur = (ragTailOverlap(cur) + ' ' + u).trim();
+        } else {
+            cur = cur ? `${cur} ${u}` : u;
+        }
+    }
+    if (cur) bodies.push(cur);
+    return bodies.map(b => ({ title, text: `[Source: ${title}]\n${b}` }));
+}
+
+// Spreadsheet / CSV text: every chunk repeats the column headers so a row is
+// never separated from what its columns mean.
+function ragChunkTable(text, title, sheetName) {
+    const lines = String(text || '').replace(/\r/g, '').split('\n').filter(l => l.trim());
+    if (lines.length < 2) return ragChunkProse(text, title);
+    let header = lines[0];
+    if (header.length > 600) header = header.slice(0, 600) + '…';
+    const label = sheetName ? `${title} › ${sheetName}` : title;
+    const prefix = `[Source: ${label}]\nColumns: ${header}\n`;
+    const room = Math.max(400, RAG_CHUNK_TARGET_CHARS - prefix.length);
+    const out = [];
+    let cur = [];
+    let curLen = 0;
+    const flush = () => { if (cur.length) { out.push({ title: label, text: prefix + cur.join('\n') }); cur = []; curLen = 0; } };
+    for (let row of lines.slice(1)) {
+        if (row.length > room) row = row.slice(0, room);
+        if (curLen + row.length + 1 > room) flush();
+        cur.push(row);
+        curLen += row.length + 1;
+    }
+    flush();
+    return out;
+}
+
+function ragChunkDocument(title, text, tableHint) {
+    const src = String(text || '');
+    if (/^Sheet: .+$/m.test(src)) {
+        const parts = src.split(/^Sheet: (.+)$/m); // [pre, name1, body1, name2, body2, ...]
+        const out = [...ragChunkProse(parts[0], title)];
+        for (let i = 1; i < parts.length; i += 2) out.push(...ragChunkTable(parts[i + 1] || '', title, parts[i].trim()));
+        return out;
+    }
+    if (tableHint) return ragChunkTable(src, title, null);
+    return ragChunkProse(src, title);
+}
+
+function ragSplitFiles(fileContents) {
+    const text = String(fileContents || '');
+    if (!text.trim()) return [];
+    const out = [];
+    const re = new RegExp(RAG_FILE_MARKER_RE.source, 'gm');
+    let last = 0, name = 'Uploaded documents', m;
+    const push = (n, body) => { if (body && body.trim()) out.push({ title: n, text: body.trim() }); };
+    while ((m = re.exec(text))) {
+        push(name, text.slice(last, m.index));
+        name = m[1].trim();
+        last = re.lastIndex;
+    }
+    push(name, text.slice(last));
+    return out;
+}
+
+// All knowledge of an agent as a list of titled sources.
+function ragBuildSources(bot, know) {
+    const sources = [];
+    const siteText = (know && know.siteText) || bot.context || '';
+    if (siteText) sources.push({ title: bot.url || 'Website', text: siteText, kind: 'site' });
+
+    const linksText = (know && know.linksText) || bot.linksContext || '';
+    if (linksText) {
+        for (const block of linksText.split(/\n\n(?=\[Source: )/)) {
+            const m = block.match(/^\[Source: ([^\]]+)\]\n([\s\S]*)$/);
+            if (m && m[2].trim()) sources.push({ title: m[1], text: m[2], kind: 'link' });
+        }
+    }
+
+    for (const f of ragSplitFiles(bot.knowledgeContext?.fileContents)) {
+        sources.push({ title: f.title, text: f.text, kind: 'file', table: /\.(csv|xlsx?|xls)$/i.test(f.title) });
+    }
+    return sources;
+}
+
+function ragBuildChunks(sources) {
+    const chunks = [];
+    for (const s of sources) {
+        for (const c of ragChunkDocument(s.title, s.text, s.table)) chunks.push(c);
+        if (chunks.length >= RAG_MAX_CHUNKS) break;
+    }
+    return chunks.slice(0, RAG_MAX_CHUNKS);
+}
+
+// Identity of the current knowledge: changes only when site/link text or files change.
+function ragComputeKey(bot) {
+    return ragSha(`${bot.contextHash || ''}|${ragSha(bot.knowledgeContext?.fileContents || '')}`);
+}
+
+// ── Embeddings (OpenRouter, same key as chat models) ────────────────────────
+async function ragEmbedTexts(texts) {
+    const apiKey = process.env.OPENROUTER_API_KEY;
+    if (!apiKey) throw new Error('OPENROUTER_API_KEY not set.');
+    let lastErr;
+    for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+            const r = await fetch('https://openrouter.ai/api/v1/embeddings', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${apiKey}`,
+                    'HTTP-Referer': process.env.APP_URL || 'https://meboragents.com',
+                    'X-Title': 'Mebor AI',
+                },
+                body: JSON.stringify({ model: RAG_EMBED_MODEL, input: texts }),
+                signal: AbortSignal.timeout(25000),
+            });
+            if (!r.ok) throw new Error(`Embeddings error ${r.status}: ${(await r.text()).substring(0, 200)}`);
+            const json = await r.json();
+            const rows = Array.isArray(json.data) ? [...json.data].sort((a, b) => (a.index ?? 0) - (b.index ?? 0)) : [];
+            if (rows.length !== texts.length || !rows.every(x => Array.isArray(x.embedding))) {
+                throw new Error('Embeddings response was malformed.');
+            }
+            return rows.map(x => x.embedding);
+        } catch (e) {
+            lastErr = e;
+            await new Promise(res => setTimeout(res, 400));
+        }
+    }
+    throw lastErr;
+}
+
+function ragVector(arr) {
+    const FV = admin.firestore.FieldValue;
+    return typeof FV.vector === 'function' ? FV.vector(arr) : arr;
+}
+const ragToArray = (v) => (v && typeof v.toArray === 'function') ? v.toArray() : (Array.isArray(v) ? v : []);
+
+function ragCosine(a, b) {
+    let dot = 0, na = 0, nb = 0;
+    const n = Math.min(a.length, b.length);
+    for (let i = 0; i < n; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+    return na && nb ? dot / (Math.sqrt(na) * Math.sqrt(nb)) : 0;
+}
+
+// ── Ingestion ───────────────────────────────────────────────────────────────
+async function ragDeleteChunks(db, businessId, { exceptRunKey = null } = {}) {
+    const snap = await db.collection('knowledge_chunks').where('botId', '==', businessId).select('runKey').get();
+    const stale = snap.docs.filter(d => !exceptRunKey || d.get('runKey') !== exceptRunKey);
+    for (let i = 0; i < stale.length; i += 400) {
+        const batch = db.batch();
+        stale.slice(i, i + 400).forEach(d => batch.delete(d.ref));
+        await batch.commit();
+    }
+    return stale.length;
+}
+
+async function ragMakeSummary(bot, sources) {
+    const titles = [...new Set(sources.map(s => s.title))].slice(0, 30);
+    const sample = sources.map(s => `## ${s.title}\n${String(s.text).slice(0, 900)}`).join('\n\n').slice(0, 6000);
+    try {
+        const modelKey = process.env.RAG_REWRITE_MODEL_KEY || process.env.FALLBACK_MODEL_KEY || 'gpt-4o-mini';
+        const msg = await callLLM({
+            modelKey,
+            messages: [
+                { role: 'system', content: 'You write short, factual business summaries for a customer-service assistant. Use only the material provided. Max 120 words, plain text, no preamble. Cover who the business is and the main things it offers.' },
+                { role: 'user', content: `Business: ${bot.displayName || bot.name || 'this business'}\nSources: ${titles.join('; ')}\n\nMaterial:\n${sample}` },
+            ],
+            maxTokens: 350,
+        });
+        const text = String(msg.content || '').trim();
+        if (text.length > 30) return text.slice(0, 1200);
+    } catch (e) {
+        console.warn('[RAG/Summary]', e.message);
+    }
+    const first = sources.find(s => s.kind === 'site') || sources[0];
+    return `${String(first?.text || '').slice(0, 700)}\n(Knowledge sources: ${titles.join('; ')})`;
+}
+
+// Idempotent and resumable: safe to call from deploy, the worker, or both.
+async function ensureKnowledgeIndex(db, businessId, { budgetMs = RAG_WORKER_BUDGET_MS, force = false } = {}) {
+    const startedAt = Date.now();
+    const botRef  = db.collection('user_bots').doc(businessId);
+    const knowRef = db.collection('bot_knowledge').doc(businessId);
+    const [botSnap, knowSnap] = await Promise.all([botRef.get(), knowRef.get()]);
+    if (!botSnap.exists) return { state: 'missing' };
+    const bot  = botSnap.data();
+    const know = knowSnap.exists ? knowSnap.data() : null;
+
+    const key = ragComputeKey(bot);
+    if (!force && bot.ragKey === key && bot.ragStatus === 'ready') return { state: 'ready', mode: bot.ragMode };
+
+    const lockUntil = know?.ingest?.lockUntil || 0;
+    if (!force && lockUntil > Date.now() && know?.ingest?.key === key) return { state: 'busy' };
+
+    const sources = ragBuildSources(bot, know);
+    const total = sources.reduce((n, s) => n + s.text.length, 0);
+
+    // Small knowledge base: keep the original "stuff everything in the prompt" mode.
+    if (total < RAG_THRESHOLD_CHARS) {
+        if (bot.ragChunkCount) await ragDeleteChunks(db, businessId);
+        await botRef.set({
+            ragKey: key, ragMode: 'stuff', ragStatus: 'ready', ragChunkCount: 0,
+            ragSummary: null, ragSources: [], ragIndexedAt: new Date().toISOString(),
+        }, { merge: true });
+        await knowRef.set({ ingest: admin.firestore.FieldValue.delete() }, { merge: true });
+        return { state: 'ready', mode: 'stuff', totalChars: total };
+    }
+
+    const chunks = ragBuildChunks(sources);
+    const ingestPrev = know?.ingest;
+    const resume = ingestPrev && ingestPrev.key === key && !force;
+    let next = resume ? (ingestPrev.nextChunk || 0) : 0;
+
+    if (!resume) {
+        await botRef.set({ ragStatus: 'indexing', ragError: null }, { merge: true });
+    }
+    const saveProgress = (extra = {}) => knowRef.set({
+        ingest: { key, nextChunk: next, total: chunks.length, startedAt: ingestPrev?.startedAt || new Date().toISOString(), lockUntil: Date.now() + budgetMs + 15000, ...extra },
+    }, { merge: true });
+    await saveProgress();
+
+    const idFor = (c) => `${businessId.replace(/[^\w-]/g, '_')}__${ragSha(`${RAG_EMBED_MODEL}|${c.text}`).slice(0, 24)}`;
+    const col = db.collection('knowledge_chunks');
+
+    try {
+        while (next < chunks.length && Date.now() - startedAt < budgetMs) {
+            const batch = chunks.slice(next, next + RAG_EMBED_BATCH);
+            const refs = batch.map(c => col.doc(idFor(c)));
+            const existing = await db.getAll(...refs);
+            const missingIdx = [];
+            existing.forEach((s, i) => { if (!s.exists) missingIdx.push(i); });
+
+            let vectors = [];
+            if (missingIdx.length) vectors = await ragEmbedTexts(missingIdx.map(i => batch[i].text));
+
+            const wb = db.batch();
+            batch.forEach((c, i) => {
+                const mi = missingIdx.indexOf(i);
+                if (mi === -1) {
+                    // Same text + same embedding model already stored: reuse, no embedding cost.
+                    wb.set(refs[i], { botId: businessId, idx: next + i, runKey: key }, { merge: true });
+                } else {
+                    wb.set(refs[i], {
+                        botId: businessId, idx: next + i, title: c.title, text: c.text,
+                        runKey: key, embedding: ragVector(vectors[mi]), createdAt: new Date().toISOString(),
+                    });
+                }
+            });
+            await wb.commit();
+            next += batch.length;
+            await saveProgress();
+        }
+    } catch (e) {
+        console.error('[RAG/Ingest]', e.message);
+        await botRef.set({ ragStatus: 'error', ragError: String(e.message).slice(0, 300) }, { merge: true });
+        await saveProgress({ lockUntil: 0, lastError: String(e.message).slice(0, 300) });
+        return { state: 'error', error: e.message, progress: `${next}/${chunks.length}` };
+    }
+
+    if (next < chunks.length) {
+        await saveProgress({ lockUntil: 0 });
+        return { state: 'indexing', progress: `${next}/${chunks.length}` };
+    }
+
+    // Finished: drop chunks from older versions, publish the new index.
+    await ragDeleteChunks(db, businessId, { exceptRunKey: key });
+    const summary = await ragMakeSummary(bot, sources);
+    await botRef.set({
+        ragKey: key, ragMode: 'rag', ragStatus: 'ready', ragError: null,
+        ragChunkCount: chunks.length, ragSummary: summary,
+        ragSources: [...new Set(sources.map(s => s.title))].slice(0, 50),
+        ragIndexedAt: new Date().toISOString(),
+    }, { merge: true });
+    await knowRef.set({ ingest: admin.firestore.FieldValue.delete() }, { merge: true });
+    return { state: 'ready', mode: 'rag', chunks: chunks.length, totalChars: total };
+}
+
+// ── Continuation worker (each call finishes inside the 60 s function limit) ──
+function ragWorkerSecret() {
+    return process.env.KNOWLEDGE_WORKER_SECRET || process.env.EMAIL_WORKER_SECRET || '';
+}
+
+async function ragDispatchWorker(businessId, baseUrl) {
+    const secret = ragWorkerSecret();
+    const base = (baseUrl || process.env.API_BASE_URL || process.env.APP_URL || '').replace(/\/$/, '');
+    if (!secret || !base) {
+        console.warn('[RAG] Cannot dispatch ingestion worker: set KNOWLEDGE_WORKER_SECRET (or EMAIL_WORKER_SECRET) and APP_URL/API_BASE_URL.');
+        return false;
+    }
+    try {
+        // Short timeout: we only need the request to be accepted; the worker keeps running on its own.
+        await fetch(`${base}/api/knowledge/ingest-worker`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-worker-secret': secret },
+            body: JSON.stringify({ businessId }),
+            signal: AbortSignal.timeout(1500),
+        });
+    } catch (e) { /* timeout is expected */ }
+    return true;
+}
+
+async function handleKnowledgeIngestWorker(req, res) {
+    const secret = ragWorkerSecret();
+    if (!secret) return res.status(500).json({ success: false, message: 'Worker secret not configured.' });
+    if (req.headers['x-worker-secret'] !== secret) return res.status(401).json({ success: false, message: 'Unauthorized.' });
+    const businessId = req.body?.businessId;
+    if (!businessId) return res.status(400).json({ success: false, message: 'Missing businessId.' });
+    try {
+        const db = getDb();
+        const result = await ensureKnowledgeIndex(db, businessId, { budgetMs: RAG_WORKER_BUDGET_MS });
+        if (result.state === 'indexing') await ragDispatchWorker(businessId, getPublicBaseUrl(req));
+        return res.json({ success: true, ...result });
+    } catch (err) {
+        console.error('[RAG/Worker]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// Authenticated: owner can check status or force a rebuild.
+async function handleKnowledgeReindex(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { businessId, force } = req.body || {};
+    if (!businessId) return res.status(400).json({ success: false, message: 'Missing businessId.' });
+    const auth = await requireAuth(req, res);
+    if (!auth) return;
+    try {
+        const db = getDb();
+        const snap = await db.collection('user_bots').doc(businessId).get();
+        if (!snap.exists) return res.status(404).json({ success: false, message: 'Agent not found.' });
+        const ctx = await resolveOwnerContext(db, auth.email);
+        if (snap.data()?.owner !== ctx.ownerEmail) return res.status(403).json({ success: false, message: 'You do not own this agent.' });
+        const result = await ensureKnowledgeIndex(db, businessId, { budgetMs: RAG_DEPLOY_BUDGET_MS, force: !!force });
+        if (result.state === 'indexing') await ragDispatchWorker(businessId, getPublicBaseUrl(req));
+        return res.json({ success: true, ...result });
+    } catch (err) {
+        console.error('[RAG/Reindex]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ── Query time ──────────────────────────────────────────────────────────────
+async function ragRewriteQuery(userMsg, history) {
+    const recent = (history || []).slice(-6);
+    if (!recent.length) return userMsg;
+    const looksContextual = userMsg.length < 80 ||
+        /\b(it|its|this|that|they|them|their|those|these|he|she|there|one|ones|more|also|too|what about|how about)\b/i.test(userMsg);
+    if (!looksContextual) return userMsg;
+    try {
+        const transcript = recent.map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content.slice(0, 400)}`).join('\n');
+        const msg = await callLLM({
+            modelKey: process.env.RAG_REWRITE_MODEL_KEY || process.env.FALLBACK_MODEL_KEY || 'gpt-4o-mini',
+            messages: [
+                { role: 'system', content: 'Rewrite the user\'s latest message as one standalone search query that can be understood without the conversation. Resolve pronouns and references. Output only the query, no quotes, no explanation.' },
+                { role: 'user', content: `Conversation:\n${transcript}\n\nLatest message: ${userMsg}\n\nStandalone query:` },
+            ],
+            maxTokens: 120,
+        });
+        const q = String(msg.content || '').trim().replace(/^["'`]+|["'`]+$/g, '');
+        if (q && q.length <= 500) return q;
+    } catch (e) {
+        console.warn('[RAG/Rewrite]', e.message);
+    }
+    const lastUser = [...recent].reverse().find(m => m.role === 'user')?.content || '';
+    return `${lastUser.slice(0, 300)} ${userMsg}`.trim();
+}
+
+async function ragRetrieve(db, businessId, query, k = RAG_TOP_K) {
+    const [qVec] = await ragEmbedTexts([query]);
+    const base = db.collection('knowledge_chunks').where('botId', '==', businessId);
+
+    if (typeof base.findNearest === 'function') {
+        try {
+            const snap = await base.findNearest({
+                vectorField: 'embedding',
+                queryVector: ragVector(qVec),
+                limit: k,
+                distanceMeasure: 'COSINE',
+            }).get();
+            if (!snap.empty) return snap.docs.map(d => ({ title: d.get('title'), text: d.get('text'), idx: d.get('idx') }));
+        } catch (e) {
+            console.warn('[RAG/Retrieve] vector search unavailable, using fallback scan:', e.message);
+        }
+    }
+
+    const snap = await base.limit(RAG_MAX_CHUNKS).get();
+    return snap.docs
+        .map(d => ({ title: d.get('title'), text: d.get('text'), idx: d.get('idx'), score: ragCosine(qVec, ragToArray(d.get('embedding'))) }))
+        .sort((a, b) => b.score - a.score)
+        .slice(0, k);
+}
+
+function ragFormatContext(summary, chunks) {
+    let out = '';
+    if (summary) out += `\n\n[BUSINESS SUMMARY]:\n${summary}`;
+    out += `\n\n[RETRIEVED KNOWLEDGE — the excerpts from this business's website, links and documents that best match the user's question]:\n` +
+        chunks.map((c, i) => `--- Excerpt ${i + 1} ---\n${c.text}`).join('\n\n');
+    out += `\n\nThe summary and excerpts above are your knowledge about this business. Only part of the full knowledge base is shown for each question. If the answer is not in them, say you don't have that information instead of guessing.`;
+    return out;
+}
+
+// Original behaviour: whole knowledge placed in the prompt (used for small agents and as fallback).
+function stuffedKnowledgeSection(b, kc) {
+    let s = '';
+    if (b.context) {
+        s += `\n\n[WEBSITE CONTENT — LIVE, last synced ${b.lastSyncedAt || 'at deploy time'}]:\n${b.context}`;
+        if (b.linksContext) s += `\n\n[REFERENCE LINKS — LIVE]:\n${b.linksContext}`;
+        s += `\n\nThe website content above is the current source of truth. If earlier messages in this conversation contradict it, the website content is correct and the earlier messages are outdated.`;
+    }
+    if (kc.fileContents) {
+        s += `\n\n[REFERENCE DOCUMENTS]:\n${String(kc.fileContents).substring(0, MAX_FILE_CONTEXT_CHARS)}`;
+    }
+    return s;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1528,6 +2024,7 @@ export default async function handler(req, res) {
     if (path.startsWith('/api/telegram/webhook/')) return handleTelegramWebhook(req, res, path);
     if (path === '/api/webhooks/whop')            return handleWhopWebhook(req, res);
     if (path === '/api/email/poll-worker')        return handleEmailPollWorker(req, res);
+    if (path === '/api/knowledge/ingest-worker')  return handleKnowledgeIngestWorker(req, res);
     if (path === '/api/google-chat/webhook')      return handleGoogleChatWebhook(req, res);
     if (path === '/api/slack/events')             return handleSlackWebhook(req, res);
     if (path === '/api/password-reset/request')   return handlePasswordResetRequest(req, res);
@@ -1538,6 +2035,7 @@ export default async function handler(req, res) {
     if (path === '/api/oauth/ticket')             return handleOAuthTicket(req, res);
     if (path === '/api/email-verification/send')  return handleEmailVerificationSend(req, res);
     if (path === '/api/scrape')                   return handleScrape(req, res);
+    if (path === '/api/knowledge/reindex')        return handleKnowledgeReindex(req, res);
     if (path === '/api/deploy')                   return handleDeploy(req, res);
     if (path === '/api/calculate-roi')            return handleROI(req, res);
     if (path === '/api/analytics/advanced')       return handleAdvancedAnalytics(req, res);
@@ -3104,6 +3602,8 @@ async function wipeBotCompletely(db, botId) {
     await deleteQueryBatch(db, db.collection('email_drafts').where('businessId', '==', botId));
     await deleteQueryBatch(db, db.collection('email_queue').where('businessId', '==', botId));
     await deleteQueryBatch(db, db.collection('telegram_sessions').where('businessId', '==', botId));
+    await deleteQueryBatch(db, db.collection('knowledge_chunks').where('botId', '==', botId));
+    await db.collection('bot_knowledge').doc(botId).delete().catch(() => {});
 
     await botRef.delete().catch(() => {});
 }
@@ -5197,10 +5697,21 @@ async function handleDeploy(req, res) {
             } catch (e) { console.warn('[Deploy/Telegram/deleteWebhook]', e.message); }
         }
 
+        // Build (or skip) the retrieval index for this agent's knowledge. Resumes
+        // through the ingestion worker if it can't finish inside this request.
+        let knowledgeIndex = null;
+        try {
+            knowledgeIndex = await ensureKnowledgeIndex(db, botData.id, { budgetMs: RAG_DEPLOY_BUDGET_MS });
+            if (knowledgeIndex.state === 'indexing') await ragDispatchWorker(botData.id, getPublicBaseUrl(req));
+        } catch (ragErr) {
+            console.warn('[Deploy/KnowledgeIndex]', ragErr.message);
+        }
+
         const agentsUsed = await countActiveAgents(db, ctx.ownerEmail);
         return res.status(200).json({
             success: true,
             botId: botData.id,
+            knowledgeIndex,
             agents: { used: agentsUsed, limit: limits.maxAgents, remaining: Math.max(0, limits.maxAgents - agentsUsed) },
             plan: { tier: limits.tier, label: limits.label },
             modelKey: botData.modelKey,
@@ -5251,21 +5762,25 @@ async function handleScrape(req, res) {
             return res.status(400).json({ success: false, message: 'That URL is not allowed.' });
         }
 
-        const text = (await fetchPageText(url, 12000)).substring(0, 15000);
-        if (text.length < 20) throw new Error('Could not extract text from this URL.');
+        const fullText = (await fetchPageText(url, 12000)).substring(0, RAG_MAX_SITE_CHARS);
+        if (fullText.length < 20) throw new Error('Could not extract text from this URL.');
+        const text = fullText.substring(0, 15000);
 
         const nowISO = new Date().toISOString();
         const update = {
             url,
             context: text,
-            contextHash: crypto.createHash('sha256').update(text + '||').digest('hex'),
+            contextHash: crypto.createHash('sha256').update('v2||' + fullText + '||').digest('hex'),
             lastSyncedAt: nowISO,
             lastSyncCheckAt: nowISO,
             lastSyncError: null,
         };
         if (customInstructions) update.knowledgeContext = { systemPrompt: customInstructions };
         await db.collection('user_bots').doc(businessId).set(update, { merge: true });
-        return res.status(200).json({ success: true, message: `Scraped ${text.length} chars.`, snippet: text.substring(0, 200) });
+        await db.collection('bot_knowledge').doc(businessId).set({
+            siteText: fullText, linksText: '', updatedAt: nowISO,
+        }, { merge: true });
+        return res.status(200).json({ success: true, message: `Scraped ${fullText.length} chars.`, snippet: text.substring(0, 200) });
     } catch (err) {
         console.error('[Scrape]', err.message);
         return res.status(500).json({ success: false, message: err.message });
@@ -5379,6 +5894,7 @@ async function generateBotReply({ db, businessId, userMsg, history = [], convers
     let agentActionsList = [];
     let pinnedQA = [], personality = 'default', toolsConfig = {};
     let planLimits = resolvePlanLimits({});
+    let ragMode = false, ragSummary = '', needsKnowledgeKick = false, stuffedFallback = '';
     let behaviorConfig = {
         allowOutOfTopic: true,
         allowWebSearch: true,
@@ -5412,20 +5928,25 @@ async function generateBotReply({ db, businessId, userMsg, history = [], convers
         try { await syncBotWebsite(db, businessId, b); }
         catch (e) { console.warn('[Chat/Sync]', e.message); }
 
+        // Hybrid knowledge: retrieval mode only once an index exists for this agent.
+        ragMode = b.ragMode === 'rag' && (b.ragChunkCount || 0) > 0;
+        ragSummary = b.ragSummary || '';
+        if (b.ragKey !== ragComputeKey(b) &&
+            Date.now() - (b.ragKickedAt ? new Date(b.ragKickedAt).getTime() : 0) > RAG_KICK_COOLDOWN_MS) {
+            needsKnowledgeKick = true;
+        }
+
         const kc   = b.knowledgeContext || {};
         if (kc.systemPrompt) {
             sysPrompt = kc.systemPrompt;
         } else {
             sysPrompt = `You are a helpful, friendly customer service assistant for "${botName}". Use the business information below to answer questions accurately.`;
         }
-        if (b.context) {
-            sysPrompt += `\n\n[WEBSITE CONTENT — LIVE, last synced ${b.lastSyncedAt || 'at deploy time'}]:\n${b.context}`;
-            if (b.linksContext) sysPrompt += `\n\n[REFERENCE LINKS — LIVE]:\n${b.linksContext}`;
-            sysPrompt += `\n\nThe website content above is the current source of truth. If earlier messages in this conversation contradict it, the website content is correct and the earlier messages are outdated.`;
-        }
-        if (kc.fileContents) {
-            sysPrompt += `\n\n[REFERENCE DOCUMENTS]:\n${String(kc.fileContents).substring(0, MAX_FILE_CONTEXT_CHARS)}`;
-        }
+        // Small agents: stuff everything (original behaviour). Large agents: the
+        // summary + retrieved excerpts are added after the pinned-answer and
+        // credit checks, so those paths never pay for an embedding call.
+        stuffedFallback = stuffedKnowledgeSection(b, kc);
+        if (!ragMode) sysPrompt += stuffedFallback;
 
         const dbSources = (kc.databaseSources || []).filter(s => {
             const featureKey = DB_SERVICE_FEATURE[s?.service];
@@ -5541,6 +6062,23 @@ async function generateBotReply({ db, businessId, userMsg, history = [], convers
         warning: creditState.warning,
     };
     meta._credits = creditMeta;
+
+    if (needsKnowledgeKick) {
+        db.collection('user_bots').doc(businessId).set({ ragKickedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
+        await ragDispatchWorker(businessId);
+    }
+    if (ragMode) {
+        try {
+            const standalone = await ragRewriteQuery(userMsg, safeHistory);
+            const hits = await ragRetrieve(db, businessId, standalone);
+            if (!hits.length) throw new Error('no chunks retrieved');
+            sysPrompt += ragFormatContext(ragSummary, hits);
+            meta._rag = { query: standalone, chunks: hits.length };
+        } catch (e) {
+            console.error('[Chat/RAG]', e.message);
+            sysPrompt += stuffedFallback; // never leave the agent without knowledge
+        }
+    }
 
     const msgLower = userMsg.toLowerCase().trim();
 
