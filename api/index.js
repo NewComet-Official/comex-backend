@@ -1247,8 +1247,9 @@ const RAG_MAX_LINK_CHARS       = 20000;  // stored/indexed per reference link
 const RAG_MAX_CHUNKS           = 3000;
 const RAG_EMBED_MODEL          = process.env.RAG_EMBED_MODEL || 'openai/text-embedding-3-small';
 const RAG_EMBED_BATCH          = 64;
-const RAG_WORKER_BUDGET_MS     = 40000;
-const RAG_DEPLOY_BUDGET_MS     = 20000;
+// Defaults are safe for a 10 s function limit (Vercel Hobby). Raise via env on Pro.
+const RAG_WORKER_BUDGET_MS     = Number(process.env.RAG_WORKER_BUDGET_MS) || 7000;
+const RAG_DEPLOY_BUDGET_MS     = Number(process.env.RAG_DEPLOY_BUDGET_MS) || 4000;
 const RAG_KICK_COOLDOWN_MS     = 2 * 60 * 1000;
 const RAG_FILE_MARKER_RE       = /^=== FILE: (.+?) ===[ \t]*$/gm;
 
@@ -1548,6 +1549,13 @@ async function ensureKnowledgeIndex(db, businessId, { budgetMs = RAG_WORKER_BUDG
     if (next < chunks.length) {
         await saveProgress({ lockUntil: 0 });
         return { state: 'indexing', progress: `${next}/${chunks.length}` };
+    }
+
+    // Finalizing (summary LLM call) needs a few seconds; if this invocation has
+    // used most of its budget, let the next worker call finish it.
+    if (Date.now() - startedAt > budgetMs * 0.7) {
+        await saveProgress({ lockUntil: 0 });
+        return { state: 'indexing', progress: 'finalizing' };
     }
 
     // Finished: drop chunks from older versions, publish the new index.
