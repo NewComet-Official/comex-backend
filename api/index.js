@@ -51,6 +51,7 @@ function getAllowedOrigins() {
 // P0-1: public endpoints must be callable from any customer website.
 const PUBLIC_ROUTE_PREFIXES = [
     '/api/chat',
+    '/api/widget/submit',
     '/api/config',
     '/api/models',
     '/api/human/',
@@ -2026,6 +2027,8 @@ export default async function handler(req, res) {
 
     // ── Public routes (no auth) ──
     if (path === '/api/chat')                     return handleChat(req, res);
+    if (path === '/api/widget/submit')            return handleWidgetSubmit(req, res);
+    if (path === '/api/widget/generate')          return handleWidgetGenerate(req, res);
     if (path === '/api/config')                   return handleConfig(req, res);
     if (path === '/api/models')                   return handleModels(req, res);
     if (path === '/api/promo/validate')           return handlePromoValidate(req, res);
@@ -2778,6 +2781,242 @@ async function handleSlackReject(req, res) {
     } catch (err) {
         console.error('[Slack/Reject]', err.message);
         return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/widget/submit  (Direct Database Connection for Custom HTML & Forms)
+// ════════════════════════════════════════════════════════════════════════════
+async function handleWidgetSubmit(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { businessId, conversationId, widgetId, widgetName, category, fields = {} } = req.body || {};
+    if (!businessId || !fields || typeof fields !== 'object') {
+        return res.status(400).json({ success: false, message: 'Missing businessId or fields.' });
+    }
+
+    try {
+        const db = getDb();
+        const botSnap = await db.collection('user_bots').doc(businessId).get();
+        if (!botSnap.exists) return res.status(404).json({ success: false, message: 'Agent not found.' });
+        const bot = botSnap.data();
+        const ownerEmail = bot.owner || '';
+        const botName = bot.displayName || bot.name || 'Assistant';
+        const convId = conversationId || `conv-${Date.now()}`;
+
+        // Normalize keys so custom HTML inputs with any name/id/label map cleanly
+        const norm = {};
+        for (const [k, v] of Object.entries(fields)) {
+            norm[String(k).toLowerCase().replace(/[^a-z0-9]/g, '')] = String(v ?? '').trim();
+        }
+        const pick = (...keys) => {
+            for (const k of keys) {
+                if (norm[k]) return norm[k];
+            }
+            for (const [k, v] of Object.entries(norm)) {
+                if (v && keys.some( cand => k.includes(cand) )) return v;
+            }
+            return '';
+        };
+
+        const nameVal    = pick('name', 'fullname', 'username', 'customername', 'first');
+        const contactVal = pick('contact', 'email', 'phone', 'mobile', 'tel', 'whatsapp');
+        const dateVal    = pick('date', 'day', 'appointmentday', 'scheduleddate', 'preferreddate');
+        const timeVal    = pick('time', 'slot', 'appointmenttime', 'preferredtime', 'hour');
+        const noteVal    = pick('note', 'message', 'reason', 'issue', 'details', 'comment', 'feedback', 'query');
+
+        const nowISO = new Date().toISOString();
+
+        // 1. Always store the raw structured submission in widget_submissions
+        const submissionDoc = {
+            businessId,
+            botName,
+            owner: ownerEmail,
+            conversationId: convId,
+            widgetId: widgetId || null,
+            widgetName: widgetName || category || 'Custom Widget',
+            category: category || 'custom',
+            fields,
+            createdAt: nowISO,
+        };
+        const subRef = await db.collection('widget_submissions').add(submissionDoc);
+        await db.collection('user_bots').doc(businessId).collection('widget_submissions').doc(subRef.id).set(submissionDoc);
+
+        // 2. If it's an appointment form (or has date + time + name/contact), book the appointment directly in DB
+        const isAppointment = category === 'appointment_form' || (dateVal && timeVal && (nameVal || contactVal));
+        if (isAppointment && dateVal && timeVal) {
+            const dateISO = resolveDay(dateVal);
+            const appt = {
+                businessId,
+                botName,
+                owner: ownerEmail,
+                conversationId: convId,
+                customerName: nameVal || 'Guest',
+                contactInfo: contactVal || 'Not provided',
+                appointmentDay: dateVal,
+                appointmentTime: timeVal,
+                scheduledDate: dateISO,
+                extraFields: fields,
+                status: 'confirmed',
+                createdAt: nowISO,
+                googleCalendarEvents: [],
+            };
+
+            const apptDocRef = await db.collection('appointments').add(appt);
+            await db.collection('user_bots').doc(businessId).collection('appointments').add({ ...appt, globalId: apptDocRef.id });
+
+            if (ownerEmail) {
+                try {
+                    const ownerSnap = await db.collection('users').doc(ownerEmail).get();
+                    const planLimits = resolvePlanLimits(ownerSnap.exists ? ownerSnap.data() : {});
+                    if (planLimits.features.googleCalendar) {
+                        const bookingAccounts = bookingEnabledAccounts(await getGoogleCalendarAccounts(db, ownerEmail));
+                        const createdEvents = [];
+                        for (const acct of bookingAccounts) {
+                            try {
+                                const calResult = await addCalendarEvent(acct, appt, ownerEmail, db);
+                                if (calResult?.eventId) createdEvents.push({ accountEmail: acct.email, eventId: calResult.eventId });
+                            } catch (e) { console.error('[WidgetSubmit/Calendar]', e.message); }
+                        }
+                        if (createdEvents.length) await apptDocRef.update({ googleCalendarEvents: createdEvents });
+                    }
+                    await sendFCMToUser(ownerEmail, buildBookingNotification(appt)).catch(() => {});
+                } catch (e) { console.error('[WidgetSubmit/Notify]', e.message); }
+            }
+
+            await logChat(db, businessId, convId, `[Widget Submission: ${widgetName || 'Appointment Form'}]`, 'Appointment booked.', true, true, { source: 'web' });
+
+            return res.json({
+                success: true,
+                type: 'appointment_booked',
+                submissionId: subRef.id,
+                _widget: {
+                    category: 'appointment_booked',
+                    ctx: {
+                        date: dateISO,
+                        time: timeVal,
+                        name: nameVal || 'Guest',
+                        contact: contactVal || 'Not provided',
+                        ...fields,
+                    },
+                },
+            });
+        }
+
+        // 3. If it contains contact info (or name + note), save directly to leads collection
+        if (contactVal || nameVal) {
+            const summaryNote = noteVal || Object.entries(fields)
+                .filter(([k]) => !/^(name|fullname|contact|email|phone|mobile|tel)$/i.test(k))
+                .map(([k, v]) => `${k}: ${v}`)
+                .join(', ');
+            const lead = {
+                businessId,
+                botName,
+                owner: ownerEmail,
+                conversationId: convId,
+                customerName: (nameVal || 'Visitor').substring(0, 120),
+                contactInfo: (contactVal || nameVal).substring(0, 200),
+                note: (summaryNote || `Submitted ${widgetName || 'widget'}`).substring(0, 500),
+                fields,
+                source: 'widget',
+                createdAt: nowISO,
+            };
+            await db.collection('leads').add(lead);
+            if (ownerEmail) {
+                sendFCMToUser(ownerEmail, {
+                    title: '🎯 New Widget Lead Captured',
+                    body: `${lead.customerName} (${lead.contactInfo}) via "${widgetName || botName}": ${lead.note}`.substring(0, 180),
+                    url: '/?view=analytics',
+                    tag: 'mebor-lead',
+                }).catch(() => {});
+            }
+        }
+
+        await logChat(db, businessId, convId, `[Widget Submission: ${widgetName || 'Form'}]`, 'Submission saved.', true, !!contactVal, { source: 'web' });
+
+        return res.json({
+            success: true,
+            type: 'saved',
+            submissionId: subRef.id,
+            ctx: fields,
+        });
+    } catch (err) {
+        console.error('[WidgetSubmit]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/widget/generate  (AI Widget Builder powered by Gemini 2.5 Flash)
+// ════════════════════════════════════════════════════════════════════════════
+async function handleWidgetGenerate(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const auth = await requireAuth(req, res);
+    if (!auth) return;
+
+    const { prompt, currentWidget } = req.body || {};
+    if (!prompt || typeof prompt !== 'string') {
+        return res.status(400).json({ success: false, message: 'Please describe the widget you want to build.' });
+    }
+
+    const sys = `You are an expert UI/UX widget designer for MeborAgents Widget Studio (similar to Chatbase).
+The user will describe a chat widget they want their AI agent to display inside the chat window.
+Respond with ONLY a valid JSON object (no markdown fences, no commentary) matching this exact schema:
+{
+  "name": "Short descriptive widget name",
+  "category": "snake_case_category_slug (e.g. appointment_form, appointment_booked, human_joined, tracker, lead_capture, feedback_survey, order_status, product_card, pricing_quote, newsletter_signup, or any fitting custom slug)",
+  "triggerKeywords": "comma-separated keywords or phrases that should trigger this widget in chat (e.g. book, schedule, appointment)",
+  "contextMessage": "Short conversational sentence shown right before the widget ONLY when user action is needed, e.g. 'Okay, fill out the following form to book your slot:' — or empty string '' if the widget is a self-contained display card",
+  "config": {
+    "mode": "custom",
+    "icon": "svg:form",
+    "title": "Card Title",
+    "subtitle": "Card Subtitle",
+    "accent": "#5b3df5",
+    "bg": "#ffffff",
+    "text": "#15121f",
+    "radius": 16,
+    "button": "Submit",
+    "footer": "",
+    "fields": [
+      { "key": "field_key", "label": "Field Label", "type": "text|email|tel|date|time|number|select|textarea" }
+    ],
+    "html": "<div ...>...complete, modern, self-contained HTML+inline-CSS widget markup...</div>"
+  }
+}
+
+CRITICAL RULES FOR "config.html":
+- Build a polished, modern, responsive card (max-width: 100%, clean rounded corners, subtle shadow, Plus Jakarta Sans / Inter font).
+- Every interactive input/select/textarea MUST have a clear \`name="field_key"\` attribute (e.g., \`name="name"\`, \`name="email"\`, \`name="date"\`, \`name="time"\`, \`name="rating"\`, \`name="note"\`) so the Widget Studio auto-sensor automatically binds it to the database!
+- If the widget has a submit button, wrap the inputs in a \`<form>\` or give the submit button \`type="submit"\` or \`data-cc-submit="true"\`. Do NOT use \`sendToChat()\` to dump raw form answers as a chat message — the platform automatically intercepts form submissions, saves all fields directly to Firestore, and shows a clean confirmation state!
+- You may use \`{{placeholder}}\` tokens for dynamic values if it is a status/confirmation card.`;
+
+    const userPrompt = currentWidget
+        ? `Current widget JSON:\n${JSON.stringify(currentWidget)}\n\nUser request / modification:\n${prompt}`
+        : `User request:\n${prompt}`;
+
+    try {
+        const choice = await callLLM({
+            modelKey: 'gemini-2.5-flash',
+            messages: [
+                { role: 'system', content: sys },
+                { role: 'user', content: userPrompt },
+            ],
+            maxTokens: 2200,
+        });
+
+        let raw = String(choice?.content || '').trim();
+        raw = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+        const firstBrace = raw.indexOf('{');
+        const lastBrace = raw.lastIndexOf('}');
+        if (firstBrace !== -1 && lastBrace !== -1) {
+            raw = raw.slice(firstBrace, lastBrace + 1);
+        }
+
+        const parsed = JSON.parse(raw);
+        return res.json({ success: true, widget: parsed });
+    } catch (err) {
+        console.error('[WidgetGenerate]', err.message);
+        return res.status(500).json({ success: false, message: 'AI Widget Builder could not generate the widget: ' + err.message });
     }
 }
 
@@ -6381,7 +6620,17 @@ async function generateBotReply({ db, businessId, userMsg, history = [], convers
             'Reply with "CANCEL" to cancel or "EDIT" to change a detail.',
         ].join('\n');
 
-        return { answer, meta };
+        return {
+            answer,
+            meta: {
+                ...meta,
+                _widget: {
+                    category: 'appointment_booked',
+                    ctx: { date: dateISO, time: appointmentTime, name: userName, contact: contactInfo },
+                },
+                _suppressTextIfWidget: true,
+            },
+        };
     }
 
     if (agentActionToolDefs.length && Array.isArray(choice?.tool_calls) && choice.tool_calls.length) {
