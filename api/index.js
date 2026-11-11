@@ -2946,17 +2946,31 @@ async function handleWidgetSubmit(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// POST /api/widget/generate  (AI Widget Builder powered by Gemini 2.5 Flash)
+// POST /api/widget/generate  (AI Widget Builder, selectable model; defaults to Gemini 2.5 Flash)
 // ════════════════════════════════════════════════════════════════════════════
+const WIDGET_BUILDER_MODELS = new Set([
+    'gemini-2.5-flash',
+    'gpt-4o-mini',
+    'deepseek-v4-flash-0731',
+    'llama-3.3-70b-instruct',
+    'mistral-small-3.2-24b',
+]);
+const WIDGET_BUILDER_DEFAULT_MODEL = 'gemini-2.5-flash';
+
 async function handleWidgetGenerate(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
     const auth = await requireAuth(req, res);
     if (!auth) return;
 
-    const { prompt, currentWidget } = req.body || {};
+    const { prompt, currentWidget, model, modelKey } = req.body || {};
     if (!prompt || typeof prompt !== 'string') {
         return res.status(400).json({ success: false, message: 'Please describe the widget you want to build.' });
     }
+
+    const requestedModel = String(model || modelKey || '').trim();
+    const builderModel = WIDGET_BUILDER_MODELS.has(requestedModel) && MODEL_REGISTRY[requestedModel]
+        ? requestedModel
+        : WIDGET_BUILDER_DEFAULT_MODEL;
 
     const sys = `You are an expert UI/UX widget designer for MeborAgents Widget Studio (similar to Chatbase).
 The user will describe a chat widget they want their AI agent to display inside the chat window.
@@ -2996,7 +3010,7 @@ CRITICAL RULES FOR "config.html":
 
     try {
         const choice = await callLLM({
-            modelKey: 'gemini-2.5-flash',
+            modelKey: builderModel,
             messages: [
                 { role: 'system', content: sys },
                 { role: 'user', content: userPrompt },
@@ -3013,9 +3027,9 @@ CRITICAL RULES FOR "config.html":
         }
 
         const parsed = JSON.parse(raw);
-        return res.json({ success: true, widget: parsed });
+        return res.json({ success: true, widget: parsed, model: builderModel });
     } catch (err) {
-        console.error('[WidgetGenerate]', err.message);
+        console.error('[WidgetGenerate]', builderModel, err.message);
         return res.status(500).json({ success: false, message: 'AI Widget Builder could not generate the widget: ' + err.message });
     }
 }
