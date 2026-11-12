@@ -742,6 +742,11 @@ const MODEL_REGISTRY = {
     'nvidia-nemotron-4-340b': { id: 'nvidia/nemotron-4-340b-instruct', label: 'NVIDIA Nemotron-4 340B' },
     'nvidia-llama-3.1-nemotron-70b': { id: 'nvidia/llama-3.1-nemotron-70b-instruct', label: 'NVIDIA Llama 3.1 Nemotron 70B' },
     'nvidia-mistral-nemo-12b': { id: 'nvidia/mistral-nemo-minitron-8b-8k-instruct', label: 'NVIDIA Mistral NeMo 12B' },
+
+    'claude-haiku-5.5':      { id: 'anthropic/claude-haiku-5.5', label: 'Anthropic Claude Haiku 5.5' },
+    'gpt-6-luna-pro':        { id: 'openai/gpt-6-luna-pro', label: 'OpenAI GPT-6 Luna Pro' },
+    'gpt-6-luna':            { id: 'openai/gpt-6-luna', label: 'OpenAI GPT-6 Luna' },
+    'muse-ember':            { id: 'meta/muse-ember', label: 'Meta Muse Ember' },
 };
 
 const DEFAULT_MODEL_KEY = 'gpt-4o-mini';
@@ -752,6 +757,7 @@ const PREMIUM_MODEL_KEYS = new Set([
     'mistral-small-3.2-24b', 'mistral-small-3.1-24b', 'mistral-small-4',
     'deepseek-v4-flash-0423', 'deepseek-v4-flash-0731', 'qwen-3.8-27b',
     'nvidia-nemotron-4-340b', 'nvidia-llama-3.1-nemotron-70b', 'nvidia-mistral-nemo-12b',
+    'claude-haiku-5.5', 'gpt-6-luna-pro', 'gpt-6-luna', 'muse-ember',
 ]);
 
 function isPremiumModel(modelKey) {
@@ -1722,6 +1728,7 @@ const AGENT_CAPABLE_MODELS = new Set([
     'mistral-small-3.2-24b', 'mistral-small-3.1-24b', 'mistral-small-4',
     'deepseek-v4-flash-0423', 'deepseek-v4-flash-0731', 'qwen-3.8-27b',
     'nvidia-nemotron-4-340b', 'nvidia-llama-3.1-nemotron-70b', 'nvidia-mistral-nemo-12b',
+    'claude-haiku-5.5', 'gpt-6-luna-pro', 'gpt-6-luna', 'muse-ember',
 ]);
 
 const PERSONALITY_PROMPTS = {
@@ -3037,10 +3044,25 @@ CRITICAL RULES FOR "config.html":
 // ════════════════════════════════════════════════════════════════════════════
 // GET /api/models
 // ════════════════════════════════════════════════════════════════════════════
+function getModelLogo(id = '', key = '') {
+    const s = `${id} ${key}`.toLowerCase();
+    if (s.includes('anthropic') || s.includes('claude')) return '/media/anthropic_logo.png';
+    if (s.includes('openai') || s.includes('gpt'))       return '/media/openai_logo.png';
+    if (s.includes('google') || s.includes('gemini') || s.includes('gemma')) return '/media/goog_logo.png';
+    if (s.includes('meta') || s.includes('llama') || s.includes('muse'))     return '/media/meta_logo.png';
+    if (s.includes('nvidia') || s.includes('nemotron'))  return '/media/nvidia_logo.png';
+    if (s.includes('microsoft') || s.includes('phi'))    return '/media/msft_logo.png';
+    if (s.includes('mistral'))                           return '/media/mistral_logo.png';
+    if (s.includes('qwen'))                              return '/media/qwen_logo.png';
+    return '/media/mebor_logo.png';
+}
+
 async function handleModels(req, res) {
     const models = Object.entries(MODEL_REGISTRY).map(([key, val]) => ({
         key,
+        id:       val.id,
         label:    val.label,
+        logo:     getModelLogo(val.id, key),
         provider: 'openrouter',
         premium:  isPremiumModel(key),
     }));
