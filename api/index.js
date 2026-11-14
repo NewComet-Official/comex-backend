@@ -59,6 +59,7 @@ const PUBLIC_ROUTE_PREFIXES = [
     '/api/telegram/webhook/',
     '/api/google-chat/webhook',
     '/api/slack/events',
+    '/api/zendesk/webhook',
     '/api/webhooks/whop',
     '/api/email/poll-worker',
     '/api/knowledge/ingest-worker',
@@ -77,7 +78,7 @@ function cors(req, res, path) {
         // Public widget / webhook routes: allow any origin, no credentials.
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-worker-secret, x-whop-signature, x-telegram-bot-api-secret-token');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-worker-secret, x-whop-signature, x-telegram-bot-api-secret-token, x-zendesk-webhook-signature, x-zendesk-webhook-signature-timestamp');
         return;
     }
 
@@ -263,6 +264,7 @@ const FEATURE_CATALOG = {
     telegramAgent:      { label: 'Telegram Channel',                        plans: ['teamplus', 'enterprise'] },
     googleChatAgent:    { label: 'Google Chat Channel (user-auth)',         plans: ['team', 'teamplus', 'enterprise'] },
     slackAgent:         { label: 'Slack Channel',                           plans: ['teamplus', 'enterprise'] },
+    zendeskAgent:       { label: 'Zendesk Channel (tickets, escalation, approvals)', plans: ['teamplus', 'enterprise'] },
     firebaseDatabase:   { label: 'Firebase Live Database Source',           plans: ['teamplus', 'enterprise'] },
     supabaseDatabase:   { label: 'Supabase Live Database Source',           plans: ['teamplus', 'enterprise'] },
     canvaDesign:        { label: 'Canva Design Import',                     plans: ['teamplus', 'enterprise'] },
@@ -275,7 +277,7 @@ const DB_SERVICE_FEATURE = { firebase: 'firebaseDatabase', supabase: 'supabaseDa
 const MAX_FILE_CONTEXT_CHARS = 25000;
 const DESIGN_SERVICE_FEATURE = { canva: 'canvaDesign', figma: 'figmaDesign' };
 
-const ALL_CHANNELS = ['widget', 'email', 'telegram', 'googlechat', 'slack', 'helppage'];
+const ALL_CHANNELS = ['widget', 'email', 'telegram', 'googlechat', 'slack', 'zendesk', 'helppage'];
 
 function normalizeChannels(botData) {
     let channels = Array.isArray(botData?.channels)
@@ -286,7 +288,7 @@ function normalizeChannels(botData) {
         const m = botData?.agentBuildMode || 'widget';
         const map = {
             widget: ['widget'], email: ['email'], telegram: ['telegram'],
-            googlechat: ['googlechat'], slack: ['slack'], helppage: ['helppage'],
+            googlechat: ['googlechat'], slack: ['slack'], zendesk: ['zendesk'], helppage: ['helppage'],
             both: ['widget', 'email'],
             'widget+telegram': ['widget', 'telegram'],
             'widget+googlechat': ['widget', 'googlechat'],
@@ -311,7 +313,7 @@ function normalizeChannels(botData) {
 function deriveBuildMode(channels) {
     const c = channels || [];
     const w = c.includes('widget'), e = c.includes('email');
-    const t = c.includes('telegram'), g = c.includes('googlechat'), sl = c.includes('slack');
+    const t = c.includes('telegram'), g = c.includes('googlechat'), sl = c.includes('slack'), zd = c.includes('zendesk');
     if (w && e && t && g) return 'all';
     if (w && e)      return 'both';
     if (w && t)      return 'widget+telegram';
@@ -322,6 +324,7 @@ function deriveBuildMode(channels) {
     if (t)           return 'telegram';
     if (g)           return 'googlechat';
     if (sl)          return 'slack';
+    if (zd)          return 'zendesk';
     return 'widget';
 }
 
@@ -462,6 +465,10 @@ function sanitizeBotDataForPlan(botData, limits) {
     if (!f.slackAgent && filtered.includes('slack')) {
         filtered = filtered.filter(c => c !== 'slack');
         stripped.push('slackAgent');
+    }
+    if (!f.zendeskAgent && filtered.includes('zendesk')) {
+        filtered = filtered.filter(c => c !== 'zendesk');
+        stripped.push('zendeskAgent');
     }
     if (!filtered.length) filtered = ['widget'];
 
@@ -2045,6 +2052,7 @@ export default async function handler(req, res) {
     if (path === '/api/knowledge/ingest-worker')  return handleKnowledgeIngestWorker(req, res);
     if (path === '/api/google-chat/webhook')      return handleGoogleChatWebhook(req, res);
     if (path === '/api/slack/events')             return handleSlackWebhook(req, res);
+    if (path === '/api/zendesk/webhook')          return handleZendeskWebhook(req, res);
     if (path === '/api/password-reset/request')   return handlePasswordResetRequest(req, res);
     if (path === '/api/password-reset/verify')    return handlePasswordResetVerify(req, res);
     if (path === '/api/password-reset/confirm')   return handlePasswordResetConfirm(req, res);
@@ -2147,6 +2155,17 @@ if (_gchatRoutes[path]) {
     if (path === '/api/slack/reject')          return handleSlackReject(req, res);
     if (path === '/api/oauth/slack')           return handleSlackOAuth(req, res);
     if (path === '/api/oauth/slack/callback')  return handleSlackOAuthCallback(req, res);
+
+    // ── Zendesk routes ──
+    if (path === '/api/zendesk/status')        return handleZendeskStatus(req, res);
+    if (path === '/api/zendesk/disconnect')    return handleZendeskDisconnect(req, res);
+    if (path === '/api/zendesk/reprovision')   return handleZendeskReprovision(req, res);
+    if (path === '/api/zendesk/pending')       return handleZendeskPending(req, res);
+    if (path === '/api/zendesk/approve')       return handleZendeskApprove(req, res);
+    if (path === '/api/zendesk/reject')        return handleZendeskReject(req, res);
+    if (path === '/api/zendesk/escalate')      return handleZendeskEscalate(req, res);
+    if (path === '/api/oauth/zendesk')         return handleZendeskOAuth(req, res);
+    if (path === '/api/oauth/zendesk/callback') return handleZendeskOAuthCallback(req, res);
 
     return res.status(404).json({ success: false, message: `Unknown route: ${path}` });
 }
@@ -2787,6 +2806,1187 @@ async function handleSlackReject(req, res) {
         return res.json({ success: true });
     } catch (err) {
         console.error('[Slack/Reject]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// ZENDESK CHANNEL
+//   • OAuth (confidential client, per-customer subdomain, expiring + refreshable tokens)
+//   • Auto-provisioned webhook + 2 triggers (inbound tickets / approval tags)
+//   • Inbound ticket replies: AUTO-SEND or DRAFT (internal note + tag approval)
+//   • Outbound escalation: AI conversation -> Zendesk ticket
+// ════════════════════════════════════════════════════════════════════════════
+
+const ZENDESK_SCOPES = [
+    'tickets:read', 'tickets:write', 'users:read',
+    'webhooks:read', 'webhooks:write',
+    'triggers:read', 'triggers:write',
+];
+const ZENDESK_TOKEN_TTL_SECS   = 172800;   // 2 days (Zendesk max)
+const ZENDESK_REFRESH_TTL_SECS = 7776000;  // 90 days (Zendesk max)
+
+// Tags used by the human-in-the-loop workflow. Agents only ever add APPROVE / REJECT.
+const ZD_TAG = {
+    PENDING:   'mebor_draft_pending',
+    APPROVE:   'mebor_approve',
+    REJECT:    'mebor_reject',
+    REPLIED:   'mebor_ai_replied',
+    REJECTED:  'mebor_rejected',
+    HUMAN:     'mebor_human_requested',
+    IGNORE:    'mebor_ignore',
+    ESCALATED: 'mebor_escalation',
+};
+
+const ZENDESK_HUMAN_RE = /speak to human support|connect (me )?(to )?(a )?human|talk to (a )?(human|person|someone|agent|representative)|(human|real) (agent|person)|customer service rep|talk to (someone|somebody) real/i;
+const ZENDESK_STATUS_AFTER_REPLY = ['open', 'pending', 'solved'];
+const ZENDESK_PRIORITIES = ['low', 'normal', 'high', 'urgent'];
+
+const zdSleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+function normalizeZendeskSubdomain(raw) {
+    let s = String(raw || '').trim().toLowerCase();
+    if (!s) return null;
+    s = s.replace(/^https?:\/\//, '').split('/')[0].split('?')[0];
+    if (s.endsWith('.zendesk.com')) s = s.slice(0, -'.zendesk.com'.length);
+    return /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(s) ? s : null;
+}
+
+function zendeskBaseUrl(subdomain) { return `https://${subdomain}.zendesk.com`; }
+function zendeskTicketUrl(subdomain, ticketId) { return `${zendeskBaseUrl(subdomain)}/agent/tickets/${ticketId}`; }
+
+function zendeskRedirectUri(req) {
+    return process.env.ZENDESK_REDIRECT_URI || `https://${req.headers.host}/api/oauth/zendesk/callback`;
+}
+
+// Public origin Zendesk should call for the webhook (same host as the OAuth redirect URI).
+function zendeskPublicBase(req) {
+    try { if (process.env.ZENDESK_REDIRECT_URI) return new URL(process.env.ZENDESK_REDIRECT_URI).origin; } catch { /* fall through */ }
+    return `https://${req.headers.host}`;
+}
+
+function toZendeskPlain(text) {
+    return String(text || '')
+        .replace(/\*\*(.+?)\*\*/g, '$1')
+        .replace(/__(.+?)__/g, '$1')
+        .replace(/^#{1,6}\s+/gm, '')
+        .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '$1 ($2)')
+        .replace(/`{3}[a-z]*\n?/gi, '')
+        .replace(/`([^`]+)`/g, '$1')
+        .trim();
+}
+
+function zdEscapeHtml(s) {
+    return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function zdOwnerKey(ownerEmail) {
+    return crypto.createHash('sha1').update(String(ownerEmail).toLowerCase()).digest('hex').slice(0, 16);
+}
+
+// ── Token handling ──────────────────────────────────────────────────────────
+
+async function zendeskTokenRequest(subdomain, payload) {
+    const r = await fetch(`${zendeskBaseUrl(subdomain)}/oauth/tokens`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(9000),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || !data.access_token) {
+        const err = new Error(data.error_description || data.error || `HTTP ${r.status}`);
+        err.code = data.error || `http_${r.status}`;
+        throw err;
+    }
+    return data;
+}
+
+function zendeskTokenPatch(tokens) {
+    const now = Date.now();
+    const patch = { accessTokenEnc: encryptCredential(tokens.access_token) };
+    if (tokens.refresh_token) patch.refreshTokenEnc = encryptCredential(tokens.refresh_token);
+    patch.accessTokenExpiresAt = tokens.expires_in ? now + Number(tokens.expires_in) * 1000 : null;
+    patch.refreshTokenExpiresAt = tokens.refresh_token_expires_in ? now + Number(tokens.refresh_token_expires_in) * 1000 : null;
+    patch.needsReauth = false;
+    patch.refreshLockUntil = 0;
+    return patch;
+}
+
+/**
+ * Returns a valid access token for the owner's Zendesk account, refreshing it when it is
+ * (almost) expired. Refresh tokens rotate on every use, so refreshes are serialised with a
+ * short Firestore lock to stop two serverless invocations from invalidating each other.
+ */
+async function getZendeskAccess(db, ownerEmail, { force = false } = {}) {
+    let forceNow = force;
+    for (let attempt = 0; attempt < 4; attempt++) {
+        const secrets = await getUserSecrets(db, ownerEmail);
+        const zd = secrets?.integrations?.zendesk;
+        if (!zd?.connected || !zd.accessTokenEnc) throw new Error('zendesk-disconnected');
+
+        const exp = Number(zd.accessTokenExpiresAt || 0);
+        const fresh = !forceNow && (!exp || exp - Date.now() > 120000);
+        if (fresh) return { subdomain: zd.subdomain, accessToken: decryptCredential(zd.accessTokenEnc), zd };
+
+        if (!zd.refreshTokenEnc) {
+            await setUserSecrets(db, ownerEmail, { integrations: { zendesk: { needsReauth: true } } });
+            throw new Error('zendesk-reauth-required');
+        }
+
+        const ref = db.collection('user_secrets').doc(ownerEmail);
+        const lock = await db.runTransaction(async (tx) => {
+            const s = await tx.get(ref);
+            const cur = s.data()?.integrations?.zendesk;
+            if (!cur?.connected) return { status: 'gone' };
+            const curExp = Number(cur.accessTokenExpiresAt || 0);
+            if (!forceNow && (!curExp || curExp - Date.now() > 120000)) return { status: 'fresh' };
+            if (Number(cur.refreshLockUntil || 0) > Date.now()) return { status: 'locked' };
+            tx.set(ref, { integrations: { zendesk: { refreshLockUntil: Date.now() + 15000 } } }, { merge: true });
+            return { status: 'ok', refreshTokenEnc: cur.refreshTokenEnc };
+        });
+        if (lock.status === 'gone') throw new Error('zendesk-disconnected');
+        if (lock.status === 'fresh') continue;
+        if (lock.status === 'locked') { await zdSleep(1500); forceNow = false; continue; }
+
+        try {
+            const tokens = await zendeskTokenRequest(zd.subdomain, {
+                grant_type: 'refresh_token',
+                refresh_token: decryptCredential(lock.refreshTokenEnc),
+                client_id: process.env.ZENDESK_CLIENT_ID,
+                client_secret: process.env.ZENDESK_CLIENT_SECRET,
+                expires_in: ZENDESK_TOKEN_TTL_SECS,
+                refresh_token_expires_in: ZENDESK_REFRESH_TTL_SECS,
+            });
+            await setUserSecrets(db, ownerEmail, { integrations: { zendesk: zendeskTokenPatch(tokens) } });
+            return { subdomain: zd.subdomain, accessToken: tokens.access_token, zd };
+        } catch (e) {
+            const patch = { refreshLockUntil: 0 };
+            if (e.code === 'invalid_grant' || e.code === 'invalid_request') patch.needsReauth = true;
+            await setUserSecrets(db, ownerEmail, { integrations: { zendesk: patch } }).catch(() => {});
+            console.error('[Zendesk/Refresh]', e.message);
+            throw new Error('zendesk-reauth-required');
+        }
+    }
+    throw new Error('zendesk-token-unavailable');
+}
+
+async function zendeskApi(db, ownerEmail, method, path, body, opts = {}) {
+    const { subdomain, accessToken } = await getZendeskAccess(db, ownerEmail, { force: !!opts.forceRefresh });
+    const r = await fetch(`${zendeskBaseUrl(subdomain)}${path}`, {
+        method,
+        headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+        },
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+        signal: AbortSignal.timeout(9000),
+    });
+    if (r.status === 401 && !opts.forceRefresh) {
+        return zendeskApi(db, ownerEmail, method, path, body, { ...opts, forceRefresh: true });
+    }
+    if (r.status === 429 && !opts.rateRetried) {
+        const wait = Math.min(Number(r.headers.get('retry-after')) || 1, 3);
+        await zdSleep(wait * 1000);
+        return zendeskApi(db, ownerEmail, method, path, body, { ...opts, rateRetried: true });
+    }
+    const txt = await r.text();
+    let data = null;
+    try { data = txt ? JSON.parse(txt) : null; } catch { /* non-JSON body */ }
+    if (!r.ok) {
+        const detail = data?.description || data?.error?.message || data?.error || txt.slice(0, 200);
+        const err = new Error(`Zendesk ${method} ${path.split('?')[0]} failed: HTTP ${r.status} ${typeof detail === 'string' ? detail : JSON.stringify(detail)}`);
+        err.status = r.status;
+        throw err;
+    }
+    return data;
+}
+
+// ── Webhook + trigger provisioning ──────────────────────────────────────────
+
+async function teardownZendeskAutomation(db, ownerEmail) {
+    const secrets = await getUserSecrets(db, ownerEmail);
+    const zd = secrets?.integrations?.zendesk;
+    if (!zd?.connected) return;
+    for (const id of (zd.triggerIds || [])) {
+        await zendeskApi(db, ownerEmail, 'DELETE', `/api/v2/triggers/${id}.json`).catch(e => {
+            if (e.status !== 404) console.warn('[Zendesk/Teardown/trigger]', e.message);
+        });
+    }
+    if (zd.webhookId) {
+        await zendeskApi(db, ownerEmail, 'DELETE', `/api/v2/webhooks/${zd.webhookId}`).catch(e => {
+            if (e.status !== 404) console.warn('[Zendesk/Teardown/webhook]', e.message);
+        });
+    }
+}
+
+/**
+ * Creates (or re-creates) the Zendesk webhook and the two triggers that feed it:
+ *   1. "inbound"  – a customer's public comment (new ticket or reply) → webhook
+ *   2. "approval" – a ticket gets the mebor_approve / mebor_reject tag → webhook
+ * The webhook body only carries ids; the ticket content is fetched through the API, which
+ * avoids any JSON-escaping problems with customer text.
+ */
+async function provisionZendeskAutomation(db, ownerEmail, publicBase) {
+    await teardownZendeskAutomation(db, ownerEmail).catch(() => {});
+
+    const hookKey = crypto.randomBytes(24).toString('hex');
+    const suffix = hookKey.slice(0, 6);
+    const endpoint = `${publicBase}/api/zendesk/webhook?k=${hookKey}`;
+    const patch = { hookKey, webhookId: null, triggerIds: [], signingSecretEnc: null, provisionError: null };
+
+    try {
+        const wh = await zendeskApi(db, ownerEmail, 'POST', '/api/v2/webhooks', {
+            webhook: {
+                name: `Mebor Agents (${suffix})`,
+                description: 'Sends ticket events to Mebor Agents. Managed automatically — do not edit.',
+                status: 'active',
+                endpoint,
+                http_method: 'POST',
+                request_format: 'json',
+                subscriptions: ['conditional_ticket_events'],
+            },
+        });
+        const webhookId = wh?.webhook?.id;
+        if (!webhookId) throw new Error('Zendesk did not return a webhook id.');
+        patch.webhookId = webhookId;
+
+        try {
+            const sec = await zendeskApi(db, ownerEmail, 'GET', `/api/v2/webhooks/${webhookId}/signing_secret`);
+            if (sec?.signing_secret?.secret) patch.signingSecretEnc = encryptCredential(sec.signing_secret.secret);
+        } catch (e) { console.warn('[Zendesk/Provision/signing-secret]', e.message); }
+
+        const inbound = await zendeskApi(db, ownerEmail, 'POST', '/api/v2/triggers.json', {
+            trigger: {
+                title: `Mebor Agents – inbound customer message (${suffix})`,
+                description: 'Notifies Mebor Agents when a customer writes on a ticket. Managed automatically.',
+                active: true,
+                conditions: {
+                    all: [
+                        { field: 'comment_is_public', operator: 'is', value: 'true' },
+                        { field: 'role', operator: 'is', value: 'end_user' },
+                        { field: 'current_tags', operator: 'not_includes', value: ZD_TAG.IGNORE },
+                    ],
+                },
+                actions: [{
+                    field: 'notification_webhook',
+                    value: [String(webhookId), JSON.stringify({ event: 'inbound', ticket_id: '{{ticket.id}}' })],
+                }],
+            },
+        });
+        if (inbound?.trigger?.id) patch.triggerIds.push(inbound.trigger.id);
+
+        const approval = await zendeskApi(db, ownerEmail, 'POST', '/api/v2/triggers.json', {
+            trigger: {
+                title: `Mebor Agents – draft approval tags (${suffix})`,
+                description: `Notifies Mebor Agents when ${ZD_TAG.APPROVE} or ${ZD_TAG.REJECT} is added to a ticket. Managed automatically.`,
+                active: true,
+                conditions: {
+                    all: [{ field: 'update_type', operator: 'is', value: 'Change' }],
+                    any: [
+                        { field: 'current_tags', operator: 'includes', value: ZD_TAG.APPROVE },
+                        { field: 'current_tags', operator: 'includes', value: ZD_TAG.REJECT },
+                    ],
+                },
+                actions: [{
+                    field: 'notification_webhook',
+                    value: [String(webhookId), JSON.stringify({ event: 'approval', ticket_id: '{{ticket.id}}', actor: '{{current_user.email}}' })],
+                }],
+            },
+        });
+        if (approval?.trigger?.id) patch.triggerIds.push(approval.trigger.id);
+
+        patch.provisionedAt = new Date().toISOString();
+    } catch (e) {
+        patch.provisionError = String(e.message || e).substring(0, 300);
+        console.error('[Zendesk/Provision]', patch.provisionError);
+    }
+
+    await setUserSecrets(db, ownerEmail, { integrations: { zendesk: patch } });
+    return { ok: !patch.provisionError, error: patch.provisionError };
+}
+
+// ── Reply / ticket helpers ──────────────────────────────────────────────────
+
+async function sendZendeskPublicReply(db, ownerEmail, ticketId, text, { statusAfter = '', addTags = [ZD_TAG.REPLIED], removeTags = [] } = {}) {
+    const ticket = {
+        comment: { body: toZendeskPlain(text).substring(0, 30000) || '(empty reply)', public: true },
+    };
+    if (addTags.length) ticket.additional_tags = addTags;
+    if (removeTags.length) ticket.remove_tags = removeTags;
+    if (ZENDESK_STATUS_AFTER_REPLY.includes(statusAfter)) ticket.status = statusAfter;
+    return zendeskApi(db, ownerEmail, 'PUT', `/api/v2/tickets/${ticketId}.json`, { ticket });
+}
+
+async function addZendeskInternalNote(db, ownerEmail, ticketId, text, { addTags = [], removeTags = [] } = {}) {
+    const ticket = { comment: { body: String(text).substring(0, 30000), public: false } };
+    if (addTags.length) ticket.additional_tags = addTags;
+    if (removeTags.length) ticket.remove_tags = removeTags;
+    return zendeskApi(db, ownerEmail, 'PUT', `/api/v2/tickets/${ticketId}.json`, { ticket });
+}
+
+async function findZendeskAgentForOwner(db, ownerEmail) {
+    let agent = null;
+    const botsSnap = await db.collection('user_bots').where('owner', '==', ownerEmail).get();
+    botsSnap.forEach(d => {
+        const b = d.data();
+        if (b.deletedAt || agent) return;
+        if (normalizeChannels(b).includes('zendesk')) agent = { id: d.id, name: b.displayName || b.name || 'Assistant', data: b };
+    });
+    return agent;
+}
+
+async function findZendeskOwnerByHookKey(db, key) {
+    if (!/^[a-f0-9]{48}$/.test(String(key || ''))) return null;
+    const snap = await db.collection('user_secrets').where('integrations.zendesk.hookKey', '==', key).limit(1).get();
+    let found = null;
+    snap.forEach(d => {
+        const zd = d.data()?.integrations?.zendesk;
+        if (zd?.connected && zd.accessTokenEnc && !found) found = { ownerEmail: d.id, zd };
+    });
+    return found;
+}
+
+function verifyZendeskSignature(req, rawBody, zd) {
+    if (!zd.signingSecretEnc) return { ok: true, unsigned: true };
+    const ts = String(req.headers['x-zendesk-webhook-signature-timestamp'] || '');
+    const sig = String(req.headers['x-zendesk-webhook-signature'] || '');
+    if (!ts || !sig) return { ok: false, message: 'Missing Zendesk signature headers.' };
+    const t = new Date(ts).getTime();
+    if (!Number.isFinite(t) || Math.abs(Date.now() - t) > 5 * 60 * 1000) return { ok: false, message: 'Stale Zendesk request.' };
+    let secret;
+    try { secret = decryptCredential(zd.signingSecretEnc); } catch { return { ok: false, message: 'Signing secret unreadable.' }; }
+    const expected = crypto.createHmac('sha256', secret).update(ts + rawBody.toString('utf8')).digest('base64');
+    const a = Buffer.from(sig), b = Buffer.from(expected);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return { ok: false, message: 'Invalid Zendesk signature.' };
+    return { ok: true };
+}
+
+async function claimZendeskEvent(db, eventId, ownerEmail) {
+    const ref = db.collection('zendesk_events').doc(eventId);
+    try {
+        await ref.create({ status: 'processing', ownerEmail, attempts: 1, receivedAt: new Date().toISOString() });
+        return { ref, ok: true };
+    } catch {
+        const took = await db.runTransaction(async (tx) => {
+            const s = await tx.get(ref);
+            const d = s.data() || {};
+            if (d.status === 'failed' && (d.attempts || 1) < 3) {
+                tx.set(ref, { status: 'processing', attempts: (d.attempts || 1) + 1 }, { merge: true });
+                return true;
+            }
+            return false;
+        }).catch(() => false);
+        return { ref, ok: took };
+    }
+}
+
+// ── POST /api/zendesk/webhook  (public — verified by hook key + Zendesk signature) ──
+async function handleZendeskWebhook(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ ok: false });
+
+    const rawBody = await readSlackRawBody(req); // generic raw-body reader
+    const key = String(req.query?.k || (() => { try { return new URL(req.url, 'http://x').searchParams.get('k'); } catch { return ''; } })() || '');
+
+    try {
+        const db = getDb();
+        const link = await findZendeskOwnerByHookKey(db, key);
+        if (!link) return res.status(401).json({ ok: false, message: 'Unknown webhook.' });
+        const { ownerEmail, zd } = link;
+
+        const sigCheck = verifyZendeskSignature(req, rawBody, zd);
+        if (!sigCheck.ok) {
+            console.warn('[Zendesk/Webhook]', sigCheck.message);
+            return res.status(401).json({ ok: false, message: sigCheck.message });
+        }
+
+        let body;
+        try { body = JSON.parse(rawBody.toString('utf8')); }
+        catch {
+            const m = rawBody.toString('utf8').match(/"ticket_id"\s*:\s*"?(\d+)"?/);
+            const ev = rawBody.toString('utf8').match(/"event"\s*:\s*"(\w+)"/);
+            body = { ticket_id: m ? m[1] : null, event: ev ? ev[1] : null };
+        }
+        const ticketId = String(body.ticket_id || '').match(/^\d+$/) ? String(body.ticket_id) : null;
+        if (!ticketId || !['inbound', 'approval'].includes(body.event)) return res.status(200).json({ ok: true, ignored: true });
+
+        const ctx = await resolveOwnerContext(db, ownerEmail);
+        const limits = resolvePlanLimits(ctx.ownerProfile);
+        if (!limits.features.zendeskAgent) {
+            console.warn('[Zendesk/Webhook] Plan does not include Zendesk:', ownerEmail);
+            return res.status(200).json({ ok: true });
+        }
+
+        if (body.event === 'approval') {
+            await processZendeskApproval(db, { ownerEmail, zd, ticketId, actor: String(body.actor || '').substring(0, 200) });
+            return res.status(200).json({ ok: true });
+        }
+
+        await processZendeskInbound(db, { ownerEmail, zd, ticketId });
+        return res.status(200).json({ ok: true });
+    } catch (err) {
+        console.error('[Zendesk/Webhook]', err.message);
+        // 200 so Zendesk's circuit breaker does not deactivate the webhook over one bad ticket.
+        return res.status(200).json({ ok: true });
+    }
+}
+
+async function processZendeskInbound(db, { ownerEmail, zd, ticketId }) {
+    const agent = await findZendeskAgentForOwner(db, ownerEmail);
+    if (!agent) return;
+
+    const tk = await zendeskApi(db, ownerEmail, 'GET', `/api/v2/tickets/${ticketId}.json`);
+    const ticket = tk?.ticket;
+    if (!ticket) return;
+    const tags = Array.isArray(ticket.tags) ? ticket.tags : [];
+    if (tags.includes(ZD_TAG.IGNORE) || ticket.status === 'closed') return;
+
+    const cm = await zendeskApi(db, ownerEmail, 'GET', `/api/v2/tickets/${ticketId}/comments.json?include=users&sort_order=desc`);
+    const users = new Map((cm?.users || []).map(u => [u.id, u]));
+    const publicComments = (cm?.comments || []).filter(c => c.public); // newest first
+    const latest = publicComments[0];
+    if (!latest) return;
+
+    const author = users.get(latest.author_id);
+    const isEndUser = author ? author.role === 'end-user' : latest.author_id === ticket.requester_id;
+    if (!isEndUser) return; // our own reply / an agent comment — never answer those (loop guard)
+
+    const claim = await claimZendeskEvent(db, `${zdOwnerKey(ownerEmail)}__${ticketId}__${latest.id}`, ownerEmail);
+    if (!claim.ok) return;
+
+    try {
+        const latestText = String(latest.plain_body || latest.body || '').trim();
+        if (!latestText) { await claim.ref.set({ status: 'done', skipped: 'empty' }, { merge: true }); return; }
+        const userText = (publicComments.length === 1 && ticket.subject
+            ? `Subject: ${ticket.subject}\n\n${latestText}`
+            : latestText).substring(0, 3500);
+
+        const nowISO = new Date().toISOString();
+        const zc = agent.data.zendeskConfig || {};
+        const requester = users.get(ticket.requester_id);
+        const convId = `zendesk-${zd.subdomain}-${ticketId}`;
+
+        // Customer asked for a person → flag the ticket for a human, no AI reply.
+        if (agent.data.behaviorConfig?.allowHumanHandoff !== false && ZENDESK_HUMAN_RE.test(latestText)) {
+            await addZendeskInternalNote(db, ownerEmail, ticketId,
+                '🤖 Mebor Agents: the customer asked to speak with a person. No automatic reply was sent — please take over this ticket.',
+                { addTags: [ZD_TAG.HUMAN] });
+            await logChat(db, agent.id, convId, userText, '(escalated to a human agent)', false, false, { humanRequested: true, source: 'zendesk' });
+            sendFCMToUser(ownerEmail, {
+                title: `🙋 Zendesk #${ticketId}: customer wants a human`,
+                body: String(ticket.subject || latestText).substring(0, 120),
+                url: '/zendesk-dashboard', tag: `zendesk-human-${ticketId}`, type: 'zendesk_human',
+            }).catch(() => {});
+            await claim.ref.set({ status: 'done', outcome: 'human-requested' }, { merge: true });
+            return;
+        }
+
+        // Earlier public messages as chat history (oldest → newest, excludes the latest one).
+        const history = publicComments.slice(1, 11).reverse().map(c => {
+            const a = users.get(c.author_id);
+            const fromCustomer = a ? a.role === 'end-user' : c.author_id === ticket.requester_id;
+            return { role: fromCustomer ? 'user' : 'assistant', content: String(c.plain_body || c.body || '').substring(0, 1500) };
+        }).filter(m => m.content);
+
+        const result = await generateBotReply({
+            db, businessId: agent.id, userMsg: userText, history, conversationId: convId, source: 'zendesk',
+        });
+
+        // Never post "I'm offline / too long / unavailable" boilerplate to a customer's ticket.
+        if (result?.meta?._creditsExhausted || result?.meta?._unavailable || result?.meta?._tooLong) {
+            const why = result.meta._creditsExhausted ? 'the monthly message credits are used up'
+                : result.meta._unavailable ? 'the agent is unavailable' : 'the message was too long';
+            await addZendeskInternalNote(db, ownerEmail, ticketId,
+                `🤖 Mebor Agents could not draft a reply because ${why}. Please answer this ticket manually.`,
+                { addTags: [ZD_TAG.HUMAN] });
+            await claim.ref.set({ status: 'done', outcome: 'no-reply', reason: why }, { merge: true });
+            return;
+        }
+
+        const replyText = String(result?.answer || '').trim() || "Thanks for reaching out — a member of our team will get back to you shortly.";
+
+        const draftBase = {
+            ownerEmail, businessId: agent.id, botName: agent.name, subdomain: zd.subdomain,
+            ticketId: String(ticketId), ticketSubject: String(ticket.subject || '').substring(0, 200),
+            requesterId: ticket.requester_id || null, requesterName: requester?.name || null,
+            commentId: String(latest.id), originalMessage: userText, draftedResponse: replyText,
+            createdAt: nowISO,
+        };
+        const statusAfter = ZENDESK_STATUS_AFTER_REPLY.includes(zc.statusAfterReply) ? zc.statusAfterReply : '';
+
+        // A newer customer message makes any older unsent draft for this ticket obsolete.
+        const older = await db.collection('zendesk_drafts')
+            .where('ownerEmail', '==', ownerEmail).where('ticketId', '==', String(ticketId)).where('status', 'in', ['pending', 'scheduled']).get();
+        if (!older.empty) {
+            const batch = db.batch();
+            older.docs.forEach(d => batch.update(d.ref, { status: 'superseded', supersededAt: nowISO }));
+            await batch.commit();
+        }
+
+        if (zc.requireHumanApproval !== false) {
+            const ref = await db.collection('zendesk_drafts').add({ ...draftBase, status: 'pending' });
+            try {
+                await addZendeskInternalNote(db, ownerEmail, ticketId,
+                    `🤖 Mebor Agents drafted a reply (NOT sent yet):\n` +
+                    `──────────\n${toZendeskPlain(replyText)}\n──────────\n` +
+                    `• To send it to the customer, add the tag "${ZD_TAG.APPROVE}" to this ticket.\n` +
+                    `• To discard it, add the tag "${ZD_TAG.REJECT}".\n` +
+                    `• You can also edit and approve it from the Mebor Agents dashboard.`,
+                    { addTags: [ZD_TAG.PENDING] });
+            } catch (e) {
+                console.error('[Zendesk/DraftNote]', e.message);
+                await ref.set({ noteError: String(e.message).substring(0, 200) }, { merge: true });
+            }
+            sendFCMToUser(ownerEmail, {
+                title: `🎫 New Zendesk draft · #${ticketId}`,
+                body: replyText.substring(0, 120),
+                url: '/zendesk-dashboard', tag: `zendesk-approval-${ref.id}`, type: 'zendesk_approval',
+            }).catch(e => console.error('[Zendesk/ApprovalFCM]', e.message));
+            await claim.ref.set({ status: 'done', outcome: 'draft', draftId: ref.id }, { merge: true });
+            return;
+        }
+
+        const delayMs = parseAutoSendDelay(zc.autoSendDelay || '00:00:02');
+        if (delayMs <= 0) {
+            await sendZendeskPublicReply(db, ownerEmail, ticketId, replyText, { statusAfter });
+            await db.collection('zendesk_drafts').add({ ...draftBase, status: 'sent', sentAt: nowISO, autoSent: true });
+            await logChat(db, agent.id, convId, userText, replyText, true, false, { source: 'zendesk' });
+        } else {
+            await db.collection('zendesk_drafts').add({
+                ...draftBase, status: 'scheduled', scheduledAt: new Date(Date.now() + delayMs).toISOString(),
+            });
+        }
+        await claim.ref.set({ status: 'done', outcome: delayMs <= 0 ? 'sent' : 'scheduled' }, { merge: true });
+    } catch (e) {
+        console.error('[Zendesk/Inbound]', ticketId, e.message);
+        await claim.ref.set({ status: 'failed', error: String(e.message).substring(0, 300) }, { merge: true }).catch(() => {});
+    }
+}
+
+// Agent added mebor_approve / mebor_reject on the ticket.
+async function processZendeskApproval(db, { ownerEmail, zd, ticketId, actor }) {
+    const tk = await zendeskApi(db, ownerEmail, 'GET', `/api/v2/tickets/${ticketId}.json`);
+    const tags = Array.isArray(tk?.ticket?.tags) ? tk.ticket.tags : [];
+    const wantReject = tags.includes(ZD_TAG.REJECT);
+    const wantApprove = tags.includes(ZD_TAG.APPROVE);
+    if (!wantApprove && !wantReject) return;
+
+    const clearTags = [ZD_TAG.APPROVE, ZD_TAG.REJECT, ZD_TAG.PENDING];
+    const snap = await db.collection('zendesk_drafts')
+        .where('ownerEmail', '==', ownerEmail).where('ticketId', '==', String(ticketId)).where('status', '==', 'pending').get();
+    const drafts = snap.docs.sort((a, b) => String(b.data().createdAt || '').localeCompare(String(a.data().createdAt || '')));
+
+    if (!drafts.length) {
+        await addZendeskInternalNote(db, ownerEmail, ticketId,
+            '🤖 Mebor Agents: there is no pending draft for this ticket, so the approval tag was cleared.',
+            { removeTags: clearTags }).catch(e => console.warn('[Zendesk/Approval/clear]', e.message));
+        return;
+    }
+
+    const target = drafts[0];
+    const nowISO = new Date().toISOString();
+    // Older pending drafts on the same ticket are obsolete.
+    for (const d of drafts.slice(1)) await d.ref.set({ status: 'superseded', supersededAt: nowISO }, { merge: true });
+
+    const claimed = await db.runTransaction(async (tx) => {
+        const s = await tx.get(target.ref);
+        if (!s.exists || s.data().status !== 'pending') return false;
+        tx.set(target.ref, { status: wantReject ? 'rejecting' : 'sending' }, { merge: true });
+        return true;
+    }).catch(() => false);
+    if (!claimed) return;
+    const draft = target.data();
+
+    // If both tags are present, reject wins — the safe choice.
+    if (wantReject) {
+        await target.ref.set({ status: 'rejected', rejectedAt: nowISO, rejectedBy: actor || 'zendesk-tag' }, { merge: true });
+        await zendeskApi(db, ownerEmail, 'PUT', `/api/v2/tickets/${ticketId}.json`, {
+            ticket: { additional_tags: [ZD_TAG.REJECTED], remove_tags: clearTags },
+        }).catch(e => console.warn('[Zendesk/Reject/tags]', e.message));
+        return;
+    }
+
+    try {
+        const agentSnap = await db.collection('user_bots').doc(draft.businessId).get();
+        const statusAfter = agentSnap.data()?.zendeskConfig?.statusAfterReply || '';
+        await sendZendeskPublicReply(db, ownerEmail, ticketId, draft.draftedResponse, { statusAfter, removeTags: clearTags });
+        await target.ref.set({ status: 'sent', finalResponse: draft.draftedResponse, approvedAt: nowISO, sentAt: nowISO, approvedBy: actor || 'zendesk-tag' }, { merge: true });
+        await logChat(db, draft.businessId, `zendesk-${draft.subdomain}-${ticketId}`, draft.originalMessage || '', draft.draftedResponse, true, false, { source: 'zendesk' });
+    } catch (e) {
+        console.error('[Zendesk/Approve]', e.message);
+        await target.ref.set({ status: 'pending', sendError: String(e.message).substring(0, 300) }, { merge: true });
+        await addZendeskInternalNote(db, ownerEmail, ticketId,
+            `🤖 Mebor Agents could not send the approved reply (${String(e.message).substring(0, 160)}). The draft is still pending — add "${ZD_TAG.APPROVE}" again to retry.`,
+            { removeTags: [ZD_TAG.APPROVE] }).catch(() => {});
+    }
+}
+
+// Sends scheduled (auto-send) replies that are due. Called from the poll worker tick.
+async function runZendeskScheduledJob(db) {
+    const out = { sent: 0, failed: 0 };
+    try {
+        const nowISO = new Date().toISOString();
+        const snap = await db.collection('zendesk_drafts').where('status', '==', 'scheduled').get();
+        const due = snap.docs.filter(d => (d.data().scheduledAt || '') <= nowISO).slice(0, 5);
+        for (const d of due) {
+            const claimed = await db.runTransaction(async (tx) => {
+                const s = await tx.get(d.ref);
+                if (!s.exists || s.data().status !== 'scheduled') return false;
+                tx.set(d.ref, { status: 'sending' }, { merge: true });
+                return true;
+            }).catch(() => false);
+            if (!claimed) continue;
+            const draft = d.data();
+            try {
+                const tk = await zendeskApi(db, draft.ownerEmail, 'GET', `/api/v2/tickets/${draft.ticketId}.json`);
+                if (!tk?.ticket || tk.ticket.status === 'closed' || (tk.ticket.tags || []).includes(ZD_TAG.IGNORE)) {
+                    await d.ref.set({ status: 'abandoned', abandonedAt: new Date().toISOString() }, { merge: true });
+                    continue;
+                }
+                const agentSnap = await db.collection('user_bots').doc(draft.businessId).get();
+                const statusAfter = agentSnap.data()?.zendeskConfig?.statusAfterReply || '';
+                await sendZendeskPublicReply(db, draft.ownerEmail, draft.ticketId, draft.draftedResponse, { statusAfter });
+                await d.ref.set({ status: 'sent', sentAt: new Date().toISOString(), autoSent: true }, { merge: true });
+                await logChat(db, draft.businessId, `zendesk-${draft.subdomain}-${draft.ticketId}`, draft.originalMessage || '', draft.draftedResponse, true, false, { source: 'zendesk' });
+                out.sent++;
+            } catch (e) {
+                console.error('[Zendesk/ScheduledSend]', d.id, e.message);
+                await d.ref.set({ status: 'failed', error: String(e.message).substring(0, 300), failedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
+                out.failed++;
+            }
+        }
+    } catch (e) { console.warn('[Zendesk/ScheduledScan]', e.message); }
+    return out;
+}
+
+// ── Outbound escalation: AI conversation → Zendesk ticket ───────────────────
+
+/**
+ * Creates a Zendesk ticket (or appends to the existing one for the same conversation) with the
+ * AI transcript attached as an internal note. Never throws — returns { created, ticketId, ... }.
+ * Escalated tickets are tagged mebor_ignore so the AI never auto-answers them.
+ */
+async function escalateToZendesk(db, opts) {
+    const {
+        ownerEmail, businessId, botName = 'Assistant', conversationId, source = 'web',
+        lastMessage = '', subject = '', priority = '', requesterName = '', requesterEmail = '',
+        reason = 'Customer asked to speak with a person.', force = false,
+    } = opts || {};
+    try {
+        if (!ownerEmail || !businessId || !conversationId) return { created: false, skipped: 'missing-params' };
+
+        const secrets = await getUserSecrets(db, ownerEmail);
+        const zd = secrets?.integrations?.zendesk;
+        if (!zd?.connected || !zd.accessTokenEnc) return { created: false, skipped: 'not-connected' };
+
+        const ctx = await resolveOwnerContext(db, ownerEmail);
+        if (!resolvePlanLimits(ctx.ownerProfile).features.zendeskAgent) return { created: false, skipped: 'plan' };
+
+        const botSnap = await db.collection('user_bots').doc(businessId).get();
+        const bot = botSnap.exists ? botSnap.data() : null;
+        if (!bot || bot.deletedAt || bot.owner !== ownerEmail) return { created: false, skipped: 'bot' };
+        const zc = bot.zendeskConfig || {};
+        if (!force && zc.escalateOnHandoff === false) return { created: false, skipped: 'disabled' };
+
+        const prio = ZENDESK_PRIORITIES.includes(priority) ? priority
+            : (ZENDESK_PRIORITIES.includes(zc.escalationPriority) ? zc.escalationPriority : 'normal');
+
+        // Transcript (no orderBy → no composite index needed).
+        let transcript = '';
+        try {
+            const chats = await db.collection('user_bots').doc(businessId).collection('chats')
+                .where('conversationId', '==', conversationId).limit(40).get();
+            transcript = chats.docs.map(d => d.data())
+                .sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')))
+                .slice(-15)
+                .map(c => `Customer: ${String(c.question || '').substring(0, 600)}\nAI: ${String(c.answer || '').substring(0, 600)}`)
+                .join('\n\n');
+        } catch (e) { console.warn('[Zendesk/Escalate/transcript]', e.message); }
+
+        const noteBody = [
+            `Escalated by Mebor Agents (${botName}) — channel: ${source}.`,
+            `Reason: ${reason}`,
+            lastMessage ? `\nLatest customer message:\n${String(lastMessage).substring(0, 1500)}` : '',
+            transcript ? `\n──── Conversation so far ────\n${transcript}` : '',
+        ].filter(Boolean).join('\n').substring(0, 20000);
+
+        const linkRef = db.collection('zendesk_tickets').doc(
+            crypto.createHash('sha1').update(`${ownerEmail}|${businessId}|${conversationId}`).digest('hex'));
+        const existing = await linkRef.get();
+        if (existing.exists && existing.data().ticketId) {
+            try {
+                await addZendeskInternalNote(db, ownerEmail, existing.data().ticketId,
+                    `Customer followed up:\n${String(lastMessage || '(no new message)').substring(0, 3000)}`);
+                return { created: false, existing: true, ticketId: existing.data().ticketId, url: zendeskTicketUrl(zd.subdomain, existing.data().ticketId) };
+            } catch (e) {
+                if (![404, 422].includes(e.status)) throw e; // deleted / closed → open a fresh ticket
+            }
+        }
+
+        const cleanSource = String(source).replace(/[^a-z0-9_]/gi, '').toLowerCase() || 'web';
+        const ticket = {
+            subject: String(subject || `[${botName}] Customer needs human support`).substring(0, 200),
+            comment: { body: noteBody, public: false },
+            priority: prio,
+            tags: ['mebor', ZD_TAG.ESCALATED, ZD_TAG.IGNORE, `mebor_source_${cleanSource}`],
+            external_id: String(conversationId).substring(0, 200),
+        };
+        const email = String(requesterEmail || '').trim();
+        if (/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+            ticket.requester = { name: String(requesterName || email).substring(0, 100), email };
+        }
+
+        const created = await zendeskApi(db, ownerEmail, 'POST', '/api/v2/tickets.json', { ticket });
+        const ticketId = created?.ticket?.id;
+        if (!ticketId) throw new Error('Zendesk did not return a ticket id.');
+
+        await linkRef.set({
+            ownerEmail, businessId, conversationId, ticketId: String(ticketId), subdomain: zd.subdomain,
+            source: cleanSource, createdAt: new Date().toISOString(),
+        });
+        return { created: true, ticketId: String(ticketId), url: zendeskTicketUrl(zd.subdomain, ticketId) };
+    } catch (e) {
+        console.error('[Zendesk/Escalate]', e.message);
+        return { created: false, error: String(e.message).substring(0, 200) };
+    }
+}
+
+// POST /api/zendesk/escalate  { ownerEmail, businessId, conversationId, subject?, message?, priority?, requesterEmail?, requesterName? }
+async function handleZendeskEscalate(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const b = req.body || {};
+    const { ownerEmail, businessId, conversationId } = b;
+    if (!ownerEmail || !businessId || !conversationId)
+        return res.status(400).json({ success: false, message: 'Missing ownerEmail, businessId, or conversationId.' });
+
+    const auth = await requireAuth(req, res, { matches: [ownerEmail] });
+    if (!auth) return;
+    try {
+        const db = getDb();
+        if (await denyIfFeatureLocked(res, db, ownerEmail, 'zendeskAgent')) return;
+        const r = await escalateToZendesk(db, {
+            ownerEmail, businessId, conversationId, source: String(b.source || 'dashboard'),
+            lastMessage: String(b.message || ''), subject: String(b.subject || ''), priority: String(b.priority || ''),
+            requesterEmail: String(b.requesterEmail || ''), requesterName: String(b.requesterName || ''),
+            reason: 'Escalated manually from the Mebor Agents dashboard.', force: true,
+        });
+        if (r.error || r.skipped) {
+            const msg = r.skipped === 'not-connected' ? 'Zendesk is not connected.'
+                : r.skipped === 'bot' ? 'Agent not found.' : (r.error || 'Could not create the ticket.');
+            return res.status(r.skipped === 'not-connected' ? 400 : 502).json({ success: false, message: msg });
+        }
+        return res.json({ success: true, ticketId: r.ticketId, url: r.url, existing: !!r.existing });
+    } catch (err) {
+        console.error('[Zendesk/EscalateRoute]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// ZENDESK OAUTH
+// ════════════════════════════════════════════════════════════════════════════
+
+function zendeskSubdomainFormHtml(req, { email, origin, ticket }, error) {
+    return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Connect Zendesk</title>
+<style>body{font-family:system-ui,sans-serif;background:#f6f7f9;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}
+.c{background:#fff;padding:32px;border-radius:14px;box-shadow:0 4px 24px rgba(0,0,0,.08);max-width:380px;width:100%}
+h1{font-size:20px;margin:0 0 6px}p{color:#555;font-size:14px;margin:0 0 18px}
+.row{display:flex;align-items:center;gap:6px}input[type=text]{flex:1;padding:10px;border:1px solid #ccd;border-radius:8px;font-size:15px}
+button{margin-top:16px;width:100%;padding:11px;border:0;border-radius:8px;background:#03363d;color:#fff;font-size:15px;cursor:pointer}
+.e{color:#b00020;font-size:13px;margin-bottom:10px}</style></head><body><form class="c" method="GET" action="/api/oauth/zendesk">
+<h1>Connect Zendesk</h1><p>Enter your Zendesk subdomain (the part before <b>.zendesk.com</b>).</p>
+${error ? `<div class="e">${zdEscapeHtml(error)}</div>` : ''}
+<div class="row"><input type="text" name="subdomain" placeholder="yourcompany" autofocus required><span>.zendesk.com</span></div>
+<input type="hidden" name="email" value="${zdEscapeHtml(email)}">
+<input type="hidden" name="origin" value="${zdEscapeHtml(origin || '')}">
+<input type="hidden" name="ticket" value="${zdEscapeHtml(ticket || '')}">
+<button type="submit">Continue to Zendesk</button></form></body></html>`;
+}
+
+// GET /api/oauth/zendesk?email=…&subdomain=…&origin=…[&ticket=…]
+async function handleZendeskOAuth(req, res) {
+    const { email, origin, ticket } = req.query;
+    if (!email) return res.status(400).send('Missing email.');
+
+    if (!(await requireOAuthStarter(req, res, email))) return;
+    if (await gateOAuthFeature(req, res, email, origin, 'zendeskAgent')) return;
+
+    const clientId = process.env.ZENDESK_CLIENT_ID;
+    if (!clientId) return res.status(500).send('Missing ZENDESK_CLIENT_ID env var.');
+
+    const rawSub = req.query.subdomain;
+    const subdomain = normalizeZendeskSubdomain(rawSub);
+    if (!subdomain) {
+        return res.status(200).setHeader('Content-Type', 'text/html; charset=utf-8')
+            .send(zendeskSubdomainFormHtml(req, { email, origin, ticket }, rawSub ? 'That does not look like a valid Zendesk subdomain.' : ''));
+    }
+
+    const state = signOAuthState({ email, origin: origin || null, subdomain, kind: 'oauth_callback' });
+    const q = [
+        ['response_type', 'code'],
+        ['client_id', clientId],
+        ['redirect_uri', zendeskRedirectUri(req)],
+        ['scope', ZENDESK_SCOPES.join(' ')],
+        ['state', state],
+    ].map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
+
+    return res.redirect(302, `${zendeskBaseUrl(subdomain)}/oauth/authorizations/new?${q}`);
+}
+
+// GET /api/oauth/zendesk/callback
+async function handleZendeskOAuthCallback(req, res) {
+    const { code, state, error } = req.query;
+
+    const parsed = verifyOAuthState(state);
+    if (!parsed || parsed.kind !== 'oauth_callback') return res.status(400).send('Invalid state parameter.');
+    const { email, origin } = parsed;
+    const subdomain = normalizeZendeskSubdomain(parsed.subdomain);
+
+    const appUrl = buildAppUrl(req, origin);
+    const failRedirect = (msg) => {
+        try {
+            const url = new URL(appUrl);
+            url.searchParams.set('zendesk_error', msg);
+            return res.redirect(302, url.toString());
+        } catch {
+            return res.status(400).send(`Zendesk connection failed: ${msg}`);
+        }
+    };
+
+    if (error) return failRedirect(String(error).substring(0, 200));
+    if (!code) return failRedirect('missing_code');
+    if (!subdomain) return failRedirect('invalid_subdomain');
+
+    if (await gateOAuthFeature(req, res, email, origin, 'zendeskAgent')) return;
+
+    const clientId = process.env.ZENDESK_CLIENT_ID;
+    const clientSecret = process.env.ZENDESK_CLIENT_SECRET;
+    if (!clientId || !clientSecret) {
+        console.error('[Zendesk/OAuth/Callback] Missing ZENDESK_CLIENT_ID or ZENDESK_CLIENT_SECRET.');
+        return failRedirect('oauth_not_configured');
+    }
+
+    try {
+        let tokens;
+        try {
+            tokens = await zendeskTokenRequest(subdomain, {
+                grant_type: 'authorization_code',
+                code: String(code),
+                client_id: clientId,
+                client_secret: clientSecret,
+                redirect_uri: zendeskRedirectUri(req),
+                scope: ZENDESK_SCOPES.join(' '),
+                expires_in: ZENDESK_TOKEN_TTL_SECS,
+                refresh_token_expires_in: ZENDESK_REFRESH_TTL_SECS,
+            });
+        } catch (e) {
+            console.error('[Zendesk/OAuth/Callback] Token exchange failed:', e.message);
+            return failRedirect(String(e.code || 'token_exchange_failed').substring(0, 200));
+        }
+
+        const db = getDb();
+
+        // One Zendesk account can only be linked to one Mebor account.
+        const existing = await db.collection('user_secrets').where('integrations.zendesk.subdomain', '==', subdomain).limit(5).get();
+        let takenByOther = false;
+        existing.forEach(d => { if (d.id !== email && d.data()?.integrations?.zendesk?.connected) takenByOther = true; });
+        if (takenByOther) return failRedirect('account_already_connected');
+
+        // Who authorised? (best effort — uses users:read)
+        let authUser = null;
+        try {
+            const me = await fetch(`${zendeskBaseUrl(subdomain)}/api/v2/users/me.json`, {
+                headers: { Authorization: `Bearer ${tokens.access_token}`, Accept: 'application/json' },
+                signal: AbortSignal.timeout(8000),
+            });
+            if (me.ok) authUser = (await me.json())?.user || null;
+        } catch (e) { console.warn('[Zendesk/OAuth/me]', e.message); }
+
+        // Replace a previous connection cleanly (its webhook/triggers are re-created below).
+        const prior = (await getUserSecrets(db, email))?.integrations?.zendesk;
+        if (prior?.connected) await teardownZendeskAutomation(db, email).catch(() => {});
+
+        await setUserSecrets(db, email, {
+            integrations: {
+                zendesk: {
+                    connected: true,
+                    subdomain,
+                    accountLabel: `${subdomain}.zendesk.com`,
+                    authorizedUserId: authUser?.id || null,
+                    authorizedUserEmail: authUser?.email || null,
+                    authorizedUserName: authUser?.name || null,
+                    scope: tokens.scope || ZENDESK_SCOPES.join(' '),
+                    connectedAt: new Date().toISOString(),
+                    authMethod: 'oauth',
+                    ...zendeskTokenPatch(tokens),
+                    hookKey: null, webhookId: null, triggerIds: [], signingSecretEnc: null, provisionError: null,
+                },
+            },
+        });
+        await db.collection('users').doc(email).set({
+            integrations: { zendesk: publicIntegrationFlag(true) },
+        }, { merge: true });
+
+        const prov = await provisionZendeskAutomation(db, email, zendeskPublicBase(req));
+
+        try {
+            const url = new URL(appUrl);
+            url.searchParams.set('zendesk_connected', '1');
+            if (!prov.ok) url.searchParams.set('zendesk_warning', 'webhook_setup_failed');
+            return res.redirect(302, url.toString());
+        } catch {
+            return res.status(200).send('Zendesk connected. You can close this tab.');
+        }
+    } catch (err) {
+        console.error('[Zendesk/OAuth/Callback]', err.message);
+        return failRedirect('server_error');
+    }
+}
+
+// GET /api/zendesk/status?ownerEmail=…[&stats=1]
+async function handleZendeskStatus(req, res) {
+    if (req.method !== 'GET') return res.status(405).json({ success: false });
+    const ownerEmail = String(req.query?.ownerEmail || '').trim();
+    if (!ownerEmail) return res.status(400).json({ success: false, connected: false, message: 'ownerEmail is required.' });
+
+    const auth = await requireAuth(req, res, { matches: [ownerEmail] });
+    if (!auth) return;
+
+    try {
+        const db = getDb();
+        const secrets = await getUserSecrets(db, ownerEmail);
+        const zd = secrets?.integrations?.zendesk || null;
+        const connected = !!zd?.connected;
+
+        let stats = null;
+        if (String(req.query?.stats) === '1') {
+            stats = {};
+            try {
+                const botsSnap = await db.collection('user_bots').where('owner', '==', ownerEmail).get();
+                botsSnap.forEach(d => {
+                    const b = d.data();
+                    if (b.deletedAt || !normalizeChannels(b).includes('zendesk')) return;
+                    stats[d.id] = { pending: 0, sent: 0 };
+                });
+                const draftsSnap = await db.collection('zendesk_drafts').where('ownerEmail', '==', ownerEmail).get();
+                draftsSnap.forEach(d => {
+                    const v = d.data();
+                    if (!stats[v.businessId]) stats[v.businessId] = { pending: 0, sent: 0 };
+                    if (v.status === 'pending') stats[v.businessId].pending++;
+                    if (v.status === 'sent' || v.status === 'scheduled') stats[v.businessId].sent++;
+                });
+            } catch (e) { console.warn('[Zendesk/Status/stats]', e.message); }
+        }
+
+        return res.json({
+            success: true,
+            connected,
+            accountLabel: connected ? (zd.accountLabel || null) : null,
+            subdomain: connected ? (zd.subdomain || null) : null,
+            authorizedUserEmail: connected ? (zd.authorizedUserEmail || null) : null,
+            needsReauth: connected ? !!zd.needsReauth : false,
+            webhookActive: connected ? !!(zd.webhookId && (zd.triggerIds || []).length >= 2) : false,
+            provisionError: connected ? (zd.provisionError || null) : null,
+            approvalTags: { approve: ZD_TAG.APPROVE, reject: ZD_TAG.REJECT },
+            stats,
+        });
+    } catch (err) {
+        console.error('[Zendesk/Status]', err.message);
+        return res.status(200).json({ success: true, connected: false, stats: {} });
+    }
+}
+
+// POST /api/zendesk/reprovision  { ownerEmail }  — re-create the webhook + triggers
+async function handleZendeskReprovision(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { ownerEmail } = req.body || {};
+    if (!ownerEmail) return res.status(400).json({ success: false, message: 'Missing ownerEmail.' });
+
+    const auth = await requireAuth(req, res, { matches: [ownerEmail] });
+    if (!auth) return;
+
+    try {
+        const db = getDb();
+        if (await denyIfFeatureLocked(res, db, ownerEmail, 'zendeskAgent')) return;
+        const secrets = await getUserSecrets(db, ownerEmail);
+        if (!secrets?.integrations?.zendesk?.connected)
+            return res.status(400).json({ success: false, message: 'Zendesk is not connected.' });
+        const r = await provisionZendeskAutomation(db, ownerEmail, zendeskPublicBase(req));
+        if (!r.ok) return res.status(502).json({ success: false, message: r.error || 'Webhook setup failed.' });
+        return res.json({ success: true, message: 'Zendesk webhook and triggers re-created.' });
+    } catch (err) {
+        console.error('[Zendesk/Reprovision]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// POST /api/zendesk/disconnect  { ownerEmail }
+async function handleZendeskDisconnect(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { ownerEmail } = req.body || {};
+    if (!ownerEmail) return res.status(400).json({ success: false, message: 'Missing ownerEmail.' });
+
+    const auth = await requireAuth(req, res, { matches: [ownerEmail] });
+    if (!auth) return;
+
+    try {
+        const db = getDb();
+        // Best effort: remove our webhook/triggers and revoke the token in Zendesk.
+        await teardownZendeskAutomation(db, ownerEmail).catch(e => console.warn('[Zendesk/Disconnect/teardown]', e.message));
+        await zendeskApi(db, ownerEmail, 'DELETE', '/api/v2/oauth/tokens/current.json').catch(() => {});
+
+        await setUserSecrets(db, ownerEmail, { integrations: { zendesk: null } });
+        await db.collection('users').doc(ownerEmail).set({
+            integrations: { zendesk: publicIntegrationFlag(false) },
+        }, { merge: true });
+
+        try {
+            const drafts = await db.collection('zendesk_drafts')
+                .where('ownerEmail', '==', ownerEmail)
+                .where('status', 'in', ['pending', 'scheduled'])
+                .get();
+            if (!drafts.empty) {
+                const batch = db.batch();
+                drafts.docs.forEach(d => batch.update(d.ref, { status: 'abandoned', abandonedAt: new Date().toISOString() }));
+                await batch.commit();
+            }
+        } catch (e) { console.warn('[Zendesk/Disconnect/drafts]', e.message); }
+
+        return res.json({ success: true, message: 'Zendesk disconnected.' });
+    } catch (err) {
+        console.error('[Zendesk/Disconnect]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// GET /api/zendesk/pending?ownerEmail=…
+async function handleZendeskPending(req, res) {
+    if (req.method !== 'GET') return res.status(405).json({ success: false, pending: [] });
+    const ownerEmail = String(req.query?.ownerEmail || '').trim();
+    if (!ownerEmail) return res.status(400).json({ success: false, pending: [], message: 'ownerEmail is required.' });
+
+    const auth = await requireAuth(req, res, { matches: [ownerEmail] });
+    if (!auth) return;
+
+    try {
+        const db = getDb();
+        const snap = await db.collection('zendesk_drafts')
+            .where('ownerEmail', '==', ownerEmail)
+            .where('status', '==', 'pending')
+            .get();
+        const pending = [];
+        snap.forEach(d => {
+            const v = d.data();
+            pending.push({
+                id: d.id,
+                businessId: v.businessId || '',
+                botName: v.botName || v.businessId || 'Zendesk Agent',
+                ticketId: v.ticketId || '',
+                ticketSubject: v.ticketSubject || '',
+                ticketUrl: v.subdomain && v.ticketId ? zendeskTicketUrl(v.subdomain, v.ticketId) : null,
+                requesterName: v.requesterName || '',
+                channelName: `Ticket #${v.ticketId || '?'}${v.ticketSubject ? ` · ${v.ticketSubject}` : ''}`,
+                originalMessage: v.originalMessage || '',
+                draftedResponse: v.draftedResponse || '',
+                createdAt: v.createdAt || null,
+            });
+        });
+        pending.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+        return res.json({ success: true, pending });
+    } catch (err) {
+        console.error('[Zendesk/Pending]', err.message);
+        return res.status(200).json({ success: true, pending: [] });
+    }
+}
+
+// POST /api/zendesk/approve  { draftId, ownerEmail, finalResponse }
+async function handleZendeskApprove(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { draftId, ownerEmail, finalResponse } = req.body || {};
+    if (!draftId || !ownerEmail || !finalResponse)
+        return res.status(400).json({ success: false, message: 'Missing draftId, ownerEmail, or finalResponse.' });
+
+    const auth = await requireAuth(req, res, { matches: [ownerEmail] });
+    if (!auth) return;
+
+    try {
+        const db = getDb();
+        const ref = db.collection('zendesk_drafts').doc(String(draftId));
+        const snap = await ref.get();
+        if (!snap.exists) return res.status(404).json({ success: false, message: 'Draft not found.' });
+        const draft = snap.data();
+        if (draft.ownerEmail !== ownerEmail)
+            return res.status(403).json({ success: false, message: 'You do not own this draft.' });
+        if (draft.status !== 'pending')
+            return res.status(409).json({ success: false, message: `This draft is already ${draft.status}.` });
+
+        const secrets = await getUserSecrets(db, ownerEmail);
+        if (!secrets?.integrations?.zendesk?.connected)
+            return res.status(400).json({ success: false, message: 'Zendesk is disconnected. Reconnect it before approving.' });
+
+        // Claim first so a simultaneous tag-approval in Zendesk cannot double-send.
+        const claimed = await db.runTransaction(async (tx) => {
+            const s = await tx.get(ref);
+            if (!s.exists || s.data().status !== 'pending') return false;
+            tx.set(ref, { status: 'sending' }, { merge: true });
+            return true;
+        }).catch(() => false);
+        if (!claimed) return res.status(409).json({ success: false, message: 'This draft is already being handled.' });
+
+        const text = String(finalResponse);
+        const agentSnap = await db.collection('user_bots').doc(draft.businessId).get();
+        const statusAfter = agentSnap.data()?.zendeskConfig?.statusAfterReply || '';
+        try {
+            await sendZendeskPublicReply(db, ownerEmail, draft.ticketId, text, {
+                statusAfter, removeTags: [ZD_TAG.PENDING, ZD_TAG.APPROVE, ZD_TAG.REJECT],
+            });
+        } catch (e) {
+            await ref.set({ status: 'pending', sendError: String(e.message).substring(0, 300) }, { merge: true });
+            throw e;
+        }
+
+        const now = new Date().toISOString();
+        await ref.set({ status: 'sent', finalResponse: text, approvedAt: now, sentAt: now, approvedBy: ownerEmail }, { merge: true });
+        await logChat(db, draft.businessId, `zendesk-${draft.subdomain}-${draft.ticketId}`, draft.originalMessage || '', text, true, false, { source: 'zendesk' });
+
+        return res.json({ success: true, message: 'Reply approved and sent.' });
+    } catch (err) {
+        console.error('[Zendesk/Approve]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// POST /api/zendesk/reject  { draftId, ownerEmail }
+async function handleZendeskReject(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { draftId, ownerEmail } = req.body || {};
+    if (!draftId || !ownerEmail)
+        return res.status(400).json({ success: false, message: 'Missing draftId or ownerEmail.' });
+
+    const auth = await requireAuth(req, res, { matches: [ownerEmail] });
+    if (!auth) return;
+
+    try {
+        const db = getDb();
+        const ref = db.collection('zendesk_drafts').doc(String(draftId));
+        const snap = await ref.get();
+        if (!snap.exists) return res.status(404).json({ success: false, message: 'Draft not found.' });
+        const draft = snap.data();
+        if (draft.ownerEmail !== ownerEmail)
+            return res.status(403).json({ success: false, message: 'You do not own this draft.' });
+        if (draft.status !== 'pending')
+            return res.status(409).json({ success: false, message: `This draft is already ${draft.status}.` });
+
+        await ref.set({ status: 'rejected', rejectedAt: new Date().toISOString(), rejectedBy: ownerEmail }, { merge: true });
+        // Tidy the ticket's tags (best effort).
+        await zendeskApi(db, ownerEmail, 'PUT', `/api/v2/tickets/${draft.ticketId}.json`, {
+            ticket: { additional_tags: [ZD_TAG.REJECTED], remove_tags: [ZD_TAG.PENDING, ZD_TAG.APPROVE, ZD_TAG.REJECT] },
+        }).catch(e => console.warn('[Zendesk/Reject/tags]', e.message));
+        return res.json({ success: true });
+    } catch (err) {
+        console.error('[Zendesk/Reject]', err.message);
         return res.status(500).json({ success: false, message: err.message });
     }
 }
@@ -4014,6 +5214,10 @@ async function handleAccountDeleteCascade(req, res) {
             await db.collection('company_secrets').doc(companyUsername).delete().catch(() => {});
         }
 
+        await teardownZendeskAutomation(db, email).catch(() => {});
+        await deleteQueryBatch(db, db.collection('zendesk_drafts').where('ownerEmail', '==', email));
+        await deleteQueryBatch(db, db.collection('zendesk_tickets').where('ownerEmail', '==', email));
+        await deleteQueryBatch(db, db.collection('zendesk_events').where('ownerEmail', '==', email));
         await db.collection('user_secrets').doc(email).delete().catch(() => {});
         await db.collection('users').doc(email).delete().catch(() => {});
 
@@ -4757,6 +5961,7 @@ async function handleEmailPollWorker(req, res) {
         const replyResult = await runEmailReplyJob(db, startedAt);
         const gchatResult = await runGoogleChatReplyJob(db, startedAt);
         const slackResult = await runSlackScheduledJob(db);
+        const zendeskResult = await runZendeskScheduledJob(db);
         return res.json({
             success: true,
             elapsedMs: Date.now() - startedAt,
@@ -4764,6 +5969,7 @@ async function handleEmailPollWorker(req, res) {
             reply: replyResult,
             googleChat: gchatResult,
             slack: slackResult,
+            zendesk: zendeskResult,
         });
     } catch (err) {
         console.error('[Email/Tick]', err.message);
@@ -5906,6 +7112,19 @@ async function handleDeploy(req, res) {
             };
         }
 
+        if (incomingChannels.includes('zendesk') || botData.zendeskConfig) {
+            const zc = botData.zendeskConfig || {};
+            botData.zendeskConfig = {
+                requireHumanApproval: zc.requireHumanApproval !== false,
+                autoSendDelay: /^\d{1,3}:\d{2}:\d{2}$/.test(String(zc.autoSendDelay || ''))
+                    ? zc.autoSendDelay
+                    : '00:00:02',
+                statusAfterReply: ['open', 'pending', 'solved'].includes(zc.statusAfterReply) ? zc.statusAfterReply : '',
+                escalateOnHandoff: zc.escalateOnHandoff !== false,
+                escalationPriority: ['low', 'normal', 'high', 'urgent'].includes(zc.escalationPriority) ? zc.escalationPriority : 'normal',
+            };
+        }
+
         if (incomingChannels.includes('email')) {
             const ec = botData.emailConfig || {};
             botData.emailConfig = {
@@ -6287,9 +7506,11 @@ async function generateBotReply({ db, businessId, userMsg, history = [], convers
         sysPrompt += `\n\nTHIS IS A GOOGLE CHAT CONVERSATION. Keep replies conversational and short — Google Chat strips most Markdown, so plain text with short paragraphs works best. Bold via *asterisks* is fine; avoid headings, tables, and code fences.`;
     } else if (source === 'slack') {
         sysPrompt += `\n\nTHIS IS A SLACK CONVERSATION. Keep replies conversational and concise. Slack uses its own mrkdwn: *single asterisks* for bold, and bullet lists with "-". Avoid headings, tables, and code fences.`;
+    } else if (source === 'zendesk') {
+        sysPrompt += `\n\nTHIS IS A REPLY TO A ZENDESK SUPPORT TICKET. Write a clear, polite, professional reply to the customer as a support agent would. Use plain text only: no Markdown, no headings, no tables, no code fences. Keep paragraphs short, start with a brief greeting and end with a brief sign-off. Do NOT mention chat, widgets, or "typing". If you cannot answer from the provided knowledge, say honestly that a member of the team will follow up instead of guessing.`;
     }
 
-    const wantsHuman = humanHandoffEnabled && /speak to human support|connect (me )?(to )?(a )?human|talk to (a )?(human|person|someone|agent|representative)|(human|real) (agent|person)|customer service rep|talk to (someone|somebody) real/i.test(userMsg);
+    const wantsHuman = humanHandoffEnabled && source !== 'zendesk' && /speak to human support|connect (me )?(to )?(a )?human|talk to (a )?(human|person|someone|agent|representative)|(human|real) (agent|person)|customer service rep|talk to (someone|somebody) real/i.test(userMsg);
     if (wantsHuman) {
         try {
             const { requestId } = await ensureHumanRequest(db, {
@@ -6297,6 +7518,11 @@ async function generateBotReply({ db, businessId, userMsg, history = [], convers
             });
             await notifyOwnerAndEmployees(db, ownerEmail, buildHumanRequestNotification(botName, userMsg))
                 .catch(e => console.error('[Human/FCM]', e.message));
+            // Outbound escalation: also open a Zendesk ticket when the owner connected Zendesk.
+            await Promise.race([
+                escalateToZendesk(db, { ownerEmail, businessId, botName, conversationId: convId, source, lastMessage: userMsg }),
+                new Promise(r => setTimeout(r, 7000)),
+            ]).catch(e => console.error('[Human/Zendesk]', e.message));
             const reply = "I've let our team know you'd like to speak with a person — someone will join this chat shortly. Feel free to keep typing in the meantime and they'll see it as soon as they connect.";
             await logChat(db, businessId, convId, userMsg, reply, false, false, { humanRequested: true, source });
             return { answer: reply, meta: { _humanRequested: true, _requestId: requestId, _credits: {} } };
