@@ -2838,6 +2838,19 @@ const ZD_TAG = {
     ESCALATED: 'mebor_escalation',
 };
 
+function normalizeZendeskTag(raw, fallback) {
+    const t = String(raw || '').trim().toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_\-]/g, '').slice(0, 60);
+    return t || fallback;
+}
+
+// Each agent can use its own approve / reject tag (dashboard: "Zendesk Behavior").
+function zendeskAgentTags(zc) {
+    const approve = normalizeZendeskTag(zc?.approveTag, ZD_TAG.APPROVE);
+    let reject = normalizeZendeskTag(zc?.rejectTag, ZD_TAG.REJECT);
+    if (reject === approve) reject = approve === ZD_TAG.REJECT ? 'mebor_reject_draft' : ZD_TAG.REJECT;
+    return { approve, reject };
+}
+
 const ZENDESK_HUMAN_RE = /speak to human support|connect (me )?(to )?(a )?human|talk to (a )?(human|person|someone|agent|representative)|(human|real) (agent|person)|customer service rep|talk to (someone|somebody) real/i;
 const ZENDESK_STATUS_AFTER_REPLY = ['open', 'pending', 'solved'];
 const ZENDESK_PRIORITIES = ['low', 'normal', 'high', 'urgent'];
@@ -3024,7 +3037,7 @@ async function teardownZendeskAutomation(db, ownerEmail) {
 /**
  * Creates (or re-creates) the Zendesk webhook and the two triggers that feed it:
  *   1. "inbound"  – a customer's public comment (new ticket or reply) → webhook
- *   2. "approval" – a ticket gets the mebor_approve / mebor_reject tag → webhook
+ *   2. "approval" – a ticket with a pending draft is updated (agent adds its approve / reject tag) → webhook
  * The webhook body only carries ids; the ticket content is fetched through the API, which
  * avoids any JSON-escaping problems with customer text.
  */
@@ -3080,13 +3093,12 @@ async function provisionZendeskAutomation(db, ownerEmail, publicBase) {
         const approval = await zendeskApi(db, ownerEmail, 'POST', '/api/v2/triggers.json', {
             trigger: {
                 title: `Mebor Agents – draft approval tags (${suffix})`,
-                description: `Notifies Mebor Agents when ${ZD_TAG.APPROVE} or ${ZD_TAG.REJECT} is added to a ticket. Managed automatically.`,
+                description: `Notifies Mebor Agents when a ticket with a pending AI draft is updated, so the approve / reject tag can be applied. Managed automatically.`,
                 active: true,
                 conditions: {
-                    all: [{ field: 'update_type', operator: 'is', value: 'Change' }],
-                    any: [
-                        { field: 'current_tags', operator: 'includes', value: ZD_TAG.APPROVE },
-                        { field: 'current_tags', operator: 'includes', value: ZD_TAG.REJECT },
+                    all: [
+                        { field: 'update_type', operator: 'is', value: 'Change' },
+                        { field: 'current_tags', operator: 'includes', value: ZD_TAG.PENDING },
                     ],
                 },
                 actions: [{
@@ -3132,7 +3144,7 @@ async function findZendeskAgentForOwner(db, ownerEmail) {
     botsSnap.forEach(d => {
         const b = d.data();
         if (b.deletedAt || agent) return;
-        if (normalizeChannels(b).includes('zendesk')) agent = { id: d.id, name: b.displayName || b.name || 'Assistant', data: b };
+        if (normalizeChannels(b).includes('zendesk') && b.zendeskConfig?.inboundEnabled !== false) agent = { id: d.id, name: b.displayName || b.name || 'Assistant', data: b };
     });
     return agent;
 }
@@ -3265,6 +3277,7 @@ async function processZendeskInbound(db, { ownerEmail, zd, ticketId }) {
         const nowISO = new Date().toISOString();
         const zc = agent.data.zendeskConfig || {};
         const requester = users.get(ticket.requester_id);
+        const tagsCfg = zendeskAgentTags(zc);
         const convId = `zendesk-${zd.subdomain}-${ticketId}`;
 
         // Customer asked for a person → flag the ticket for a human, no AI reply.
@@ -3309,7 +3322,7 @@ async function processZendeskInbound(db, { ownerEmail, zd, ticketId }) {
         const draftBase = {
             ownerEmail, businessId: agent.id, botName: agent.name, subdomain: zd.subdomain,
             ticketId: String(ticketId), ticketSubject: String(ticket.subject || '').substring(0, 200),
-            requesterId: ticket.requester_id || null, requesterName: requester?.name || null,
+            requesterId: ticket.requester_id || null, requesterName: requester?.name || null, requesterEmail: requester?.email || null,
             commentId: String(latest.id), originalMessage: userText, draftedResponse: replyText,
             createdAt: nowISO,
         };
@@ -3330,8 +3343,8 @@ async function processZendeskInbound(db, { ownerEmail, zd, ticketId }) {
                 await addZendeskInternalNote(db, ownerEmail, ticketId,
                     `🤖 Mebor Agents drafted a reply (NOT sent yet):\n` +
                     `──────────\n${toZendeskPlain(replyText)}\n──────────\n` +
-                    `• To send it to the customer, add the tag "${ZD_TAG.APPROVE}" to this ticket.\n` +
-                    `• To discard it, add the tag "${ZD_TAG.REJECT}".\n` +
+                    `• To send it to the customer, add the tag "${tagsCfg.approve}" to this ticket.\n` +
+                    `• To discard it, add the tag "${tagsCfg.reject}".\n` +
                     `• You can also edit and approve it from the Mebor Agents dashboard.`,
                     { addTags: [ZD_TAG.PENDING] });
             } catch (e) {
@@ -3364,27 +3377,31 @@ async function processZendeskInbound(db, { ownerEmail, zd, ticketId }) {
     }
 }
 
-// Agent added mebor_approve / mebor_reject on the ticket.
+// A ticket with a pending draft was updated: act only if the agent added the approve / reject tag.
 async function processZendeskApproval(db, { ownerEmail, zd, ticketId, actor }) {
-    const tk = await zendeskApi(db, ownerEmail, 'GET', `/api/v2/tickets/${ticketId}.json`);
-    const tags = Array.isArray(tk?.ticket?.tags) ? tk.ticket.tags : [];
-    const wantReject = tags.includes(ZD_TAG.REJECT);
-    const wantApprove = tags.includes(ZD_TAG.APPROVE);
-    if (!wantApprove && !wantReject) return;
-
-    const clearTags = [ZD_TAG.APPROVE, ZD_TAG.REJECT, ZD_TAG.PENDING];
     const snap = await db.collection('zendesk_drafts')
         .where('ownerEmail', '==', ownerEmail).where('ticketId', '==', String(ticketId)).where('status', '==', 'pending').get();
-    const drafts = snap.docs.sort((a, b) => String(b.data().createdAt || '').localeCompare(String(a.data().createdAt || '')));
-
-    if (!drafts.length) {
-        await addZendeskInternalNote(db, ownerEmail, ticketId,
-            '🤖 Mebor Agents: there is no pending draft for this ticket, so the approval tag was cleared.',
-            { removeTags: clearTags }).catch(e => console.warn('[Zendesk/Approval/clear]', e.message));
+    if (snap.empty) {
+        // Stale pending marker (draft already handled elsewhere) — clear it so it stops firing.
+        await zendeskApi(db, ownerEmail, 'PUT', `/api/v2/tickets/${ticketId}.json`, { ticket: { remove_tags: [ZD_TAG.PENDING] } })
+            .catch(e => console.warn('[Zendesk/Approval/stale]', e.message));
         return;
     }
-
+    const drafts = snap.docs.sort((a, b) => String(b.data().createdAt || '').localeCompare(String(a.data().createdAt || '')));
     const target = drafts[0];
+    const draft = target.data();
+
+    const agentSnap = await db.collection('user_bots').doc(draft.businessId).get();
+    const agentCfg = agentSnap.exists ? (agentSnap.data().zendeskConfig || {}) : {};
+    const tagsCfg = zendeskAgentTags(agentCfg);
+
+    const tk = await zendeskApi(db, ownerEmail, 'GET', `/api/v2/tickets/${ticketId}.json`);
+    const tags = Array.isArray(tk?.ticket?.tags) ? tk.ticket.tags : [];
+    const wantReject = tags.includes(tagsCfg.reject);
+    const wantApprove = tags.includes(tagsCfg.approve);
+    if (!wantApprove && !wantReject) return; // unrelated update — draft stays pending
+
+    const clearTags = [tagsCfg.approve, tagsCfg.reject, ZD_TAG.PENDING];
     const nowISO = new Date().toISOString();
     // Older pending drafts on the same ticket are obsolete.
     for (const d of drafts.slice(1)) await d.ref.set({ status: 'superseded', supersededAt: nowISO }, { merge: true });
@@ -3396,7 +3413,6 @@ async function processZendeskApproval(db, { ownerEmail, zd, ticketId, actor }) {
         return true;
     }).catch(() => false);
     if (!claimed) return;
-    const draft = target.data();
 
     // If both tags are present, reject wins — the safe choice.
     if (wantReject) {
@@ -3408,17 +3424,15 @@ async function processZendeskApproval(db, { ownerEmail, zd, ticketId, actor }) {
     }
 
     try {
-        const agentSnap = await db.collection('user_bots').doc(draft.businessId).get();
-        const statusAfter = agentSnap.data()?.zendeskConfig?.statusAfterReply || '';
-        await sendZendeskPublicReply(db, ownerEmail, ticketId, draft.draftedResponse, { statusAfter, removeTags: clearTags });
+        await sendZendeskPublicReply(db, ownerEmail, ticketId, draft.draftedResponse, { statusAfter: agentCfg.statusAfterReply || '', removeTags: clearTags });
         await target.ref.set({ status: 'sent', finalResponse: draft.draftedResponse, approvedAt: nowISO, sentAt: nowISO, approvedBy: actor || 'zendesk-tag' }, { merge: true });
         await logChat(db, draft.businessId, `zendesk-${draft.subdomain}-${ticketId}`, draft.originalMessage || '', draft.draftedResponse, true, false, { source: 'zendesk' });
     } catch (e) {
         console.error('[Zendesk/Approve]', e.message);
         await target.ref.set({ status: 'pending', sendError: String(e.message).substring(0, 300) }, { merge: true });
         await addZendeskInternalNote(db, ownerEmail, ticketId,
-            `🤖 Mebor Agents could not send the approved reply (${String(e.message).substring(0, 160)}). The draft is still pending — add "${ZD_TAG.APPROVE}" again to retry.`,
-            { removeTags: [ZD_TAG.APPROVE] }).catch(() => {});
+            `🤖 Mebor Agents could not send the approved reply (${String(e.message).substring(0, 160)}). The draft is still pending — add "${tagsCfg.approve}" again to retry.`,
+            { removeTags: [tagsCfg.approve] }).catch(() => {});
     }
 }
 
@@ -3471,7 +3485,7 @@ async function escalateToZendesk(db, opts) {
     const {
         ownerEmail, businessId, botName = 'Assistant', conversationId, source = 'web',
         lastMessage = '', subject = '', priority = '', requesterName = '', requesterEmail = '',
-        reason = 'Customer asked to speak with a person.', force = false,
+        reason = 'Customer asked to speak with a person.', force = false, onlyIfNew = false,
     } = opts || {};
     try {
         if (!ownerEmail || !businessId || !conversationId) return { created: false, skipped: 'missing-params' };
@@ -3487,7 +3501,7 @@ async function escalateToZendesk(db, opts) {
         const bot = botSnap.exists ? botSnap.data() : null;
         if (!bot || bot.deletedAt || bot.owner !== ownerEmail) return { created: false, skipped: 'bot' };
         const zc = bot.zendeskConfig || {};
-        if (!force && zc.escalateOnHandoff === false) return { created: false, skipped: 'disabled' };
+        if (!force && zc.escalationEnabled !== true) return { created: false, skipped: 'disabled' };
 
         const prio = ZENDESK_PRIORITIES.includes(priority) ? priority
             : (ZENDESK_PRIORITIES.includes(zc.escalationPriority) ? zc.escalationPriority : 'normal');
@@ -3504,9 +3518,33 @@ async function escalateToZendesk(db, opts) {
                 .join('\n\n');
         } catch (e) { console.warn('[Zendesk/Escalate/transcript]', e.message); }
 
+        // Customer details: lead captured in the conversation, or the email sender.
+        let custName = String(requesterName || '').trim();
+        let custEmail = String(requesterEmail || '').trim();
+        let custContact = '';
+        try {
+            if (!custEmail || !custName) {
+                const leads = await db.collection('leads').where('conversationId', '==', conversationId).limit(5).get();
+                const lead = leads.docs.map(d => d.data()).filter(l => l.owner === ownerEmail)
+                    .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')))[0];
+                if (lead) {
+                    if (!custName && lead.customerName) custName = String(lead.customerName);
+                    const contact = String(lead.contactInfo || '').trim();
+                    if (/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(contact)) { if (!custEmail) custEmail = contact; }
+                    else if (contact) custContact = contact;
+                }
+            }
+            if (!custEmail && String(conversationId).startsWith('email-')) {
+                const q = await db.collection('email_queue').doc(String(conversationId).slice(6)).get();
+                if (q.exists && q.data().fromEmail) custEmail = String(q.data().fromEmail);
+            }
+        } catch (e) { console.warn('[Zendesk/Escalate/customer]', e.message); }
+
         const noteBody = [
             `Escalated by Mebor Agents (${botName}) — channel: ${source}.`,
             `Reason: ${reason}`,
+            (custName || custEmail || custContact)
+                ? `Customer: ${[custName, custEmail ? `<${custEmail}>` : '', custContact].filter(Boolean).join(' ')}` : '',
             lastMessage ? `\nLatest customer message:\n${String(lastMessage).substring(0, 1500)}` : '',
             transcript ? `\n──── Conversation so far ────\n${transcript}` : '',
         ].filter(Boolean).join('\n').substring(0, 20000);
@@ -3515,6 +3553,7 @@ async function escalateToZendesk(db, opts) {
             crypto.createHash('sha1').update(`${ownerEmail}|${businessId}|${conversationId}`).digest('hex'));
         const existing = await linkRef.get();
         if (existing.exists && existing.data().ticketId) {
+            if (onlyIfNew) return { created: false, existing: true, ticketId: existing.data().ticketId, url: zendeskTicketUrl(zd.subdomain, existing.data().ticketId) };
             try {
                 await addZendeskInternalNote(db, ownerEmail, existing.data().ticketId,
                     `Customer followed up:\n${String(lastMessage || '(no new message)').substring(0, 3000)}`);
@@ -3524,17 +3563,18 @@ async function escalateToZendesk(db, opts) {
             }
         }
 
+        const escTags = (Array.isArray(zc.escalationTags) && zc.escalationTags.length ? zc.escalationTags : ['mebor_escalated'])
+            .map(t => normalizeZendeskTag(t, '')).filter(Boolean).slice(0, 10);
         const cleanSource = String(source).replace(/[^a-z0-9_]/gi, '').toLowerCase() || 'web';
         const ticket = {
             subject: String(subject || `[${botName}] Customer needs human support`).substring(0, 200),
             comment: { body: noteBody, public: false },
             priority: prio,
-            tags: ['mebor', ZD_TAG.ESCALATED, ZD_TAG.IGNORE, `mebor_source_${cleanSource}`],
+            tags: [...new Set([...escTags, ZD_TAG.IGNORE, `mebor_source_${cleanSource}`])],
             external_id: String(conversationId).substring(0, 200),
         };
-        const email = String(requesterEmail || '').trim();
-        if (/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
-            ticket.requester = { name: String(requesterName || email).substring(0, 100), email };
+        if (/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(custEmail)) {
+            ticket.requester = { name: String(custName || custEmail).substring(0, 100), email: custEmail };
         }
 
         const created = await zendeskApi(db, ownerEmail, 'POST', '/api/v2/tickets.json', { ticket });
@@ -3768,14 +3808,20 @@ async function handleZendeskStatus(req, res) {
                 botsSnap.forEach(d => {
                     const b = d.data();
                     if (b.deletedAt || !normalizeChannels(b).includes('zendesk')) return;
-                    stats[d.id] = { pending: 0, sent: 0 };
+                    stats[d.id] = { pending: 0, sent: 0, escalated: 0 };
                 });
                 const draftsSnap = await db.collection('zendesk_drafts').where('ownerEmail', '==', ownerEmail).get();
                 draftsSnap.forEach(d => {
                     const v = d.data();
-                    if (!stats[v.businessId]) stats[v.businessId] = { pending: 0, sent: 0 };
+                    if (!stats[v.businessId]) stats[v.businessId] = { pending: 0, sent: 0, escalated: 0 };
                     if (v.status === 'pending') stats[v.businessId].pending++;
                     if (v.status === 'sent' || v.status === 'scheduled') stats[v.businessId].sent++;
+                });
+                const escSnap = await db.collection('zendesk_tickets').where('ownerEmail', '==', ownerEmail).get();
+                escSnap.forEach(d => {
+                    const v = d.data();
+                    if (!stats[v.businessId]) stats[v.businessId] = { pending: 0, sent: 0, escalated: 0 };
+                    stats[v.businessId].escalated++;
                 });
             } catch (e) { console.warn('[Zendesk/Status/stats]', e.message); }
         }
@@ -3789,7 +3835,7 @@ async function handleZendeskStatus(req, res) {
             needsReauth: connected ? !!zd.needsReauth : false,
             webhookActive: connected ? !!(zd.webhookId && (zd.triggerIds || []).length >= 2) : false,
             provisionError: connected ? (zd.provisionError || null) : null,
-            approvalTags: { approve: ZD_TAG.APPROVE, reject: ZD_TAG.REJECT },
+            defaultApprovalTags: { approve: ZD_TAG.APPROVE, reject: ZD_TAG.REJECT },
             stats,
         });
     } catch (err) {
@@ -3887,6 +3933,8 @@ async function handleZendeskPending(req, res) {
                 ticketSubject: v.ticketSubject || '',
                 ticketUrl: v.subdomain && v.ticketId ? zendeskTicketUrl(v.subdomain, v.ticketId) : null,
                 requesterName: v.requesterName || '',
+                requesterEmail: v.requesterEmail || '',
+                subdomain: v.subdomain || '',
                 channelName: `Ticket #${v.ticketId || '?'}${v.ticketSubject ? ` · ${v.ticketSubject}` : ''}`,
                 originalMessage: v.originalMessage || '',
                 draftedResponse: v.draftedResponse || '',
@@ -3937,10 +3985,12 @@ async function handleZendeskApprove(req, res) {
 
         const text = String(finalResponse);
         const agentSnap = await db.collection('user_bots').doc(draft.businessId).get();
-        const statusAfter = agentSnap.data()?.zendeskConfig?.statusAfterReply || '';
+        const agentCfg = agentSnap.data()?.zendeskConfig || {};
+        const statusAfter = agentCfg.statusAfterReply || '';
+        const tagsCfg = zendeskAgentTags(agentCfg);
         try {
             await sendZendeskPublicReply(db, ownerEmail, draft.ticketId, text, {
-                statusAfter, removeTags: [ZD_TAG.PENDING, ZD_TAG.APPROVE, ZD_TAG.REJECT],
+                statusAfter, removeTags: [ZD_TAG.PENDING, tagsCfg.approve, tagsCfg.reject],
             });
         } catch (e) {
             await ref.set({ status: 'pending', sendError: String(e.message).substring(0, 300) }, { merge: true });
@@ -3981,8 +4031,10 @@ async function handleZendeskReject(req, res) {
 
         await ref.set({ status: 'rejected', rejectedAt: new Date().toISOString(), rejectedBy: ownerEmail }, { merge: true });
         // Tidy the ticket's tags (best effort).
+        const agentSnap = await db.collection('user_bots').doc(draft.businessId).get();
+        const tagsCfg = zendeskAgentTags(agentSnap.data()?.zendeskConfig);
         await zendeskApi(db, ownerEmail, 'PUT', `/api/v2/tickets/${draft.ticketId}.json`, {
-            ticket: { additional_tags: [ZD_TAG.REJECTED], remove_tags: [ZD_TAG.PENDING, ZD_TAG.APPROVE, ZD_TAG.REJECT] },
+            ticket: { additional_tags: [ZD_TAG.REJECTED], remove_tags: [ZD_TAG.PENDING, tagsCfg.approve, tagsCfg.reject] },
         }).catch(e => console.warn('[Zendesk/Reject/tags]', e.message));
         return res.json({ success: true });
     } catch (err) {
@@ -7114,15 +7166,21 @@ async function handleDeploy(req, res) {
 
         if (incomingChannels.includes('zendesk') || botData.zendeskConfig) {
             const zc = botData.zendeskConfig || {};
+            const zdTags = zendeskAgentTags(zc);
             botData.zendeskConfig = {
+                inboundEnabled: zc.inboundEnabled !== false,
                 requireHumanApproval: zc.requireHumanApproval !== false,
                 autoSendDelay: /^\d{1,3}:\d{2}:\d{2}$/.test(String(zc.autoSendDelay || ''))
                     ? zc.autoSendDelay
                     : '00:00:02',
-                statusAfterReply: ['open', 'pending', 'solved'].includes(zc.statusAfterReply) ? zc.statusAfterReply : '',
-                escalateOnHandoff: zc.escalateOnHandoff !== false,
+                approveTag: zdTags.approve,
+                rejectTag: zdTags.reject,
+                escalationEnabled: zc.escalationEnabled === true,
                 escalationPriority: ['low', 'normal', 'high', 'urgent'].includes(zc.escalationPriority) ? zc.escalationPriority : 'normal',
+                escalationTags: (Array.isArray(zc.escalationTags) ? zc.escalationTags : [])
+                    .map(t => normalizeZendeskTag(t, '')).filter(Boolean).slice(0, 10),
             };
+            if (!botData.zendeskConfig.escalationTags.length) botData.zendeskConfig.escalationTags = ['mebor_escalated'];
         }
 
         if (incomingChannels.includes('email')) {
@@ -10000,6 +10058,20 @@ async function logChat(db, businessId, convId, question, answer, isGenuineQuery,
             sentimentScore: sentiment.score,
             createdAt: new Date().toISOString(),
         });
+        if (fallback && !opts.humanRequested && !opts.creditBlocked && opts.source !== 'zendesk') {
+            const bs = await db.collection('user_bots').doc(businessId).get();
+            const bd = bs.exists ? bs.data() : null;
+            if (bd?.owner && bd.zendeskConfig?.escalationEnabled === true) {
+                await Promise.race([
+                    escalateToZendesk(db, {
+                        ownerEmail: bd.owner, businessId, botName: bd.displayName || bd.name || 'Assistant',
+                        conversationId: convId, source: opts.source || 'web', lastMessage: question,
+                        reason: "The AI agent could not resolve the customer's question.", onlyIfNew: true,
+                    }),
+                    new Promise(r => setTimeout(r, 7000)),
+                ]).catch(e => console.warn('[Chat/ZendeskEscalate]', e.message));
+            }
+        }
     } catch (e) { console.warn('[Chat] Log error:', e.message); }
 }
 
