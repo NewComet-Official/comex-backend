@@ -1401,7 +1401,7 @@ async function syncBotWebsite(db, businessId, bot, { force = false } = {}) {
     await botRef.set({ lastSyncCheckAt: nowISO }, { merge: true });
 
     const links = (bot.knowledgeContext?.additionalLinks || [])
-        .filter(l => /^https?:\/\//i.test(l || ''))
+        .filter(l => /^https?:\/\//i.test(l || '') && normCrawlUrl(l) !== normCrawlUrl(url))
         .slice(0, SYNC_MAX_EXTRA_LINKS);
 
     const mainFetch = crawled
@@ -6175,6 +6175,13 @@ async function handleDeploy(req, res) {
         botData.displayName = botData.displayName || botData.name;
         botData.createdAt = botData.createdAt || new Date().toISOString();
 
+        // Websites added as "reference links" must still make the agent a website agent,
+        // otherwise auto-sync skips it ("no-url") and the links are never read.
+        if (!/^https?:\/\//i.test(botData.url || '')) {
+            const firstLink = (botData.knowledgeContext?.additionalLinks || []).find(l => /^https?:\/\//i.test(l || ''));
+            if (firstLink) botData.url = firstLink;
+        }
+
         // Firestore rejects documents over 1 MiB. Fail with a clear message instead of a cryptic error.
         const approxBytes = Buffer.byteLength(JSON.stringify(botData), 'utf8');
         if (approxBytes > 950000) {
@@ -6326,7 +6333,7 @@ async function handleScrape(req, res) {
         const deadline  = startedAt + SCRAPE_BUDGET_MS;
         const timeLeft  = () => deadline - Date.now();
         const links = (bot.knowledgeContext?.additionalLinks || [])
-            .filter(l => /^https?:\/\//i.test(l || ''))
+            .filter(l => /^https?:\/\//i.test(l || '') && normCrawlUrl(l) !== normCrawlUrl(url))
             .slice(0, SYNC_MAX_EXTRA_LINKS);
 
         // Writes everything the agent needs from the scrape. Called once as soon as the first
