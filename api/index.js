@@ -1117,27 +1117,118 @@ const SYNC_CHECK_INTERVAL_MS = 60 * 1000;
 const SYNC_FETCH_TIMEOUT_MS  = 5000;
 const SYNC_MAX_EXTRA_LINKS   = 3;
 
+const SYNC_RECRAWL_INTERVAL_MS = 24 * 60 * 60 * 1000; // multi-page sites are re-crawled at most daily
+const SYNC_RECRAWL_BUDGET_MS   = 12000;
+const CRAWL_MAX_PAGES  = Number(process.env.CRAWL_MAX_PAGES) || 8;
+const CRAWL_PAGE_CHARS = 18000;                         // kept per crawled page
+const SCRAPE_BUDGET_MS = Number(process.env.SCRAPE_BUDGET_MS) || 20000;
+
+const HTML_NAMED_ENTITIES = {
+    nbsp: ' ', amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", rsquo: '’', lsquo: '‘', rdquo: '”', ldquo: '“',
+    ndash: '–', mdash: '—', hellip: '…', copy: '©', reg: '®', trade: '™', times: '×', rarr: '→', larr: '←',
+    bull: '•', middot: '·', euro: '€', pound: '£', cent: '¢', deg: '°',
+};
+
+function decodeHtmlEntities(str) {
+    return String(str).replace(/&(#x[0-9a-f]+|#\d+|[a-z][a-z0-9]*);/gi, (m, e) => {
+        if (e[0] === '#') {
+            const cp = (e[1] === 'x' || e[1] === 'X') ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
+            try { return String.fromCodePoint(cp); } catch { return ' '; }
+        }
+        const v = HTML_NAMED_ENTITIES[e.toLowerCase()];
+        return v !== undefined ? v : m;
+    });
+}
+
+// <title> and meta description often hold the one-line "what is this business" answer.
+function htmlMetaLines(html) {
+    const out = [];
+    const title = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    if (title && title[1].trim()) out.push(`Page title: ${title[1]}`);
+    const metaRe = /<meta\b[^>]*>/gi;
+    let m;
+    while ((m = metaRe.exec(html))) {
+        const tag = m[0];
+        const key = (tag.match(/\b(?:name|property)\s*=\s*["']([^"']+)["']/i) || [])[1];
+        const val = (tag.match(/\bcontent\s*=\s*"([^"]*)"/i) || tag.match(/\bcontent\s*=\s*'([^']*)'/i) || [])[1];
+        if (key && val && /^(description|og:title|og:description|og:site_name|twitter:title|twitter:description)$/i.test(key)) {
+            out.push(`${key}: ${val}`);
+        }
+    }
+    return out;
+}
+
+// Structured data (business name, address, phone, FAQ answers, prices) lives here on many sites.
+function jsonLdLines(html) {
+    const out = [];
+    let budget = 4000;
+    const walk = (v, k) => {
+        if (budget <= 0 || v == null) return;
+        if (typeof v === 'string') {
+            if (k && (k[0] === '@' || /^(url|image|logo|sameAs)$/i.test(k))) return;
+            const t = v.trim();
+            if (t.length < 2 || /^https?:\/\//i.test(t)) return;
+            out.push(`${k ? k + ': ' : ''}${t}`);
+            budget -= t.length;
+        } else if (typeof v === 'number') {
+            out.push(`${k}: ${v}`);
+            budget -= 10;
+        } else if (Array.isArray(v)) {
+            v.forEach(x => walk(x, k));
+        } else if (typeof v === 'object') {
+            Object.entries(v).forEach(([kk, vv]) => walk(vv, kk));
+        }
+    };
+    const re = /<script[^>]+type\s*=\s*["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+    let m;
+    while ((m = re.exec(html))) {
+        try { walk(JSON.parse(m[1])); } catch { /* malformed JSON-LD: ignore */ }
+    }
+    return out;
+}
+
+// Keeps document structure (one block per line) instead of flattening the whole page
+// into a single line, and keeps meta tags, structured data and image alt text.
 function htmlToText(html) {
-    return String(html || '')
+    const src = String(html || '');
+    const header = [...htmlMetaLines(src), ...jsonLdLines(src)];
+    let body = src
         .replace(/<script[\s\S]*?<\/script>/gi, '')
         .replace(/<style[\s\S]*?<\/style>/gi, '')
         .replace(/<noscript[\s\S]*?<\/noscript>/gi, '')
+        .replace(/<svg[\s\S]*?<\/svg>/gi, '')
+        .replace(/<template[\s\S]*?<\/template>/gi, '')
+        .replace(/<head\b[\s\S]*?<\/head>/i, '')
         .replace(/<!--[\s\S]*?-->/g, '')
-        .replace(/<[^>]+>/g, ' ')
-        .replace(/&nbsp;/g, ' ')
-        .replace(/&amp;/g, '&')
-        .replace(/\s+/g, ' ')
-        .trim();
+        .replace(/<img\b[^>]*>/gi, tag => {
+            const a = tag.match(/\balt\s*=\s*"([^"]{3,200})"/i) || tag.match(/\balt\s*=\s*'([^']{3,200})'/i);
+            return a ? ` ${a[1]} ` : ' ';
+        })
+        .replace(/<\/(td|th)>/gi, ' | ')
+        .replace(/<\/?(?:p|div|section|article|header|footer|nav|main|aside|li|ul|ol|tr|table|h[1-6]|br|hr|form|blockquote|pre|details|summary|dl|dt|dd|figure|figcaption|button|label|option|address)\b[^>]*>/gi, '\n')
+        .replace(/<[^>]+>/g, ' ');
+    body = decodeHtmlEntities(body);
+
+    const lines = [];
+    let prev = '';
+    for (const rawLine of [...header.map(decodeHtmlEntities), ...body.split('\n')]) {
+        const line = rawLine.replace(/[ \t\u00a0]+/g, ' ').replace(/\s*\|\s*$/, '').trim();
+        if (!line || line === prev) continue;
+        lines.push(line);
+        prev = line;
+    }
+    return lines.join('\n');
 }
 
 // P1-20: no auto-follow redirects; re-validate each hop.
-async function fetchPageText(url, timeoutMs = SYNC_FETCH_TIMEOUT_MS, maxHops = 3) {
+async function fetchPageHtml(url, timeoutMs = SYNC_FETCH_TIMEOUT_MS, maxHops = 3) {
     let current = url;
     for (let hop = 0; hop <= maxHops; hop++) {
         if (!(await isSafePublicUrl(current))) throw new Error('URL not allowed.');
         const r = await fetch(current, {
             headers: {
-                'User-Agent': 'Mozilla/5.0 MeborAI/1.0',
+                'User-Agent': 'Mozilla/5.0 (compatible; MeborAI/1.0)',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.5',
                 'Cache-Control': 'no-cache',
                 'Pragma': 'no-cache',
             },
@@ -1152,9 +1243,139 @@ async function fetchPageText(url, timeoutMs = SYNC_FETCH_TIMEOUT_MS, maxHops = 3
             continue;
         }
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        return htmlToText(await r.text());
+        const ct = String(r.headers.get('content-type') || '').toLowerCase();
+        if (ct && !/(html|xml|text\/|json)/.test(ct)) throw new Error(`Unsupported content type: ${ct.split(';')[0]}`);
+        return { html: (await r.text()).substring(0, 3000000), finalUrl: current };
     }
     throw new Error('Too many redirects.');
+}
+
+async function fetchPageText(url, timeoutMs = SYNC_FETCH_TIMEOUT_MS, maxHops = 3) {
+    const { html } = await fetchPageHtml(url, timeoutMs, maxHops);
+    return htmlToText(html);
+}
+
+// ── Multi-page crawl ────────────────────────────────────────────────────────
+// A single page is rarely the whole business: pricing, contact, FAQ and policy
+// details usually live on other pages of the same site.
+const CRAWL_PRIORITY_RE = /pric|plan|about|contact|faq|help|support|feature|service|product|how|team|company|polic|terms|refund|shipping|doc|guide|location|hour|menu|book|demo|integrat|career|story/i;
+const CRAWL_SKIP_RE = /\.(png|jpe?g|gif|svg|webp|ico|css|js|mjs|json|xml|pdf|zip|mp4|mp3|woff2?|ttf|eot|map)(\?|$)|^(mailto|tel|javascript):|\/(login|signin|sign-in|signup|sign-up|register|cart|checkout|account|wp-admin|wp-login|logout)(\/|$|\?)/i;
+const normCrawlUrl = (u) => { try { const x = new URL(u); x.hash = ''; return x.toString().replace(/\/$/, ''); } catch { return String(u); } };
+
+function extractSameOriginLinks(html, baseUrl) {
+    let origin;
+    try { origin = new URL(baseUrl).origin; } catch { return []; }
+    const seen = new Set();
+    const out = [];
+    const re = /<a\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|'([^']*)')/gi;
+    let m;
+    while ((m = re.exec(html))) {
+        const raw = decodeHtmlEntities((m[1] ?? m[2] ?? '').trim());
+        if (!raw || raw[0] === '#' || CRAWL_SKIP_RE.test(raw)) continue;
+        let u;
+        try { u = new URL(raw, baseUrl); } catch { continue; }
+        if (u.origin !== origin || !/^https?:$/.test(u.protocol)) continue;
+        u.hash = '';
+        const key = normCrawlUrl(u.toString());
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(u.toString());
+    }
+    return out;
+}
+
+async function crawlSite(startUrl, { maxPages = CRAWL_MAX_PAGES, perPageChars = CRAWL_PAGE_CHARS, budgetMs = SCRAPE_BUDGET_MS } = {}) {
+    const started = Date.now();
+    const first = await fetchPageHtml(startUrl, Math.min(12000, budgetMs));
+    const firstText = htmlToText(first.html).substring(0, perPageChars);
+    const pages = [{ url: first.finalUrl, text: firstText }];
+    const errors = [];
+    const result = () => ({ pages, errors, rawHtmlChars: first.html.length });
+    if (maxPages <= 1) return result();
+
+    const sig = (t) => t.replace(/\s+/g, ' ').substring(0, 400);
+    const seenSigs = new Set([sig(firstText)]);
+
+    const candidates = new Set(extractSameOriginLinks(first.html, first.finalUrl));
+    try {
+        const sm = await fetchPageHtml(new URL('/sitemap.xml', first.finalUrl).toString(), 4000, 1);
+        if (!/<sitemapindex/i.test(sm.html)) {
+            for (const m of sm.html.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/gi)) {
+                candidates.add(decodeHtmlEntities(m[1]));
+                if (candidates.size > 300) break;
+            }
+        }
+    } catch { /* no sitemap: link discovery alone is fine */ }
+
+    const origin = new URL(first.finalUrl).origin;
+    const visited = new Set([normCrawlUrl(startUrl), normCrawlUrl(first.finalUrl)]);
+    const queued = new Set();
+    const ranked = [];
+    for (const u of candidates) {
+        let p;
+        try { p = new URL(u); } catch { continue; }
+        const key = normCrawlUrl(u);
+        if (p.origin !== origin || CRAWL_SKIP_RE.test(u) || visited.has(key) || queued.has(key)) continue;
+        queued.add(key);
+        ranked.push({ u: p.toString(), score: (CRAWL_PRIORITY_RE.test(p.pathname) ? 0 : 100) + p.pathname.split('/').filter(Boolean).length });
+    }
+    ranked.sort((a, b) => a.score - b.score);
+    const urls = ranked.slice(0, 40).map(r => r.u);
+
+    let cursor = 0;
+    const worker = async () => {
+        while (pages.length < maxPages && cursor < urls.length && Date.now() - started < budgetMs - 1500) {
+            const u = urls[cursor++];
+            try {
+                const left = budgetMs - (Date.now() - started);
+                const r = await fetchPageHtml(u, Math.min(6000, Math.max(1500, left)), 2);
+                const text = htmlToText(r.html).substring(0, perPageChars);
+                const sg = sig(text);
+                // Skip near-empty pages and SPA shells that return the same document for every path.
+                if (text.length < 80 || seenSigs.has(sg) || pages.length >= maxPages) continue;
+                seenSigs.add(sg);
+                pages.push({ url: r.finalUrl, text });
+            } catch (e) {
+                errors.push(`${u}: ${e.message}`);
+            }
+        }
+    };
+    await Promise.all([worker(), worker(), worker()]);
+
+    // Stable order → stable content hash → no needless re-indexing on re-crawl.
+    const rest = pages.slice(1).sort((a, b) => a.url.localeCompare(b.url));
+    pages.splice(1, pages.length - 1, ...rest);
+    return result();
+}
+
+// One page → plain text (legacy format). Several pages → labelled blocks the indexer splits per page.
+function pagesToSiteText(pages) {
+    const list = (pages || []).filter(p => p && p.text);
+    if (!list.length) return '';
+    if (list.length === 1) return list[0].text;
+    return list.map(p => `[Page: ${p.url}]\n${p.text}`).join('\n\n');
+}
+
+// Short copy kept on the agent doc (used when the whole knowledge base fits in the prompt).
+// Every crawled page gets a fair share instead of page 1 using the whole budget.
+function buildStuffedSiteContext(pages, cap = 15000) {
+    const list = (pages || []).filter(p => p && p.text);
+    if (!list.length) return '';
+    if (list.length === 1) return list[0].text.substring(0, cap);
+    const per = Math.max(1200, Math.floor(cap / list.length));
+    return list.map(p => `[Page: ${p.url}]\n${p.text.substring(0, per)}`).join('\n\n');
+}
+
+function buildLinkTexts(links, results) {
+    const blocks = results
+        .map((e, i) => (e.status === 'fulfilled' && e.value.length >= 20)
+            ? { src: links[i], text: e.value.substring(0, RAG_MAX_LINK_CHARS) }
+            : null)
+        .filter(Boolean);
+    return {
+        fullLinksText: blocks.map(l => `[Source: ${l.src}]\n${l.text}`).join('\n\n'),
+        linksText: blocks.map(l => `[Source: ${l.src}]\n${l.text.substring(0, 4000)}`).join('\n\n'),
+    };
 }
 
 async function syncBotWebsite(db, businessId, bot, { force = false } = {}) {
@@ -1163,6 +1384,15 @@ async function syncBotWebsite(db, businessId, bot, { force = false } = {}) {
 
     const lastCheck = bot.lastSyncCheckAt ? new Date(bot.lastSyncCheckAt).getTime() : 0;
     if (!force && Date.now() - lastCheck < SYNC_CHECK_INTERVAL_MS) return { skipped: 'fresh' };
+
+    // A multi-page crawl is too slow to repeat inside a chat request every minute, and a
+    // single-page refresh would overwrite the crawled pages. Re-crawl at most daily;
+    // saving the agent (which re-runs /api/scrape) always refreshes immediately.
+    const crawled = (bot.siteCrawl?.pages || 0) > 1;
+    if (crawled && !force) {
+        const lastCrawl = bot.siteCrawl?.at ? new Date(bot.siteCrawl.at).getTime() : 0;
+        if (Date.now() - lastCrawl < SYNC_RECRAWL_INTERVAL_MS) return { skipped: 'crawl-fresh' };
+    }
 
     const botRef = db.collection('user_bots').doc(businessId);
     const nowISO = new Date().toISOString();
@@ -1173,13 +1403,29 @@ async function syncBotWebsite(db, businessId, bot, { force = false } = {}) {
         .filter(l => /^https?:\/\//i.test(l || ''))
         .slice(0, SYNC_MAX_EXTRA_LINKS);
 
+    const mainFetch = crawled
+        ? crawlSite(url, {
+            maxPages: Math.min(CRAWL_MAX_PAGES, (bot.siteCrawl.pages || 1) + 2),
+            budgetMs: SYNC_RECRAWL_BUDGET_MS,
+        })
+        : fetchPageText(url).then(text => ({ pages: [{ url, text }] }));
+
     const [main, ...extras] = await Promise.allSettled([
-        fetchPageText(url),
+        mainFetch,
         ...links.map(l => fetchPageText(l)),
     ]);
 
-    if (main.status !== 'fulfilled' || main.value.length < 20) {
+    const mainPages = main.status === 'fulfilled' ? main.value.pages : [];
+    const mainJoined = pagesToSiteText(mainPages);
+
+    if (main.status !== 'fulfilled' || mainJoined.length < 20) {
         const msg = main.status === 'rejected' ? main.reason?.message : 'Page had no readable text.';
+        bot.lastSyncError = msg;
+        await botRef.set({ lastSyncError: msg }, { merge: true });
+        return { error: msg };
+    }
+    if (crawled && mainPages.length < Math.ceil((bot.siteCrawl.pages || 1) / 2)) {
+        const msg = 'Re-crawl found far fewer pages than before; keeping the last good copy.';
         bot.lastSyncError = msg;
         await botRef.set({ lastSyncError: msg }, { merge: true });
         return { error: msg };
@@ -1187,36 +1433,33 @@ async function syncBotWebsite(db, businessId, bot, { force = false } = {}) {
 
     // Full text (capped generously) feeds the retrieval index; the short
     // versions below are what small agents still stuff into the prompt.
-    const fullMain  = main.value.substring(0, RAG_MAX_SITE_CHARS);
-    const mainText  = fullMain.substring(0, 15000);
-    const linkBlocks = extras
-        .map((e, i) => (e.status === 'fulfilled' && e.value.length >= 20)
-            ? { src: links[i], text: e.value.substring(0, RAG_MAX_LINK_CHARS) }
-            : null)
-        .filter(Boolean);
-    const fullLinksText = linkBlocks.map(l => `[Source: ${l.src}]\n${l.text}`).join('\n\n');
-    const linksText = linkBlocks
-        .map(l => `[Source: ${l.src}]\n${l.text.substring(0, 4000)}`)
-        .join('\n\n');
+    const fullMain  = mainJoined.substring(0, RAG_MAX_SITE_CHARS);
+    const mainText  = buildStuffedSiteContext(mainPages, 15000);
+    const { fullLinksText, linksText } = buildLinkTexts(links, extras);
 
     const hash = crypto.createHash('sha256').update('v2||' + fullMain + '||' + fullLinksText).digest('hex');
+    const crawlMeta = crawled
+        ? { siteCrawl: { at: nowISO, pages: mainPages.length, chars: fullMain.length, urls: mainPages.map(p => p.url).slice(0, 20) } }
+        : {};
 
     if (hash === bot.contextHash) {
         bot.lastSyncedAt = nowISO;
-        await botRef.set({ lastSyncedAt: nowISO, lastSyncError: null }, { merge: true });
+        Object.assign(bot, crawlMeta);
+        await botRef.set({ lastSyncedAt: nowISO, lastSyncError: null, ...crawlMeta }, { merge: true });
         return { changed: false };
     }
 
     Object.assign(bot, {
         context: mainText, linksContext: linksText, contextHash: hash,
-        lastSyncedAt: nowISO, lastSyncError: null,
+        lastSyncedAt: nowISO, lastSyncError: null, ...crawlMeta,
     });
     await botRef.set({
         context: mainText, linksContext: linksText, contextHash: hash,
-        lastSyncedAt: nowISO, lastSyncError: null,
+        lastSyncedAt: nowISO, lastSyncError: null, ...crawlMeta,
     }, { merge: true });
     await db.collection('bot_knowledge').doc(businessId).set({
         siteText: fullMain, linksText: fullLinksText, updatedAt: nowISO,
+        ...(crawled ? { pages: mainPages.map(p => ({ url: p.url, chars: p.text.length })) } : {}),
     }, { merge: true });
     return { changed: true };
 }
@@ -1249,7 +1492,7 @@ const RAG_CHUNK_TARGET_CHARS   = 2400;   // ≈ 600 tokens
 const RAG_CHUNK_MAX_CHARS      = 3200;   // ≈ 800 tokens
 const RAG_CHUNK_OVERLAP_CHARS  = 240;    // 10% of target
 const RAG_TOP_K                = 6;
-const RAG_MAX_SITE_CHARS       = 120000; // stored/indexed per site
+const RAG_MAX_SITE_CHARS       = 150000; // stored/indexed per site (all crawled pages)
 const RAG_MAX_LINK_CHARS       = 20000;  // stored/indexed per reference link
 const RAG_MAX_CHUNKS           = 3000;
 const RAG_EMBED_MODEL          = process.env.RAG_EMBED_MODEL || 'openai/text-embedding-3-small';
@@ -1362,7 +1605,15 @@ function ragSplitFiles(fileContents) {
 function ragBuildSources(bot, know) {
     const sources = [];
     const siteText = (know && know.siteText) || bot.context || '';
-    if (siteText) sources.push({ title: bot.url || 'Website', text: siteText, kind: 'site' });
+    if (siteText) {
+        // Crawled sites are stored as "[Page: <url>]" blocks: index each page under its own URL
+        // so retrieved excerpts say which page they came from.
+        for (const block of siteText.split(/\n\n(?=\[Page: )/)) {
+            const m = block.match(/^\[Page: ([^\]]+)\]\n([\s\S]*)$/);
+            if (m && m[2].trim()) sources.push({ title: m[1], text: m[2], kind: 'site' });
+            else if (block.trim()) sources.push({ title: bot.url || 'Website', text: block, kind: 'site' });
+        }
+    }
 
     const linksText = (know && know.linksText) || bot.linksContext || '';
     if (linksText) {
@@ -5922,7 +6173,24 @@ async function handleDeploy(req, res) {
         botData.deletedAt = null;
         botData.displayName = botData.displayName || botData.name;
         botData.createdAt = botData.createdAt || new Date().toISOString();
+
+        // Firestore rejects documents over 1 MiB. Fail with a clear message instead of a cryptic error.
+        const approxBytes = Buffer.byteLength(JSON.stringify(botData), 'utf8');
+        if (approxBytes > 950000) {
+            return res.status(413).json({
+                success: false,
+                message: `This agent's configuration is ${Math.round(approxBytes / 1024)} KB, over the ~930 KB per-agent storage limit. ` +
+                         `Most of that is the text extracted from uploaded documents. Remove or shorten some files and save again.`,
+            });
+        }
         await botRef.set(botData, { merge: true });
+        await botRef.set({
+            knowledgeStats: {
+                fileChars: String(botData.knowledgeContext?.fileContents || '').length,
+                fileCount: botData.knowledgeContext?.uploadedFileCount || 0,
+                updatedAt: new Date().toISOString(),
+            },
+        }, { merge: true });
 
         // P1-18: explicitly delete nested keys the user cleared so removals persist.
         const deletePatch = {};
@@ -6025,7 +6293,7 @@ async function handleDeploy(req, res) {
 // ════════════════════════════════════════════════════════════════════════════
 async function handleScrape(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
-    const { businessId, url, customInstructions } = req.body || {};
+    const { businessId, url, customInstructions, crawl } = req.body || {};
     if (!businessId || !url)
         return res.status(400).json({ success: false, message: 'Missing businessId or url.' });
 
@@ -6034,10 +6302,12 @@ async function handleScrape(req, res) {
 
     try {
         const db = getDb();
-        const botSnap = await db.collection('user_bots').doc(businessId).get();
+        const botRef = db.collection('user_bots').doc(businessId);
+        const botSnap = await botRef.get();
         if (!botSnap.exists) return res.status(404).json({ success: false, message: 'Agent not found.' });
         const ctx = await resolveOwnerContext(db, auth.email);
-        if (botSnap.data()?.owner !== ctx.ownerEmail) {
+        const bot = botSnap.data();
+        if (bot?.owner !== ctx.ownerEmail) {
             return res.status(403).json({ success: false, message: 'You do not own this agent.' });
         }
 
@@ -6045,25 +6315,79 @@ async function handleScrape(req, res) {
             return res.status(400).json({ success: false, message: 'That URL is not allowed.' });
         }
 
-        const fullText = (await fetchPageText(url, 12000)).substring(0, RAG_MAX_SITE_CHARS);
-        if (fullText.length < 20) throw new Error('Could not extract text from this URL.');
-        const text = fullText.substring(0, 15000);
-
         const nowISO = new Date().toISOString();
+        // Make failures visible on the agent (sync badge) instead of leaving it silently empty.
+        const recordFailure = async (msg) => {
+            try { await botRef.set({ lastSyncError: msg, lastSyncCheckAt: nowISO }, { merge: true }); } catch { /* best effort */ }
+        };
+
+        let crawlResult;
+        try {
+            crawlResult = await crawlSite(url, { maxPages: crawl === false ? 1 : CRAWL_MAX_PAGES, budgetMs: SCRAPE_BUDGET_MS });
+        } catch (e) {
+            const msg = `Could not fetch ${url}: ${e.message}`;
+            await recordFailure(msg);
+            return res.status(502).json({ success: false, message: msg });
+        }
+
+        const pages = crawlResult.pages;
+        const fullText = pagesToSiteText(pages).substring(0, RAG_MAX_SITE_CHARS);
+        if (fullText.length < 20) {
+            const msg = 'No readable text was found at this URL. If the site builds its pages with JavaScript, ' +
+                        'add the important pages under "Additional links" or put the key facts in the System Instructions.';
+            await recordFailure(msg);
+            return res.status(422).json({ success: false, message: msg });
+        }
+
+        // Reference links the owner listed are part of the same knowledge base.
+        const links = (bot.knowledgeContext?.additionalLinks || [])
+            .filter(l => /^https?:\/\//i.test(l || ''))
+            .slice(0, SYNC_MAX_EXTRA_LINKS);
+        const extras = await Promise.allSettled(links.map(l => fetchPageText(l, 8000)));
+        const { fullLinksText, linksText } = buildLinkTexts(links, extras);
+
         const update = {
             url,
-            context: text,
-            contextHash: crypto.createHash('sha256').update('v2||' + fullText + '||').digest('hex'),
+            context: buildStuffedSiteContext(pages, 15000),
+            linksContext: linksText,
+            contextHash: crypto.createHash('sha256').update('v2||' + fullText + '||' + fullLinksText).digest('hex'),
+            siteCrawl: { at: nowISO, pages: pages.length, chars: fullText.length, urls: pages.map(p => p.url).slice(0, 20) },
             lastSyncedAt: nowISO,
             lastSyncCheckAt: nowISO,
             lastSyncError: null,
         };
         if (customInstructions) update.knowledgeContext = { systemPrompt: customInstructions };
-        await db.collection('user_bots').doc(businessId).set(update, { merge: true });
+        await botRef.set(update, { merge: true });
         await db.collection('bot_knowledge').doc(businessId).set({
-            siteText: fullText, linksText: '', updatedAt: nowISO,
+            siteText: fullText,
+            linksText: fullLinksText,
+            pages: pages.map(p => ({ url: p.url, chars: p.text.length })),
+            updatedAt: nowISO,
         }, { merge: true });
-        return res.status(200).json({ success: true, message: `Scraped ${fullText.length} chars.`, snippet: text.substring(0, 200) });
+
+        // Rebuild the retrieval index NOW. Deploy builds it before the website exists, so without
+        // this step the agent keeps answering from a documents-only index.
+        let knowledgeIndex = null;
+        try {
+            knowledgeIndex = await ensureKnowledgeIndex(db, businessId, { budgetMs: RAG_DEPLOY_BUDGET_MS });
+            if (knowledgeIndex.state === 'indexing') await ragDispatchWorker(businessId, getPublicBaseUrl(req));
+        } catch (ragErr) {
+            console.warn('[Scrape/KnowledgeIndex]', ragErr.message);
+        }
+
+        const warnings = [];
+        if (pages.length === 1 && fullText.length < 1500 && crawlResult.rawHtmlChars > 20000) {
+            warnings.push('Only a small amount of text was found on this page. If the site loads its content with JavaScript, add the key pages under "Additional links".');
+        }
+        return res.status(200).json({
+            success: true,
+            message: `Scraped ${pages.length} page(s), ${fullText.length} chars.`,
+            pages: pages.map(p => ({ url: p.url, chars: p.text.length })),
+            crawlErrors: crawlResult.errors.slice(0, 5),
+            warnings,
+            knowledgeIndex,
+            snippet: fullText.substring(0, 200),
+        });
     } catch (err) {
         console.error('[Scrape]', err.message);
         return res.status(500).json({ success: false, message: err.message });
@@ -6177,7 +6501,7 @@ async function generateBotReply({ db, businessId, userMsg, history = [], convers
     let agentActionsList = [];
     let pinnedQA = [], personality = 'default', toolsConfig = {};
     let planLimits = resolvePlanLimits({});
-    let ragMode = false, ragSummary = '', needsKnowledgeKick = false, stuffedFallback = '';
+    let ragMode = false, ragSummary = '', needsKnowledgeKick = false, stuffedFallback = '', ragIndexStale = false;
     let behaviorConfig = {
         allowOutOfTopic: true,
         allowWebSearch: true,
@@ -6214,6 +6538,9 @@ async function generateBotReply({ db, businessId, userMsg, history = [], convers
         // Hybrid knowledge: retrieval mode only once an index exists for this agent.
         ragMode = b.ragMode === 'rag' && (b.ragChunkCount || 0) > 0;
         ragSummary = b.ragSummary || '';
+        // The index was built from an older copy of the knowledge (e.g. documents only, before the
+        // website was scraped). Retrieval alone would miss the new content, so it is also stuffed below.
+        ragIndexStale = ragMode && b.ragKey !== ragComputeKey(b);
         if (b.ragKey !== ragComputeKey(b) &&
             Date.now() - (b.ragKickedAt ? new Date(b.ragKickedAt).getTime() : 0) > RAG_KICK_COOLDOWN_MS) {
             needsKnowledgeKick = true;
@@ -6348,7 +6675,13 @@ async function generateBotReply({ db, businessId, userMsg, history = [], convers
 
     if (needsKnowledgeKick) {
         db.collection('user_bots').doc(businessId).set({ ragKickedAt: new Date().toISOString() }, { merge: true }).catch(() => {});
-        await ragDispatchWorker(businessId);
+        const dispatched = await ragDispatchWorker(businessId);
+        if (!dispatched) {
+            // No background worker configured: rebuild inline (time-boxed, resumable) so the
+            // index cannot stay out of date forever.
+            try { await ensureKnowledgeIndex(db, businessId, { budgetMs: RAG_DEPLOY_BUDGET_MS }); }
+            catch (e) { console.warn('[Chat/InlineIndex]', e.message); }
+        }
     }
     if (ragMode) {
         try {
@@ -6356,7 +6689,8 @@ async function generateBotReply({ db, businessId, userMsg, history = [], convers
             const hits = await ragRetrieve(db, businessId, standalone);
             if (!hits.length) throw new Error('no chunks retrieved');
             sysPrompt += ragFormatContext(ragSummary, hits);
-            meta._rag = { query: standalone, chunks: hits.length };
+            if (ragIndexStale) sysPrompt += stuffedFallback;
+            meta._rag = { query: standalone, chunks: hits.length, stale: ragIndexStale };
         } catch (e) {
             console.error('[Chat/RAG]', e.message);
             sysPrompt += stuffedFallback; // never leave the agent without knowledge
