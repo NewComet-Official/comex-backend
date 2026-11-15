@@ -1119,9 +1119,10 @@ const SYNC_MAX_EXTRA_LINKS   = 3;
 
 const SYNC_RECRAWL_INTERVAL_MS = 24 * 60 * 60 * 1000; // multi-page sites are re-crawled at most daily
 const SYNC_RECRAWL_BUDGET_MS   = 12000;
-const CRAWL_MAX_PAGES  = Number(process.env.CRAWL_MAX_PAGES) || 8;
+const CRAWL_MAX_PAGES  = Number(process.env.CRAWL_MAX_PAGES) || 5;
 const CRAWL_PAGE_CHARS = 18000;                         // kept per crawled page
-const SCRAPE_BUDGET_MS = Number(process.env.SCRAPE_BUDGET_MS) || 20000;
+// Total time /api/scrape may spend. Default fits Vercel Hobby's 10 s limit; raise on Pro (e.g. 40000).
+const SCRAPE_BUDGET_MS = Number(process.env.SCRAPE_BUDGET_MS) || 7000;
 
 const HTML_NAMED_ENTITIES = {
     nbsp: ' ', amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", rsquo: '’', lsquo: '‘', rdquo: '”', ldquo: '“',
@@ -1284,9 +1285,9 @@ function extractSameOriginLinks(html, baseUrl) {
     return out;
 }
 
-async function crawlSite(startUrl, { maxPages = CRAWL_MAX_PAGES, perPageChars = CRAWL_PAGE_CHARS, budgetMs = SCRAPE_BUDGET_MS } = {}) {
+async function crawlSite(startUrl, { maxPages = CRAWL_MAX_PAGES, perPageChars = CRAWL_PAGE_CHARS, budgetMs = SCRAPE_BUDGET_MS, firstPage = null } = {}) {
     const started = Date.now();
-    const first = await fetchPageHtml(startUrl, Math.min(12000, budgetMs));
+    const first = firstPage || await fetchPageHtml(startUrl, Math.min(12000, budgetMs));
     const firstText = htmlToText(first.html).substring(0, perPageChars);
     const pages = [{ url: first.finalUrl, text: firstText }];
     const errors = [];
@@ -1298,7 +1299,7 @@ async function crawlSite(startUrl, { maxPages = CRAWL_MAX_PAGES, perPageChars = 
 
     const candidates = new Set(extractSameOriginLinks(first.html, first.finalUrl));
     try {
-        const sm = await fetchPageHtml(new URL('/sitemap.xml', first.finalUrl).toString(), 4000, 1);
+        const sm = await fetchPageHtml(new URL('/sitemap.xml', first.finalUrl).toString(), Math.min(2500, Math.max(800, budgetMs / 3)), 1);
         if (!/<sitemapindex/i.test(sm.html)) {
             for (const m of sm.html.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/gi)) {
                 candidates.add(decodeHtmlEntities(m[1]));
@@ -6321,58 +6322,86 @@ async function handleScrape(req, res) {
             try { await botRef.set({ lastSyncError: msg, lastSyncCheckAt: nowISO }, { merge: true }); } catch { /* best effort */ }
         };
 
-        let crawlResult;
+        const startedAt = Date.now();
+        const deadline  = startedAt + SCRAPE_BUDGET_MS;
+        const timeLeft  = () => deadline - Date.now();
+        const links = (bot.knowledgeContext?.additionalLinks || [])
+            .filter(l => /^https?:\/\//i.test(l || ''))
+            .slice(0, SYNC_MAX_EXTRA_LINKS);
+
+        // Writes everything the agent needs from the scrape. Called once as soon as the first
+        // page is read (so a slow site or the 10 s Hobby limit can never leave Firebase empty),
+        // and again if the extra pages / links finish in time.
+        const persist = async (pages, linkTexts) => {
+            const fullText = pagesToSiteText(pages).substring(0, RAG_MAX_SITE_CHARS);
+            const update = {
+                url,
+                context: buildStuffedSiteContext(pages, 15000),
+                contextHash: crypto.createHash('sha256').update('v2||' + fullText + '||' + (linkTexts ? linkTexts.fullLinksText : '')).digest('hex'),
+                siteCrawl: { at: nowISO, pages: pages.length, chars: fullText.length, urls: pages.map(p => p.url).slice(0, 20) },
+                lastSyncedAt: nowISO, lastSyncCheckAt: nowISO, lastSyncError: null,
+            };
+            if (linkTexts) update.linksContext = linkTexts.linksText;
+            if (customInstructions) update.knowledgeContext = { systemPrompt: customInstructions };
+            await botRef.set(update, { merge: true });
+            await db.collection('bot_knowledge').doc(businessId).set({
+                siteText: fullText,
+                ...(linkTexts ? { linksText: linkTexts.fullLinksText } : {}),
+                pages: pages.map(p => ({ url: p.url, chars: p.text.length })),
+                updatedAt: nowISO,
+            }, { merge: true });
+            return fullText;
+        };
+
+        // Phase 1: first page, saved immediately.
+        let first;
         try {
-            crawlResult = await crawlSite(url, { maxPages: crawl === false ? 1 : CRAWL_MAX_PAGES, budgetMs: SCRAPE_BUDGET_MS });
+            first = await fetchPageHtml(url, Math.min(5000, SCRAPE_BUDGET_MS));
         } catch (e) {
             const msg = `Could not fetch ${url}: ${e.message}`;
             await recordFailure(msg);
             return res.status(502).json({ success: false, message: msg });
         }
-
-        const pages = crawlResult.pages;
-        const fullText = pagesToSiteText(pages).substring(0, RAG_MAX_SITE_CHARS);
-        if (fullText.length < 20) {
+        const firstText = htmlToText(first.html).substring(0, CRAWL_PAGE_CHARS);
+        if (firstText.length < 20) {
             const msg = 'No readable text was found at this URL. If the site builds its pages with JavaScript, ' +
                         'add the important pages under "Additional links" or put the key facts in the System Instructions.';
             await recordFailure(msg);
             return res.status(422).json({ success: false, message: msg });
         }
+        let pages = [{ url: first.finalUrl, text: firstText }];
+        let fullText = await persist(pages, null);
+        const crawlResult = { pages, errors: [], rawHtmlChars: first.html.length };
 
-        // Reference links the owner listed are part of the same knowledge base.
-        const links = (bot.knowledgeContext?.additionalLinks || [])
-            .filter(l => /^https?:\/\//i.test(l || ''))
-            .slice(0, SYNC_MAX_EXTRA_LINKS);
-        const extras = await Promise.allSettled(links.map(l => fetchPageText(l, 8000)));
-        const { fullLinksText, linksText } = buildLinkTexts(links, extras);
+        // Phase 2: extra pages + reference links, only with the time that is left.
+        if (crawl !== false && timeLeft() > 2500) {
+            try {
+                const [crawled, ...extras] = await Promise.all([
+                    crawlSite(url, { maxPages: CRAWL_MAX_PAGES, budgetMs: timeLeft() - 1500, firstPage: first }),
+                    ...links.map(l => fetchPageText(l, Math.max(1500, Math.min(4000, timeLeft() - 1500))).then(
+                        value => ({ status: 'fulfilled', value }), reason => ({ status: 'rejected', reason }))),
+                ]);
+                pages = crawled.pages;
+                crawlResult.pages = pages;
+                crawlResult.errors = crawled.errors;
+                fullText = await persist(pages, buildLinkTexts(links, extras));
+            } catch (e) {
+                console.warn('[Scrape/Crawl]', e.message);
+                crawlResult.errors.push(e.message);
+            }
+        }
 
-        const update = {
-            url,
-            context: buildStuffedSiteContext(pages, 15000),
-            linksContext: linksText,
-            contextHash: crypto.createHash('sha256').update('v2||' + fullText + '||' + fullLinksText).digest('hex'),
-            siteCrawl: { at: nowISO, pages: pages.length, chars: fullText.length, urls: pages.map(p => p.url).slice(0, 20) },
-            lastSyncedAt: nowISO,
-            lastSyncCheckAt: nowISO,
-            lastSyncError: null,
-        };
-        if (customInstructions) update.knowledgeContext = { systemPrompt: customInstructions };
-        await botRef.set(update, { merge: true });
-        await db.collection('bot_knowledge').doc(businessId).set({
-            siteText: fullText,
-            linksText: fullLinksText,
-            pages: pages.map(p => ({ url: p.url, chars: p.text.length })),
-            updatedAt: nowISO,
-        }, { merge: true });
-
-        // Rebuild the retrieval index NOW. Deploy builds it before the website exists, so without
-        // this step the agent keeps answering from a documents-only index.
+        // Phase 3: rebuild the index only if there is time; otherwise the next chat / worker does it.
         let knowledgeIndex = null;
-        try {
-            knowledgeIndex = await ensureKnowledgeIndex(db, businessId, { budgetMs: RAG_DEPLOY_BUDGET_MS });
-            if (knowledgeIndex.state === 'indexing') await ragDispatchWorker(businessId, getPublicBaseUrl(req));
-        } catch (ragErr) {
-            console.warn('[Scrape/KnowledgeIndex]', ragErr.message);
+        if (timeLeft() > 2500) {
+            try {
+                knowledgeIndex = await ensureKnowledgeIndex(db, businessId, { budgetMs: Math.min(RAG_DEPLOY_BUDGET_MS, timeLeft() - 1500) });
+                if (knowledgeIndex.state === 'indexing') await ragDispatchWorker(businessId, getPublicBaseUrl(req));
+            } catch (ragErr) {
+                console.warn('[Scrape/KnowledgeIndex]', ragErr.message);
+            }
+        } else {
+            knowledgeIndex = { state: 'deferred' };
         }
 
         const warnings = [];
