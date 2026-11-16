@@ -1389,6 +1389,9 @@ async function syncBotWebsite(db, businessId, bot, { force = false } = {}) {
     // A multi-page crawl is too slow to repeat inside a chat request every minute, and a
     // single-page refresh would overwrite the crawled pages. Re-crawl at most daily;
     // saving the agent (which re-runs /api/scrape) always refreshes immediately.
+    // Full-site crawls (crawl sessions) are refreshed only when the owner re-crawls from the editor.
+    if (bot.siteCrawl?.mode === 'full') return { skipped: 'full-crawl' };
+
     const crawled = (bot.siteCrawl?.pages || 0) > 1;
     if (crawled && !force) {
         const lastCrawl = bot.siteCrawl?.at ? new Date(bot.siteCrawl.at).getTime() : 0;
@@ -1495,7 +1498,7 @@ const RAG_CHUNK_OVERLAP_CHARS  = 240;    // 10% of target
 const RAG_TOP_K                = 6;
 const RAG_MAX_SITE_CHARS       = 150000; // stored/indexed per site (all crawled pages)
 const RAG_MAX_LINK_CHARS       = 20000;  // stored/indexed per reference link
-const RAG_MAX_CHUNKS           = 3000;
+const RAG_MAX_CHUNKS           = Number(process.env.RAG_MAX_CHUNKS) || 12000; // ≈ 28 MB of text
 const RAG_EMBED_MODEL          = process.env.RAG_EMBED_MODEL || 'openai/text-embedding-3-small';
 const RAG_EMBED_BATCH          = 64;
 // Defaults are safe for a 10 s function limit (Vercel Hobby). Raise via env on Pro.
@@ -1603,9 +1606,16 @@ function ragSplitFiles(fileContents) {
 }
 
 // All knowledge of an agent as a list of titled sources.
-function ragBuildSources(bot, know) {
+function ragBuildSources(bot, know, kdocs) {
     const sources = [];
-    const siteText = (know && know.siteText) || bot.context || '';
+    // Full-site crawls live in knowledge_docs (one doc per page); only pages of the
+    // crawl that finished (siteCrawl.crawlId) count. Older agents keep the single siteText.
+    const crawlId = bot.siteCrawl?.mode === 'full' ? bot.siteCrawl.crawlId : null;
+    const pageDocs = crawlId ? ((kdocs && kdocs.pages) || []).filter(p => p.crawlId === crawlId) : [];
+    for (const p of pageDocs) {
+        if (p.text && p.text.trim()) sources.push({ title: p.title, text: p.text, kind: 'site' });
+    }
+    const siteText = pageDocs.length ? '' : ((know && know.siteText) || bot.context || '');
     if (siteText) {
         // Crawled sites are stored as "[Page: <url>]" blocks: index each page under its own URL
         // so retrieved excerpts say which page they came from.
@@ -1624,8 +1634,15 @@ function ragBuildSources(bot, know) {
         }
     }
 
-    for (const f of ragSplitFiles(bot.knowledgeContext?.fileContents)) {
-        sources.push({ title: f.title, text: f.text, kind: 'file', table: /\.(csv|xlsx?|xls)$/i.test(f.title) });
+    const fileDocs = (kdocs && kdocs.files) || [];
+    if (fileDocs.length) {
+        for (const f of fileDocs) {
+            if (f.text && f.text.trim()) sources.push({ title: f.title, text: f.text, kind: 'file', table: /\.(csv|xlsx?|xls)$/i.test(f.title) });
+        }
+    } else {
+        for (const f of ragSplitFiles(bot.knowledgeContext?.fileContents)) {
+            sources.push({ title: f.title, text: f.text, kind: 'file', table: /\.(csv|xlsx?|xls)$/i.test(f.title) });
+        }
     }
     return sources;
 }
@@ -1641,7 +1658,11 @@ function ragBuildChunks(sources) {
 
 // Identity of the current knowledge: changes only when site/link text or files change.
 function ragComputeKey(bot) {
-    return ragSha(`${bot.contextHash || ''}|${ragSha(bot.knowledgeContext?.fileContents || '')}`);
+    let k = `${bot.contextHash || ''}|${ragSha(bot.knowledgeContext?.fileContents || '')}`;
+    // Appended only when present, so keys of agents without full crawls / stored files are unchanged.
+    const extra = `${bot.siteCrawl?.mode === 'full' ? (bot.siteCrawl.crawlId || '') : ''}|${bot.filesRev || ''}`;
+    if (extra !== '|') k += '|' + extra;
+    return ragSha(k);
 }
 
 // ── Embeddings (OpenRouter, same key as chat models) ────────────────────────
@@ -1740,7 +1761,8 @@ async function ensureKnowledgeIndex(db, businessId, { budgetMs = RAG_WORKER_BUDG
     const lockUntil = know?.ingest?.lockUntil || 0;
     if (!force && lockUntil > Date.now() && know?.ingest?.key === key) return { state: 'busy' };
 
-    const sources = ragBuildSources(bot, know);
+    const kdocs = await kdocLoad(db, businessId);
+    const sources = ragBuildSources(bot, know, kdocs);
     const total = sources.reduce((n, s) => n + s.text.length, 0);
 
     // Small knowledge base: keep the original "stuff everything in the prompt" mode.
@@ -1771,12 +1793,13 @@ async function ensureKnowledgeIndex(db, businessId, { budgetMs = RAG_WORKER_BUDG
     const col = db.collection('knowledge_chunks');
 
     try {
-        while (next < chunks.length && Date.now() - startedAt < budgetMs) {
-            const batch = chunks.slice(next, next + RAG_EMBED_BATCH);
+        // Embedding calls dominate the time, so three batches run in parallel.
+        const processBatch = async (start) => {
+            const batch = chunks.slice(start, start + RAG_EMBED_BATCH);
             const refs = batch.map(c => col.doc(idFor(c)));
             const existing = await db.getAll(...refs);
             const missingIdx = [];
-            existing.forEach((s, i) => { if (!s.exists) missingIdx.push(i); });
+            existing.forEach((sn, i) => { if (!sn.exists) missingIdx.push(i); });
 
             let vectors = [];
             if (missingIdx.length) vectors = await ragEmbedTexts(missingIdx.map(i => batch[i].text));
@@ -1786,16 +1809,20 @@ async function ensureKnowledgeIndex(db, businessId, { budgetMs = RAG_WORKER_BUDG
                 const mi = missingIdx.indexOf(i);
                 if (mi === -1) {
                     // Same text + same embedding model already stored: reuse, no embedding cost.
-                    wb.set(refs[i], { botId: businessId, idx: next + i, runKey: key }, { merge: true });
+                    wb.set(refs[i], { botId: businessId, idx: start + i, runKey: key }, { merge: true });
                 } else {
                     wb.set(refs[i], {
-                        botId: businessId, idx: next + i, title: c.title, text: c.text,
+                        botId: businessId, idx: start + i, title: c.title, text: c.text,
                         runKey: key, embedding: ragVector(vectors[mi]), createdAt: new Date().toISOString(),
                     });
                 }
             });
             await wb.commit();
-            next += batch.length;
+        };
+        while (next < chunks.length && Date.now() - startedAt < budgetMs) {
+            const starts = [0, 1, 2].map(k => next + k * RAG_EMBED_BATCH).filter(st => st < chunks.length);
+            await Promise.all(starts.map(processBatch));
+            next = Math.min(chunks.length, next + starts.length * RAG_EMBED_BATCH);
             await saveProgress();
         }
     } catch (e) {
@@ -1884,11 +1911,356 @@ async function handleKnowledgeReindex(req, res) {
         if (!snap.exists) return res.status(404).json({ success: false, message: 'Agent not found.' });
         const ctx = await resolveOwnerContext(db, auth.email);
         if (snap.data()?.owner !== ctx.ownerEmail) return res.status(403).json({ success: false, message: 'You do not own this agent.' });
-        const result = await ensureKnowledgeIndex(db, businessId, { budgetMs: RAG_DEPLOY_BUDGET_MS, force: !!force });
-        if (result.state === 'indexing') await ragDispatchWorker(businessId, getPublicBaseUrl(req));
+        const result = await ensureKnowledgeIndex(db, businessId, { budgetMs: req.body?.session ? RAG_SESSION_BUDGET_MS : RAG_DEPLOY_BUDGET_MS, force: !!force });
+        if (result.state === 'indexing' && !req.body?.session) await ragDispatchWorker(businessId, getPublicBaseUrl(req));
         return res.json({ success: true, ...result });
     } catch (err) {
         console.error('[RAG/Reindex]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// FULL KNOWLEDGE STORAGE: every page of a site, every file (Chatbase-style)
+// ════════════════════════════════════════════════════════════════════════════
+// Firestore caps a document at 1 MiB, so nothing is stored as one big field:
+//   knowledge_docs/{botId}__{kind}_{hash}_{part}
+//        { botId, kind: 'page' | 'file', key, title, part, text (≤ 200k chars), crawlId?, order }
+//   bot_crawl/{botId}        resumable crawl state (queue, seen hashes, counters)
+// user_bots/{botId}.siteCrawl = { mode:'full', crawlId, pages, chars, roots, urls[≤50], at }
+// user_bots/{botId}.filesRev  = changes whenever the stored files change.
+// The crawl runs in short sessions (/api/crawl/step, ≈7 s each) so it also fits Vercel Hobby's
+// 10 s limit; the editor keeps calling it and shows "Reading <page>" until it reports done.
+const KDOC_COLLECTION       = 'knowledge_docs';
+const KDOC_MAX_CHARS        = 200000;   // per Firestore doc (worst case 4 bytes/char < 1 MiB)
+const CRAWL_HARD_MAX_PAGES  = Number(process.env.CRAWL_HARD_MAX_PAGES) || 300;
+const CRAWL_STEP_BUDGET_MS  = Number(process.env.CRAWL_STEP_BUDGET_MS) || 7000;
+const CRAWL_CONCURRENCY     = 4;
+const CRAWL_QUEUE_MAX       = 1500;
+const CRAWL_SEEN_MAX        = 8000;
+const CRAWL_MAX_ROOTS       = 10;
+const CRAWL_PAGE_TEXT_MAX   = 600000;   // chars kept per page
+const FILE_PIECE_CHARS      = 1000000;  // upload piece size (keeps requests under Vercel's 4.5 MB body limit)
+const RAG_SESSION_BUDGET_MS = Number(process.env.RAG_SESSION_BUDGET_MS) || 5500;
+
+const kdocId = (botId, kind, key, part) =>
+    `${String(botId).replace(/[^\w-]/g, '_')}__${kind}_${ragSha(key).slice(0, 16)}_${part}`;
+
+// Writes `text` as one or more docs (≤ KDOC_MAX_CHARS each). `partBase` lets a file arrive in pieces.
+async function kdocWrite(db, botId, { kind, key, title, text, partBase = 0, extra = {} }) {
+    const nowISO = new Date().toISOString();
+    const body = String(text || '');
+    const parts = [];
+    for (let i = 0; i < Math.max(1, body.length); i += KDOC_MAX_CHARS) parts.push(body.slice(i, i + KDOC_MAX_CHARS));
+    const batch = db.batch();
+    parts.forEach((p, i) => {
+        batch.set(db.collection(KDOC_COLLECTION).doc(kdocId(botId, kind, key, partBase + i)), {
+            botId, kind, key, title, part: partBase + i, text: p, chars: p.length, updatedAt: nowISO, ...extra,
+        });
+    });
+    await batch.commit();
+    return parts.length;
+}
+
+async function kdocLoad(db, botId) {
+    const snap = await db.collection(KDOC_COLLECTION).where('botId', '==', botId).get();
+    const pages = new Map(), files = new Map();
+    snap.docs.forEach(d => {
+        const x = d.data();
+        const m = x.kind === 'page' ? pages : files;
+        const e = m.get(x.key) || { title: x.title, parts: [], order: x.order || 0, crawlId: x.crawlId };
+        e.parts[x.part] = x.text;
+        m.set(x.key, e);
+    });
+    const finish = (m) => [...m.values()]
+        .map(v => ({ title: v.title, text: v.parts.filter(t => typeof t === 'string').join(''), order: v.order, crawlId: v.crawlId }))
+        .sort((a, b) => (a.order - b.order) || String(a.title).localeCompare(String(b.title)));
+    return { pages: finish(pages), files: finish(files) };
+}
+
+async function kdocDelete(db, botId, { kind = null, keepCrawlId = null } = {}) {
+    let q = db.collection(KDOC_COLLECTION).where('botId', '==', botId);
+    if (kind) q = q.where('kind', '==', kind);
+    const snap = await q.select('crawlId').get();
+    const docs = snap.docs.filter(d => !keepCrawlId || d.get('crawlId') !== keepCrawlId);
+    for (let i = 0; i < docs.length; i += 400) {
+        const batch = db.batch();
+        docs.slice(i, i + 400).forEach(d => batch.delete(d.ref));
+        await batch.commit();
+    }
+    return docs.length;
+}
+
+// Auth + ownership shared by the new endpoints. Sends the error response itself and returns null.
+async function loadOwnedBot(req, res, businessId) {
+    const auth = await requireAuth(req, res);
+    if (!auth) return null;
+    const db = getDb();
+    const botRef = db.collection('user_bots').doc(businessId);
+    const snap = await botRef.get();
+    if (!snap.exists) { res.status(404).json({ success: false, message: 'Agent not found.' }); return null; }
+    const ctx = await resolveOwnerContext(db, auth.email);
+    const bot = snap.data();
+    if (bot?.owner !== ctx.ownerEmail) { res.status(403).json({ success: false, message: 'You do not own this agent.' }); return null; }
+    return { db, botRef, bot };
+}
+
+// ── Crawl helpers ───────────────────────────────────────────────────────────
+const crawlHost = (u) => { try { return new URL(u).hostname.replace(/^www\./i, '').toLowerCase(); } catch { return ''; } };
+
+function extractAllLinks(html, baseUrl) {
+    const out = [];
+    const re = /<a\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|'([^']*)')/gi;
+    let m;
+    while ((m = re.exec(html))) {
+        const raw = decodeHtmlEntities((m[1] ?? m[2] ?? '').trim());
+        if (!raw || raw[0] === '#' || /^(mailto|tel|javascript|sms|data):/i.test(raw)) continue;
+        try { out.push(new URL(raw, baseUrl).toString()); } catch { /* bad href */ }
+    }
+    return out;
+}
+
+// Same site (www-insensitive), no query/hash, no files or login pages.
+function crawlCanonicalUrl(u, hosts) {
+    let p;
+    try { p = new URL(u); } catch { return null; }
+    if (!/^https?:$/.test(p.protocol)) return null;
+    if (!hosts.includes(p.hostname.replace(/^www\./i, '').toLowerCase())) return null;
+    if (CRAWL_SKIP_RE.test(p.pathname)) return null;
+    p.hash = '';
+    p.search = '';
+    let out = p.toString();
+    if (p.pathname !== '/' && out.endsWith('/')) out = out.slice(0, -1);
+    return out;
+}
+
+function crawlEnqueue(st, seenSet, urls) {
+    for (const raw of urls) {
+        if (st.queue.length >= CRAWL_QUEUE_MAX || st.seen.length >= CRAWL_SEEN_MAX) break;
+        const c = crawlCanonicalUrl(raw, st.hosts);
+        if (!c) continue;
+        const h = ragSha(c.replace(/^https?:\/\/(www\.)?/i, '').toLowerCase()).slice(0, 12);
+        if (seenSet.has(h)) continue;
+        seenSet.add(h);
+        st.seen.push(h);
+        st.queue.push(c);
+    }
+}
+
+const crawlScore = (u) => {
+    try {
+        const p = new URL(u).pathname;
+        return (CRAWL_PRIORITY_RE.test(p) ? 0 : 100) + p.split('/').filter(Boolean).length;
+    } catch { return 999; }
+};
+
+async function crawlLoadSitemap(st, seenSet, pageUrl, deadline) {
+    let origin;
+    try { origin = new URL(pageUrl).origin; } catch { return; }
+    if (st.sitemapOrigins.includes(origin)) return;
+    st.sitemapOrigins.push(origin);
+    const locsOf = (xml) => [...xml.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/gi)].map(m => decodeHtmlEntities(m[1]));
+    try {
+        const first = await fetchPageHtml(`${origin}/sitemap.xml`, Math.min(2500, Math.max(800, deadline - Date.now() - 2500)), 1);
+        let locs = locsOf(first.html);
+        if (/<sitemapindex/i.test(first.html)) {
+            const kids = locs.slice(0, 6);
+            locs = [];
+            for (const k of kids) {
+                if (Date.now() > deadline - 3000) break;
+                try { locs.push(...locsOf((await fetchPageHtml(k, 2500, 1)).html)); } catch { /* skip child */ }
+            }
+        }
+        crawlEnqueue(st, seenSet, locs.slice(0, 3000));
+    } catch { /* no sitemap: link discovery alone is fine */ }
+}
+
+const crawlCleanState = (st) => ({
+    crawlId: st.crawlId, rootsKey: st.rootsKey, roots: st.roots, hosts: st.hosts, status: st.status,
+    queue: st.queue, seen: st.seen, sigs: st.sigs, sitemapOrigins: st.sitemapOrigins,
+    done: st.done, failed: st.failed, chars: st.chars, startedAt: st.startedAt, urls: st.urls,
+    ctxPages: st.ctxPages, errors: st.errors, jsWarn: !!st.jsWarn, message: st.message || null,
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/crawl/step  { businessId, urls[], restart }
+// Reads as many pages as fit in ≈7 s, stores each as its own document and returns progress.
+// The caller repeats until status is 'done' (or 'failed').
+// ════════════════════════════════════════════════════════════════════════════
+async function handleCrawlStep(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { businessId, restart } = req.body || {};
+    const urlsIn = (Array.isArray(req.body?.urls) ? req.body.urls : [req.body?.url])
+        .filter(u => typeof u === 'string' && /^https?:\/\//i.test(u.trim()))
+        .map(u => u.trim())
+        .slice(0, CRAWL_MAX_ROOTS);
+    if (!businessId || !urlsIn.length) return res.status(400).json({ success: false, message: 'Missing businessId or urls.' });
+
+    const owned = await loadOwnedBot(req, res, businessId);
+    if (!owned) return;
+    const { db, botRef, bot } = owned;
+    for (const u of urlsIn) {
+        if (!(await isSafePublicUrl(u))) return res.status(400).json({ success: false, message: `That URL is not allowed: ${u}` });
+    }
+
+    const deadline = Date.now() + CRAWL_STEP_BUDGET_MS;
+    const nowISO = new Date().toISOString();
+    const stateRef = db.collection('bot_crawl').doc(businessId);
+
+    try {
+        let st = (await stateRef.get()).data() || null;
+        const rootsKey = ragSha(urlsIn.map(u => u.toLowerCase()).sort().join('|'));
+
+        if (restart || !st || st.rootsKey !== rootsKey) {
+            st = {
+                crawlId: ragSha(`${businessId}|${nowISO}|${Math.random()}`).slice(0, 14),
+                rootsKey, roots: urlsIn, hosts: [...new Set(urlsIn.map(crawlHost))].filter(Boolean),
+                status: 'running', queue: [], seen: [], sigs: [], sitemapOrigins: [],
+                done: 0, failed: 0, chars: 0, startedAt: nowISO, urls: [], ctxPages: [], errors: [], jsWarn: false,
+            };
+            crawlEnqueue(st, new Set(), urlsIn);
+            if (!st.queue.length) st.queue = [urlsIn[0]];
+        }
+
+        if (st.status === 'done' || st.status === 'failed') {
+            return res.json({ success: true, status: st.status, pagesDone: st.done, queued: 0, failed: st.failed, chars: st.chars, readNow: [], next: [], message: st.message || undefined });
+        }
+
+        const seenSet = new Set(st.seen);
+        const readNow = [];
+
+        while (st.queue.length && st.done < CRAWL_HARD_MAX_PAGES && Date.now() < deadline - 2500) {
+            const take = st.queue.splice(0, Math.min(CRAWL_CONCURRENCY, CRAWL_HARD_MAX_PAGES - st.done));
+            const results = await Promise.all(take.map(async (u) => {
+                try {
+                    const left = deadline - Date.now() - 1500;
+                    return { u, r: await fetchPageHtml(u, Math.min(5000, Math.max(1500, left)), 2) };
+                } catch (e) { return { u, err: e.message }; }
+            }));
+
+            for (const x of results) {
+                if (x.err) {
+                    st.failed++;
+                    if (st.errors.length < 10) st.errors.push(`${x.u}: ${x.err}`);
+                    continue;
+                }
+                const finalUrl = x.r.finalUrl;
+                if (!st.hosts.includes(crawlHost(finalUrl))) continue;       // redirected off-site
+                const text = htmlToText(x.r.html).substring(0, CRAWL_PAGE_TEXT_MAX);
+
+                // Links are followed even from thin pages (menus / hubs), the page text is stored only if useful.
+                crawlEnqueue(st, seenSet, extractAllLinks(x.r.html, finalUrl));
+                await crawlLoadSitemap(st, seenSet, finalUrl, deadline);
+
+                if (st.done === 0 && x.r.html.length > 20000 && text.length < 1500) st.jsWarn = true;
+                if (text.length < 80) continue;
+                const sg = ragSha(text.replace(/\s+/g, ' ').slice(0, 400)).slice(0, 12);
+                if (st.sigs.includes(sg)) continue;                           // same document served for another path (SPA shell)
+                st.sigs.push(sg);
+
+                await kdocWrite(db, businessId, {
+                    kind: 'page', key: crawlCanonicalUrl(finalUrl, st.hosts) || finalUrl, title: finalUrl, text,
+                    extra: { crawlId: st.crawlId, order: st.done },
+                });
+                st.done++;
+                st.chars += text.length;
+                if (st.urls.length < 60) st.urls.push(finalUrl);
+                if (st.ctxPages.length < 6) st.ctxPages.push({ url: finalUrl, text: text.slice(0, 3000) });
+                readNow.push(finalUrl);
+            }
+            st.queue.sort((a, b) => crawlScore(a) - crawlScore(b));
+        }
+
+        const finished = !st.queue.length || st.done >= CRAWL_HARD_MAX_PAGES;
+        const warnings = [];
+
+        if (finished) {
+            if (st.done === 0) {
+                st.status = 'failed';
+                st.message = st.errors[0]
+                    ? `Could not read the website: ${st.errors[0]}`
+                    : 'No readable text was found. If the site builds its pages with JavaScript, put the key facts in the System Instructions or upload them as a file.';
+                await botRef.set({ lastSyncError: st.message, lastSyncCheckAt: nowISO }, { merge: true });
+            } else {
+                // Publish this crawl: pages of older crawls are removed, the agent switches to the new set.
+                await kdocDelete(db, businessId, { kind: 'page', keepCrawlId: st.crawlId });
+                const ctx = buildStuffedSiteContext(st.ctxPages, 15000);
+                await botRef.set({
+                    context: ctx,
+                    linksContext: '',
+                    contextHash: ragSha(`full|${st.crawlId}`),
+                    siteCrawl: {
+                        mode: 'full', crawlId: st.crawlId, at: nowISO, pages: st.done, chars: st.chars,
+                        failed: st.failed, roots: st.roots, urls: st.urls.slice(0, 50),
+                    },
+                    lastSyncedAt: nowISO, lastSyncCheckAt: nowISO, lastSyncError: null,
+                }, { merge: true });
+                await db.collection('bot_knowledge').doc(businessId).set({
+                    siteText: admin.firestore.FieldValue.delete(),
+                    linksText: admin.firestore.FieldValue.delete(),
+                    pages: admin.firestore.FieldValue.delete(),
+                    updatedAt: nowISO,
+                }, { merge: true });
+                st.status = 'done';
+                if (st.jsWarn && st.done <= 2) warnings.push('Very little text was found. If the site loads its content with JavaScript, upload the key pages as files or add the facts to the System Instructions.');
+            }
+        }
+
+        await stateRef.set(crawlCleanState(st));
+        return res.json({
+            success: true,
+            status: st.status,
+            pagesDone: st.done, queued: st.queue.length, failed: st.failed, chars: st.chars,
+            readNow, next: st.queue.slice(0, 3),
+            warnings,
+            message: st.message || undefined,
+        });
+    } catch (err) {
+        console.error('[Crawl/Step]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST /api/knowledge/files  { businessId, action: 'reset' | 'put' | 'commit', ... }
+// Files are parsed in the browser and arrive in pieces, so size is not limited by the
+// 4.5 MB request body or by Firestore's 1 MiB document limit.
+// ════════════════════════════════════════════════════════════════════════════
+async function handleKnowledgeFiles(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { businessId, action } = req.body || {};
+    if (!businessId || !action) return res.status(400).json({ success: false, message: 'Missing businessId or action.' });
+
+    const owned = await loadOwnedBot(req, res, businessId);
+    if (!owned) return;
+    const { db, botRef } = owned;
+
+    try {
+        if (action === 'reset') {
+            await kdocDelete(db, businessId, { kind: 'file' });
+            return res.json({ success: true });
+        }
+        if (action === 'put') {
+            const name = String(req.body.name || '').replace(/[\r\n]+/g, ' ').slice(0, 200);
+            const piece = Math.max(0, parseInt(req.body.piece, 10) || 0);
+            const text = String(req.body.text || '');
+            if (!name) return res.status(400).json({ success: false, message: 'Missing file name.' });
+            if (text.length > FILE_PIECE_CHARS + 1000) return res.status(413).json({ success: false, message: 'Piece too large.' });
+            const partsPerPiece = Math.ceil((FILE_PIECE_CHARS + 1000) / KDOC_MAX_CHARS);
+            await kdocWrite(db, businessId, { kind: 'file', key: name, title: name, text, partBase: piece * partsPerPiece, extra: { order: 0 } });
+            return res.json({ success: true, chars: text.length });
+        }
+        if (action === 'commit') {
+            const names = (Array.isArray(req.body.names) ? req.body.names : []).map(n => String(n).slice(0, 200)).slice(0, 500);
+            await botRef.set({
+                filesRev: ragSha(`${Date.now()}|${names.join('|')}`).slice(0, 14),
+                knowledgeContext: { hasUploadedFiles: names.length > 0, uploadedFileCount: names.length, uploadedFileNames: names.slice(0, 100) },
+            }, { merge: true });
+            return res.json({ success: true, files: names.length });
+        }
+        return res.status(400).json({ success: false, message: 'Unknown action.' });
+    } catch (err) {
+        console.error('[Knowledge/Files]', err.message);
         return res.status(500).json({ success: false, message: err.message });
     }
 }
@@ -2306,6 +2678,8 @@ export default async function handler(req, res) {
     if (path === '/api/email-verification/send')  return handleEmailVerificationSend(req, res);
     if (path === '/api/scrape')                   return handleScrape(req, res);
     if (path === '/api/knowledge/reindex')        return handleKnowledgeReindex(req, res);
+    if (path === '/api/crawl/step')               return handleCrawlStep(req, res);
+    if (path === '/api/knowledge/files')          return handleKnowledgeFiles(req, res);
     if (path === '/api/deploy')                   return handleDeploy(req, res);
     if (path === '/api/calculate-roi')            return handleROI(req, res);
     if (path === '/api/analytics/advanced')       return handleAdvancedAnalytics(req, res);
@@ -4138,6 +4512,8 @@ async function wipeBotCompletely(db, botId) {
     await deleteQueryBatch(db, db.collection('email_queue').where('businessId', '==', botId));
     await deleteQueryBatch(db, db.collection('telegram_sessions').where('businessId', '==', botId));
     await deleteQueryBatch(db, db.collection('knowledge_chunks').where('botId', '==', botId));
+    await deleteQueryBatch(db, db.collection('knowledge_docs').where('botId', '==', botId));
+    await db.collection('bot_crawl').doc(botId).delete().catch(() => {});
     await db.collection('bot_knowledge').doc(botId).delete().catch(() => {});
 
     await botRef.delete().catch(() => {});
