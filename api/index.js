@@ -1,5 +1,4 @@
 import admin from 'firebase-admin';
-import { createGoogleChatHandlers } from './googleChat.js';
 import crypto from 'crypto';
 import dns from 'dns';
 import { OAuth2Client } from 'google-auth-library';
@@ -261,7 +260,6 @@ const FEATURE_CATALOG = {
     pushNotifications:  { label: 'Desktop Push Notifications',              plans: ['team', 'teamplus', 'enterprise'] },
     emailAgent:         { label: 'Email Agent (IMAP/SMTP Inbox)',           plans: ['team', 'teamplus', 'enterprise'] },
     telegramAgent:      { label: 'Telegram Channel',                        plans: ['teamplus', 'enterprise'] },
-    googleChatAgent:    { label: 'Google Chat Channel (user-auth)',         plans: ['team', 'teamplus', 'enterprise'] },
     slackAgent:         { label: 'Slack Channel',                           plans: ['teamplus', 'enterprise'] },
     firebaseDatabase:   { label: 'Firebase Live Database Source',           plans: ['teamplus', 'enterprise'] },
     supabaseDatabase:   { label: 'Supabase Live Database Source',           plans: ['teamplus', 'enterprise'] },
@@ -275,7 +273,7 @@ const DB_SERVICE_FEATURE = { firebase: 'firebaseDatabase', supabase: 'supabaseDa
 const MAX_FILE_CONTEXT_CHARS = 25000;
 const DESIGN_SERVICE_FEATURE = { canva: 'canvaDesign', figma: 'figmaDesign' };
 
-const ALL_CHANNELS = ['widget', 'email', 'telegram', 'googlechat', 'slack', 'helppage'];
+const ALL_CHANNELS = ['widget', 'email', 'telegram', 'slack', 'helppage'];
 
 function normalizeChannels(botData) {
     let channels = Array.isArray(botData?.channels)
@@ -286,17 +284,14 @@ function normalizeChannels(botData) {
         const m = botData?.agentBuildMode || 'widget';
         const map = {
             widget: ['widget'], email: ['email'], telegram: ['telegram'],
-            googlechat: ['googlechat'], slack: ['slack'], helppage: ['helppage'],
+            slack: ['slack'], helppage: ['helppage'],
             both: ['widget', 'email'],
             'widget+telegram': ['widget', 'telegram'],
-            'widget+googlechat': ['widget', 'googlechat'],
             'widget+helppage': ['widget', 'helppage'],
             'email+telegram': ['email', 'telegram'],
-            'email+googlechat': ['email', 'googlechat'],
             'email+helppage': ['email', 'helppage'],
             'telegram+helppage': ['telegram', 'helppage'],
-            'googlechat+helppage': ['googlechat', 'helppage'],
-            all: ['widget', 'email', 'telegram', 'googlechat', 'slack', 'helppage'],
+            all: ['widget', 'email', 'telegram', 'slack', 'helppage'],
         };
         channels = map[m] || ['widget'];
     }
@@ -311,16 +306,13 @@ function normalizeChannels(botData) {
 function deriveBuildMode(channels) {
     const c = channels || [];
     const w = c.includes('widget'), e = c.includes('email');
-    const t = c.includes('telegram'), g = c.includes('googlechat'), sl = c.includes('slack');
-    if (w && e && t && g) return 'all';
+    const t = c.includes('telegram'), sl = c.includes('slack');
+    if (w && e && t && sl && c.includes('helppage')) return 'all';
     if (w && e)      return 'both';
     if (w && t)      return 'widget+telegram';
-    if (w && g)      return 'widget+googlechat';
     if (e && t)      return 'email+telegram';
-    if (e && g)      return 'email+googlechat';
     if (e)           return 'email';
     if (t)           return 'telegram';
-    if (g)           return 'googlechat';
     if (sl)          return 'slack';
     return 'widget';
 }
@@ -454,10 +446,6 @@ function sanitizeBotDataForPlan(botData, limits) {
         if (!f.telegramAgent && filtered.includes('telegram')) {
         filtered = filtered.filter(c => c !== 'telegram');
         stripped.push('telegramAgent');
-    }
-    if (!f.googleChatAgent && filtered.includes('googlechat')) {
-        filtered = filtered.filter(c => c !== 'googlechat');
-        stripped.push('googleChatAgent');
     }
     if (!f.slackAgent && filtered.includes('slack')) {
         filtered = filtered.filter(c => c !== 'slack');
@@ -2938,40 +2926,6 @@ async function runAgentLoop({ modelKey, sysPrompt, history, userMsg, tools, ctx 
 // ROUTER
 // ════════════════════════════════════════════════════════════════════════════
 
-const {
-    handleGoogleChatOAuth,
-    handleGoogleChatCallback,
-    handleGoogleChatWebhook,
-    handleGoogleChatPending,
-    handleGoogleChatApprove,
-    handleGoogleChatReject,
-    handleGoogleChatStatus,
-    handleGoogleChatDisconnect,
-    handleGoogleChatOptions,
-    runGoogleChatReplyJob,
-} = createGoogleChatHandlers({
-    admin,
-    getDb,
-    getUserSecrets,
-    setUserSecrets,
-    publicIntegrationFlag,
-    requireAuth,
-    requireOAuthStarter,
-    gateOAuthFeature,
-    verifyOAuthState,
-    signOAuthState,
-    buildAppUrl,
-    parseAutoSendDelay,
-    CREDIT_COSTS,
-    resolveOwnerContext,
-    resolvePlanLimits,
-    consumeCredits,
-    refreshGenericGoogleToken,
-    sendFCMToUser,
-    logChat,
-    generateBotReply,
-    normalizeChannels,
-});
     
 export default async function handler(req, res) {
     const path = req.url.split('?')[0].replace(/\/$/, '');
@@ -2989,7 +2943,6 @@ export default async function handler(req, res) {
     if (path === '/api/webhooks/whop')            return handleWhopWebhook(req, res);
     if (path === '/api/email/poll-worker')        return handleEmailPollWorker(req, res);
     if (path === '/api/knowledge/ingest-worker')  return handleKnowledgeIngestWorker(req, res);
-    if (path === '/api/google-chat/webhook')      return handleGoogleChatWebhook(req, res);
     if (path === '/api/slack/events')             return handleSlackWebhook(req, res);
     if (path === '/api/password-reset/request')   return handlePasswordResetRequest(req, res);
     if (path === '/api/password-reset/verify')    return handlePasswordResetVerify(req, res);
@@ -3010,30 +2963,6 @@ export default async function handler(req, res) {
     if (path === '/api/fcm-test-notification')    return handleFCMTestNotification(req, res);
     if (path === '/api/appointment/cancel')       return handleAppointmentCancel(req, res);
     if (path === '/api/appointment/edit')         return handleAppointmentEdit(req, res);
-// ── Google Chat routes (guarded: never let a missing handler return an empty 500) ──
-const _gchatRoutes = {
-    '/api/oauth/google-chat':          handleGoogleChatOAuth,
-    '/api/oauth/google-chat/callback': handleGoogleChatCallback,
-    '/api/google-chat/pending':        handleGoogleChatPending,
-    '/api/google-chat/approve':        handleGoogleChatApprove,
-    '/api/google-chat/reject':         handleGoogleChatReject,
-    '/api/google-chat/status':         handleGoogleChatStatus,
-    '/api/google-chat/disconnect':     handleGoogleChatDisconnect,
-};
-if (_gchatRoutes[path]) {
-    const fn = _gchatRoutes[path];
-    if (typeof fn !== 'function') {
-        console.error(`[Router] Google Chat handler for ${path} is missing — check googleChat.js exports.`);
-        return res.status(500).json({
-            success: false,
-            message: 'Google Chat endpoint is not configured on this deployment.',
-        });
-    }
-    if (req.method === 'OPTIONS' && typeof handleGoogleChatOptions === 'function') {
-        return handleGoogleChatOptions(req, res);
-    }
-    return fn(req, res);
-}
     if (path === '/api/oauth/google')             return handleGoogleOAuth(req, res);
     if (path === '/api/oauth/google/callback')    return handleGoogleCallback(req, res);
     if (path === '/api/disconnect-calendar')      return handleDisconnectCalendar(req, res);
@@ -5705,14 +5634,12 @@ async function handleEmailPollWorker(req, res) {
         const startedAt = Date.now();
                 const fetchResult = await runEmailFetchJob(db, startedAt);
         const replyResult = await runEmailReplyJob(db, startedAt);
-        const gchatResult = await runGoogleChatReplyJob(db, startedAt);
         const slackResult = await runSlackScheduledJob(db);
         return res.json({
             success: true,
             elapsedMs: Date.now() - startedAt,
             fetch: fetchResult,
             reply: replyResult,
-            googleChat: gchatResult,
             slack: slackResult,
         });
     } catch (err) {
@@ -6837,17 +6764,6 @@ async function handleDeploy(req, res) {
             lastRegisteredAt: priorTg.lastRegisteredAt || null,
         };
 
-    if (incomingChannels.includes('googlechat')) {
-        const gc = botData.googleChatConfig || {};
-        botData.googleChatConfig = {
-            requireHumanApproval: gc.requireHumanApproval !== false,
-            autoSendDelay: /^\d{1,3}:\d{2}:\d{2}$/.test(String(gc.autoSendDelay || ''))
-                ? gc.autoSendDelay
-                : '00:00:02',
-            greetingMessage: gc.greetingMessage || 'Hello! I am your AI assistant. How can I help you today? (Type "help" for commands)'
-        };
-    }
-
         if (incomingChannels.includes('slack')) {
             const sc = botData.slackConfig || {};
             botData.slackConfig = {
@@ -7346,8 +7262,6 @@ async function generateBotReply({ db, businessId, userMsg, history = [], convers
         sysPrompt += `\n\nTHIS IS AN EMAIL REPLY. The user's message arrived via email. Write a clear, professional reply. Do NOT mention chat, widgets, or "typing". Include a brief sign-off. Format your response using Markdown where it improves clarity — use **bold** for key terms, names, or important values, and use "-" bullet points or "1." numbered lists for multi-part answers — since this reply is rendered as a richly formatted HTML email.`;
     } else if (source === 'telegram') {
         sysPrompt += `\n\nTHIS IS A TELEGRAM CONVERSATION. Keep replies natural and concise. Avoid markdown that Telegram can't render — plain text with short paragraphs works best.`;
-    } else if (source === 'googlechat') {
-        sysPrompt += `\n\nTHIS IS A GOOGLE CHAT CONVERSATION. Keep replies conversational and short — Google Chat strips most Markdown, so plain text with short paragraphs works best. Bold via *asterisks* is fine; avoid headings, tables, and code fences.`;
     } else if (source === 'slack') {
         sysPrompt += `\n\nTHIS IS A SLACK CONVERSATION. Keep replies conversational and concise. Slack uses its own mrkdwn: *single asterisks* for bold, and bullet lists with "-". Avoid headings, tables, and code fences.`;
     }
@@ -9087,10 +9001,8 @@ async function refreshGenericGoogleToken(authObj, ownerEmail, db, key) {
         const expiryMs = new Date(authObj.expiry_date).getTime();
         if (!isNaN(expiryMs) && expiryMs < Date.now() + 60000) {
             
-            // Use the Chat-specific credentials if refreshing a Chat token
-            const isChat = key === 'google_chat';
-            const cId = isChat ? process.env.GOOGLE_CLIENT_ID_CHAT : process.env.GOOGLE_CLIENT_ID;
-            const cSec = isChat ? process.env.GOOGLE_CLIENT_SECRET_CHAT : process.env.GOOGLE_CLIENT_SECRET;
+            const cId = process.env.GOOGLE_CLIENT_ID;
+            const cSec = process.env.GOOGLE_CLIENT_SECRET;
 
             const r = await fetch('https://oauth2.googleapis.com/token', {
                 method:  'POST',
