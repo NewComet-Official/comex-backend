@@ -13,10 +13,6 @@
     }
 
     // ── Session State ────────────────────────────────────────────────────────
-    // The ACTIVE conversation lives in sessionStorage, so every tab / window is its own
-    // visitor (private windows in the same Chrome session share localStorage, which is
-    // what used to make two windows look like one user).
-    // Past chats (only when the owner enables "Save Past Chats") live in localStorage.
     let chatHistory  = [];
     let savedMessages = [];
     let isSending    = false;
@@ -31,7 +27,6 @@
         return `conv-${Date.now()}-${Array.from(a).map(n => n.toString(36)).join('')}`;
     };
 
-    // Drop the old shared (localStorage) session from previous widget versions
     try { localStorage.removeItem(SESSION_KEY); } catch (e) {}
 
     function loadSession() {
@@ -72,7 +67,7 @@
                 humanSessionActive, humanRequestId, humanLastPollISO,
                 humanRenderedIds: Array.from(humanRenderedIds),
             }));
-        } catch (e) { /* storage may be unavailable — degrade gracefully */ }
+        } catch (e) {}
         persistPastChat();
     }
     function clearHumanFromSession() {
@@ -125,7 +120,6 @@
         if (r.ok) {
             const result = await r.json();
             if (result.success) {
-                // ── Email-only agent: do not render the widget on the website ──
                 if (result.agentBuildMode === 'email') {
                     return;
                 }
@@ -171,29 +165,24 @@
 
         #cc-widget-bubble {
             position: fixed; ${pos.bubble}
-            width: 64px; height: 64px; background-color: ${themeColor};
+            width: 60px; height: 60px; background-color: ${themeColor};
             border-radius: 50%; display: flex; align-items: center; justify-content: center;
             cursor: pointer; color: #fff; background-size: cover; background-position: center;
-            box-shadow: 0 14px 34px -8px ${themeColor}99, 0 4px 10px rgba(15,23,42,0.18), inset 0 1px 1px rgba(255,255,255,0.3);
-            border: 2px solid rgba(255,255,255,0.35);
-            transition: transform .35s cubic-bezier(0.34,1.56,0.64,1), box-shadow .3s ease;
+            box-shadow: 0 10px 26px -6px ${themeColor}88, 0 4px 10px rgba(15,23,42,0.16), inset 0 1px 1px rgba(255,255,255,0.3);
+            border: 2px solid rgba(255,255,255,0.4);
+            transition: transform .25s cubic-bezier(0.34,1.56,0.64,1), box-shadow .25s ease;
             z-index: 999999; user-select: none; will-change: transform;
         }
-        #cc-widget-bubble::after {
-            content: ''; position: absolute; inset: -6px; border-radius: 50%;
-            border: 2px solid ${themeColor}; opacity: 0; animation: ccRing 2.8s ease-out infinite; pointer-events: none;
-        }
-        @keyframes ccRing { 0% { transform: scale(.9); opacity: .55; } 70%,100% { transform: scale(1.35); opacity: 0; } }
-        #cc-widget-bubble:hover { transform: scale(1.1) translateY(-3px); }
-        #cc-widget-bubble:active { transform: scale(.93); }
-        #cc-widget-bubble svg { width: 28px; height: 28px; fill: currentColor; }
+        #cc-widget-bubble:hover { transform: scale(1.07) translateY(-2px); box-shadow: 0 14px 30px -6px ${themeColor}aa, 0 6px 14px rgba(15,23,42,0.2); }
+        #cc-widget-bubble:active { transform: scale(.94); }
+        #cc-widget-bubble svg { width: 26px; height: 26px; fill: currentColor; }
 
         #cc-widget-window {
             position: fixed; ${pos.window}
             width: 400px; height: 680px; max-height: calc(100vh - 120px);
-            background: #fff; border: 1px solid rgba(226,232,240,.9); border-radius: 26px;
+            background: #fff; border: 1px solid rgba(226,232,240,.9); border-radius: 24px;
             display: none; flex-direction: column; overflow: hidden;
-            box-shadow: 0 30px 70px -14px rgba(15,23,42,.32), 0 0 0 1px rgba(15,23,42,.03);
+            box-shadow: 0 28px 65px -14px rgba(15,23,42,.28), 0 0 0 1px rgba(15,23,42,.03);
             z-index: 999999; color: #0f172a; opacity: 0;
             font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
             transform: scale(.94) translateY(16px); will-change: transform, opacity;
@@ -203,27 +192,25 @@
         #cc-widget-window.cc-closed { opacity: 0; transform: scale(.94) translateY(16px); pointer-events: none; }
 
         .cc-header {
-            padding: 18px 20px; color: #fff; flex-shrink: 0; position: relative; overflow: hidden;
+            padding: 16px 20px; color: #fff; flex-shrink: 0; position: relative; overflow: hidden;
             display: flex; align-items: center; justify-content: space-between;
-            background: linear-gradient(135deg, ${themeColor} 0%, ${themeColor}dd 100%);
+            background: linear-gradient(135deg, ${themeColor} 0%, ${themeColor}e6 100%);
         }
         .cc-header::before {
             content: ''; position: absolute; top: -60%; right: -20%; width: 260px; height: 260px;
-            background: radial-gradient(circle, rgba(255,255,255,.22) 0%, transparent 65%); pointer-events: none;
+            background: radial-gradient(circle, rgba(255,255,255,.18) 0%, transparent 65%); pointer-events: none;
         }
         .cc-header-left { display: flex; align-items: center; gap: 12px; position: relative; z-index: 1; min-width: 0; }
         .cc-avatar-container { position: relative; flex-shrink: 0; }
         .cc-avatar {
-            width: 46px; height: 46px; border-radius: 50%; background: rgba(255,255,255,.2);
+            width: 44px; height: 44px; border-radius: 50%; background: rgba(255,255,255,.22);
             border: 2px solid rgba(255,255,255,.45); display: flex; align-items: center; justify-content: center;
-            color: #fff; box-shadow: 0 6px 16px rgba(0,0,0,.14);
+            color: #fff; box-shadow: 0 4px 12px rgba(0,0,0,.12);
         }
-        .cc-avatar svg { width: 22px; height: 22px; fill: currentColor; }
-        .cc-status-dot { width: 13px; height: 13px; background: #22c55e; border: 2.5px solid ${themeColor}; border-radius: 50%; position: absolute; bottom: 0; right: 0; }
-        .cc-status-dot::after { content: ''; position: absolute; inset: -3px; border-radius: inherit; border: 2px solid #22c55e; animation: ccPulseGreen 2s ease-out infinite; }
-        @keyframes ccPulseGreen { 0% { transform: scale(.8); opacity: 1; } 100% { transform: scale(2.2); opacity: 0; } }
-        .cc-bot-title { font-weight: 800; font-size: 16px; letter-spacing: -.01em; margin-bottom: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        .cc-bot-status { font-size: 12px; opacity: .9; font-weight: 600; }
+        .cc-avatar svg { width: 21px; height: 21px; fill: currentColor; }
+        .cc-status-dot { width: 12px; height: 12px; background: #22c55e; border: 2px solid ${themeColor}; border-radius: 50%; position: absolute; bottom: 0; right: 0; }
+        .cc-bot-title { font-weight: 800; font-size: 15.5px; letter-spacing: -.01em; margin-bottom: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .cc-bot-status { font-size: 12px; opacity: .9; font-weight: 500; }
 
         .cc-header-actions { display: flex; gap: 6px; position: relative; z-index: 1; }
         .cc-close-btn, .cc-endchat-btn {
@@ -231,7 +218,7 @@
             background: rgba(255,255,255,.14); border: 1px solid rgba(255,255,255,.22);
             display: flex; align-items: center; justify-content: center; transition: all .2s cubic-bezier(0.16,1,0.3,1);
         }
-        .cc-close-btn:hover { background: rgba(255,255,255,.3); transform: rotate(90deg); }
+        .cc-close-btn:hover { background: rgba(255,255,255,.28); transform: rotate(90deg); }
         .cc-endchat-btn:hover { background: rgba(239,68,68,.9); border-color: transparent; transform: scale(1.06); }
         .cc-close-btn svg, .cc-endchat-btn svg { width: 16px; height: 16px; stroke: currentColor; }
 
@@ -241,7 +228,7 @@
             background: rgba(255,255,255,.14); border: 1px solid rgba(255,255,255,.22);
             display: none; align-items: center; justify-content: center; transition: background .2s;
         }
-        .cc-menu-btn:hover { background: rgba(255,255,255,.3); }
+        .cc-menu-btn:hover { background: rgba(255,255,255,.28); }
         .cc-menu-btn svg { width: 16px; height: 16px; }
         .cc-menu-panel {
             position: absolute; top: 68px; right: 14px; width: 260px; max-height: 340px; overflow-y: auto;
@@ -290,89 +277,123 @@
         .cc-rsubmit:disabled { opacity: .6; cursor: not-allowed; transform: none; }
 
         .cc-chatbox {
-            flex: 1; padding: 20px 18px 10px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px;
-            background: linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%); scroll-behavior: smooth;
+            flex: 1; padding: 18px 18px 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 16px;
+            background: #f8fafc; scroll-behavior: smooth;
         }
-        .cc-chatbox::-webkit-scrollbar { width: 6px; }
+        .cc-chatbox::-webkit-scrollbar { width: 5px; }
         .cc-chatbox::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
 
         .cc-welcome-card {
-            background: #fff; border: 1px solid #e2e8f0; border-radius: 22px; padding: 20px;
-            box-shadow: 0 12px 28px -10px rgba(15,23,42,.08); animation: ccFadeIn .35s ease forwards;
+            background: #fff; border: 1px solid #e2e8f0; border-radius: 20px; padding: 18px;
+            box-shadow: 0 8px 24px -10px rgba(15,23,42,.06); animation: ccFadeIn .35s ease forwards;
         }
-        .cc-welcome-card p { margin: 0 0 14px; font-size: 14px; color: #475569; line-height: 1.55; font-weight: 500; }
+        .cc-welcome-card p { margin: 0 0 14px; font-size: 13.5px; color: #475569; line-height: 1.55; font-weight: 500; }
         .cc-suggested-grid { display: flex; flex-direction: column; gap: 8px; }
         .cc-suggested-chip {
-            background: #f8fafc; border: 1px solid #e2e8f0; padding: 12px 14px; border-radius: 14px;
-            font-size: 13.5px; color: #334155; cursor: pointer; font-weight: 600;
+            background: #f8fafc; border: 1px solid #e2e8f0; padding: 11px 14px; border-radius: 13px;
+            font-size: 13px; color: #334155; cursor: pointer; font-weight: 600;
             display: flex; align-items: center; justify-content: space-between; transition: all .2s cubic-bezier(0.16,1,0.3,1);
         }
-        .cc-suggested-chip:hover { background: #fff; border-color: ${themeColor}; color: ${themeColor}; transform: translateY(-2px); box-shadow: 0 8px 18px rgba(15,23,42,.08); }
+        .cc-suggested-chip:hover { background: #fff; border-color: ${themeColor}; color: ${themeColor}; transform: translateY(-1px); box-shadow: 0 6px 14px rgba(15,23,42,.06); }
 
-        .cc-bubble-container { display: flex; flex-direction: column; width: 100%; animation: ccFadeIn .3s cubic-bezier(0.16,1,0.3,1) forwards; }
-        @keyframes ccFadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+        .cc-bubble-container { display: flex; flex-direction: column; width: 100%; animation: ccFadeIn .28s cubic-bezier(0.16,1,0.3,1) forwards; }
+        @keyframes ccFadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
 
-        .cc-bubble { max-width: 84%; padding: 12px 16px; border-radius: 20px; font-size: 14px; line-height: 1.58; word-break: break-word; font-weight: 500; }
+        /* ── Agent sender row (Avatar + Label before every agent message) ── */
+        .cc-sender-row {
+            display: flex; align-items: center; gap: 8px; margin-bottom: 6px;
+        }
+        .cc-msg-avatar {
+            width: 24px; height: 24px; border-radius: 50%; background: ${themeColor}; color: #fff;
+            display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+            background-size: cover; background-position: center;
+            border: 1.5px solid rgba(15,23,42,.08); box-shadow: 0 2px 6px rgba(15,23,42,.1);
+        }
+        .cc-msg-avatar svg { width: 13px; height: 13px; fill: currentColor; }
+        .cc-agent .cc-msg-avatar { background: #059669; }
+        .cc-sender-name {
+            font-size: 12px; font-weight: 700; color: #334155; letter-spacing: -.01em;
+        }
+        .cc-agent-body {
+            padding-left: 32px; display: flex; flex-direction: column; align-items: flex-start; width: 100%;
+        }
+
+        .cc-bubble { max-width: 86%; padding: 12px 15px; border-radius: 16px; font-size: 13.8px; line-height: 1.56; word-break: break-word; font-weight: 500; }
         .cc-bubble p { margin: 0 0 6px; } .cc-bubble p:last-child { margin-bottom: 0; }
         .cc-bubble ul, .cc-bubble ol { margin: 4px 0 6px 18px; padding: 0; } .cc-bubble li { margin-bottom: 3px; }
         .cc-bubble a { color: inherit; text-decoration: underline; text-underline-offset: 2px; font-weight: 700; }
-        .cc-bubble code { background: rgba(15,23,42,.08); padding: 1px 6px; border-radius: 6px; font-size: .86em; }
+        .cc-bubble code { background: rgba(15,23,42,.07); padding: 1px 6px; border-radius: 6px; font-size: .86em; }
 
         .cc-user { align-items: flex-end; }
-        .cc-user .cc-bubble { background: linear-gradient(135deg, ${themeColor}, ${themeColor}dd); color: #fff; border-bottom-right-radius: 6px; box-shadow: 0 8px 18px -6px ${themeColor}88; }
+        .cc-user .cc-bubble {
+            background: linear-gradient(135deg, ${themeColor}, ${themeColor}e0);
+            color: #fff; border-bottom-right-radius: 4px;
+            box-shadow: 0 6px 16px -6px ${themeColor}77;
+        }
         .cc-ai { align-items: flex-start; }
-        .cc-ai .cc-bubble { background: #fff; color: #0f172a; border-bottom-left-radius: 6px; border: 1px solid #e8edf3; box-shadow: 0 6px 16px -8px rgba(15,23,42,.1); }
-        .cc-agent .cc-bubble { background: #ecfdf5; color: #065f46; border-bottom-left-radius: 6px; border: 1px solid #a7f3d0; }
+        .cc-ai .cc-bubble {
+            background: #fff; color: #0f172a; border-top-left-radius: 4px;
+            border: 1px solid #e2e8f0; box-shadow: 0 2px 8px rgba(15,23,42,.04);
+        }
+        .cc-agent { align-items: flex-start; }
+        .cc-agent .cc-bubble {
+            background: #ecfdf5; color: #065f46; border-top-left-radius: 4px;
+            border: 1px solid #a7f3d0; box-shadow: 0 2px 8px rgba(6,95,70,.05);
+        }
         .cc-system-note { align-self: center; font-size: 11.5px; color: #64748b; font-weight: 700; padding: 5px 14px; background: #e8edf3; border-radius: 100px; }
 
-        .cc-meta-row { display: flex; align-items: center; gap: 8px; margin-top: 4px; padding: 0 6px; }
+        .cc-meta-row { display: flex; align-items: center; gap: 8px; margin-top: 4px; padding: 0 4px; }
         .cc-user .cc-meta-row { flex-direction: row-reverse; }
         .cc-meta { font-size: 10.5px; color: #94a3b8; font-weight: 600; }
         .cc-msg-actions { display: flex; gap: 2px; opacity: 0; transition: opacity .2s; }
         .cc-bubble-container:hover .cc-msg-actions { opacity: 1; }
         .cc-action-btn { background: transparent; border: none; cursor: pointer; color: #94a3b8; width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; border-radius: 7px; padding: 0; transition: all .15s; }
-        .cc-action-btn:hover { background: #e2e8f0; color: #1e293b; transform: scale(1.1); }
+        .cc-action-btn:hover { background: #e2e8f0; color: #1e293b; transform: scale(1.08); }
         .cc-action-btn.cc-reported { color: #ef4444; }
-        .cc-action-btn svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+        .cc-action-btn svg { width: 13.5px; height: 13.5px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 
         .cc-widget-row { align-self: flex-start; width: 100%; max-width: 330px; animation: ccFadeIn .4s cubic-bezier(0.16,1,0.3,1) forwards; }
         .cc-widget-row .cw-card input { width: 100%; padding: 10px 12px; border: 1.5px solid #e2e8f0; border-radius: 11px; margin: 4px 0 10px; font: inherit; font-size: 13px; outline: none; background: #f8fafc; transition: border-color .2s, box-shadow .2s; }
         .cc-widget-row .cw-card input:focus { border-color: ${themeColor}; background: #fff; box-shadow: 0 0 0 4px ${themeColor}1f; }
         .cc-widget-row .cw-submit:disabled { opacity: .6; cursor: not-allowed; }
 
-        .cc-footer { padding: 14px 16px 10px; background: #fff; border-top: 1px solid #eef2f6; display: flex; gap: 10px; align-items: center; flex-shrink: 0; }
+        .cc-footer { padding: 12px 16px 10px; background: #fff; border-top: 1px solid #eef2f6; display: flex; gap: 10px; align-items: center; flex-shrink: 0; }
         .cc-input-wrapper { flex: 1; position: relative; display: flex; align-items: center; }
         .cc-input {
             width: 100%; background: #f1f5f9; border: 1.5px solid transparent; color: #0f172a; outline: none; font-family: inherit;
-            padding: ${typebarSize === 'large' ? '15px 46px 15px 18px' : '12px 46px 12px 18px'};
-            font-size: 14px; border-radius: 100px; font-weight: 500; transition: all .2s ease;
+            padding: ${typebarSize === 'large' ? '14px 44px 14px 16px' : '11px 44px 11px 16px'};
+            font-size: 13.8px; border-radius: 14px; font-weight: 500; transition: all .2s ease;
         }
         .cc-input::placeholder { color: #94a3b8; }
-        .cc-input:focus { border-color: ${themeColor}; background: #fff; box-shadow: 0 0 0 4px ${themeColor}1f; }
+        .cc-input:focus { border-color: ${themeColor}; background: #fff; box-shadow: 0 0 0 3px ${themeColor}1a; }
         .cc-send-btn {
             background: ${themeColor}; border: none; color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center;
-            padding: ${sendButtonStyle === 'pill' ? '0 22px' : '0'}; width: ${sendButtonStyle === 'pill' ? 'auto' : '46px'}; height: 46px;
-            border-radius: ${sendButtonStyle === 'pill' ? '23px' : '50%'}; font-weight: 700; font-family: inherit; font-size: 13.5px; flex-shrink: 0;
-            box-shadow: 0 8px 18px -6px ${themeColor}99; transition: all .2s cubic-bezier(0.16,1,0.3,1);
+            padding: ${sendButtonStyle === 'pill' ? '0 20px' : '0'}; width: ${sendButtonStyle === 'pill' ? 'auto' : '42px'}; height: 42px;
+            border-radius: ${sendButtonStyle === 'pill' ? '14px' : '12px'}; font-weight: 700; font-family: inherit; font-size: 13.5px; flex-shrink: 0;
+            box-shadow: 0 6px 14px -4px ${themeColor}88; transition: all .2s cubic-bezier(0.16,1,0.3,1);
         }
-        .cc-send-btn svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; transition: transform .2s; }
-        .cc-send-btn:hover:not(:disabled) { transform: scale(1.07); } .cc-send-btn:hover:not(:disabled) svg { transform: translateX(2px); }
-        .cc-send-btn:active:not(:disabled) { transform: scale(.94); }
+        .cc-send-btn svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; transition: transform .2s; }
+        .cc-send-btn:hover:not(:disabled) { transform: scale(1.05); } .cc-send-btn:hover:not(:disabled) svg { transform: translateX(1.5px); }
+        .cc-send-btn:active:not(:disabled) { transform: scale(.95); }
         .cc-send-btn:disabled { opacity: .4; cursor: not-allowed; box-shadow: none; }
 
-        .cc-mic-btn { position: absolute; right: 10px; background: none; border: none; color: #64748b; cursor: pointer; padding: 6px; display: ${voiceEnabled ? 'flex' : 'none'}; align-items: center; justify-content: center; border-radius: 50%; transition: all .2s; }
+        .cc-mic-btn { position: absolute; right: 8px; background: none; border: none; color: #64748b; cursor: pointer; padding: 6px; display: ${voiceEnabled ? 'flex' : 'none'}; align-items: center; justify-content: center; border-radius: 50%; transition: all .2s; }
         .cc-mic-btn:hover { color: #0f172a; background: #e2e8f0; }
-        .cc-mic-btn svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; }
-        .cc-mic-btn.recording { color: #ef4444; background: #fef2f2; animation: ccPulse 1.4s infinite; }
-        @keyframes ccPulse { 0%,100% { transform: scale(1); } 50% { transform: scale(1.12); } }
+        .cc-mic-btn svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 2; }
+        .cc-mic-btn.recording { color: #ef4444; background: #fef2f2; }
 
-        .cc-typing { display: none; align-self: flex-start; background: #fff; border: 1px solid #e8edf3; padding: 13px 18px; border-radius: 20px; border-bottom-left-radius: 6px; gap: 5px; align-items: center; box-shadow: 0 6px 16px -8px rgba(15,23,42,.1); }
+        .cc-typing { display: none; align-self: flex-start; flex-direction: column; width: 100%; }
         .cc-typing.visible { display: flex; animation: ccFadeIn .25s ease forwards; }
-        .cc-dot { width: 7px; height: 7px; border-radius: 50%; background: ${themeColor}; opacity: .55; animation: ccBounce 1.4s ease-in-out infinite; }
+        .cc-typing-dots {
+            display: inline-flex; align-items: center; gap: 5px; background: #fff; border: 1px solid #e2e8f0;
+            padding: 12px 16px; border-radius: 16px; border-top-left-radius: 4px;
+            box-shadow: 0 2px 8px rgba(15,23,42,.04); margin-left: 32px; width: fit-content;
+        }
+        .cc-dot { width: 6.5px; height: 6.5px; border-radius: 50%; background: ${themeColor}; opacity: .55; animation: ccBounce 1.4s ease-in-out infinite; }
         .cc-dot:nth-child(2) { animation-delay: .2s; } .cc-dot:nth-child(3) { animation-delay: .4s; }
-        @keyframes ccBounce { 0%,80%,100% { transform: translateY(0); } 40% { transform: translateY(-6px); } }
+        @keyframes ccBounce { 0%,80%,100% { transform: translateY(0); } 40% { transform: translateY(-5px); } }
 
-        .cc-brand-footer { text-align: center; font-size: 11px; color: #94a3b8; padding: 0 0 12px; background: #fff; font-weight: 600; }
+        .cc-brand-footer { text-align: center; font-size: 11px; color: #94a3b8; padding: 0 0 10px; background: #fff; font-weight: 600; }
         .cc-brand-footer a { color: #64748b; text-decoration: none; font-weight: 800; } .cc-brand-footer a:hover { color: ${themeColor}; }
 
         .cc-report-card h3 { margin: 0 0 4px; font-size: 17px; font-weight: 800; }
@@ -388,7 +409,6 @@
         .cc-rstar.active { color: #f59e0b; } .cc-rstar:hover { transform: scale(1.2); }
         .cc-rerror { color: #ef4444; font-size: 12px; font-weight: 700; margin-bottom: 12px; display: none; }
 
-        @media (prefers-reduced-motion: reduce) { #cc-widget-bubble::after, .cc-status-dot::after { animation: none; } }
         @media (max-width: 480px) {
             #cc-widget-window { width: 100% !important; height: 100% !important; max-height: 100vh !important; inset: 0 !important; border-radius: 0 !important; transform: translateY(100%); }
             #cc-widget-window.cc-open { transform: translateY(0); }
@@ -397,6 +417,32 @@
         }
     `;
     document.head.appendChild(style);
+
+    const DEFAULT_BOT_SVG = `<svg viewBox="0 0 24 24"><path d="M12 2c-4.97 0-9 4.03-9 9 0 2.12.74 4.07 1.97 5.61L4.35 19.4c-.39.39-.39 1.02 0 1.41.39.39 1.02.39 1.41 0l2.79-2.79C10.09 18.64 11.03 19 12 19c4.97 0 9-4.03 9-9s-4.03-9-9-9zm0 15c-3.31 0-6-2.69-6-6s2.69-6 6-6 6 2.69 6 6-2.69 6-6 6zm-2-7c-.55 0-1 .45-1 1s.45 1 1 1 1-.45 1-1-.45-1-1-1zm4 0c-.55 0-1 .45-1 1s.45 1 1 1 1-.45 1-1-.45-1-1-1zm-4 4h4c.55 0 1-.45 1-1s-.45-1-1-1h-4c-.55 0-1 .45-1 1s.45 1 1 1z"/></svg>`;
+    const DEFAULT_USER_SVG = `<svg viewBox="0 0 24 24"><path d="M12 12c2.7 0 4.8-2.1 4.8-4.8S14.7 2.4 12 2.4 7.2 4.5 7.2 7.2 9.3 12 12 12zm0 2.4c-3.2 0-9.6 1.6-9.6 4.8v2.4h19.2v-2.4c0-3.2-6.4-4.8-9.6-4.8z"/></svg>`;
+
+    function createAgentSenderHeader(isHumanAgent) {
+        const row = document.createElement('div');
+        row.className = 'cc-sender-row';
+
+        const av = document.createElement('div');
+        av.className = 'cc-msg-avatar';
+        if (isHumanAgent) {
+            av.innerHTML = DEFAULT_USER_SVG;
+        } else if (config.logoBase64) {
+            av.style.backgroundImage = `url('${config.logoBase64}')`;
+        } else {
+            av.innerHTML = DEFAULT_BOT_SVG;
+        }
+
+        const label = document.createElement('span');
+        label.className = 'cc-sender-name';
+        label.textContent = isHumanAgent ? 'Human Agent' : config.name;
+
+        row.appendChild(av);
+        row.appendChild(label);
+        return row;
+    }
 
     // ── Build Interactive Floating Bubble ────────────────────────────────────
     const bubble = document.createElement('div');
@@ -428,7 +474,7 @@
         avatar.style.backgroundSize = 'cover';
         avatar.style.backgroundPosition = 'center';
     } else {
-        avatar.innerHTML = `<svg viewBox="0 0 24 24"><path d="M12 2c-4.97 0-9 4.03-9 9 0 2.12.74 4.07 1.97 5.61L4.35 19.4c-.39.39-.39 1.02 0 1.41.39.39 1.02.39 1.41 0l2.79-2.79C10.09 18.64 11.03 19 12 19c4.97 0 9-4.03 9-9s-4.03-9-9-9zm0 15c-3.31 0-6-2.69-6-6s2.69-6 6-6 6 2.69 6 6-2.69 6-6 6zm-2-7c-.55 0-1 .45-1 1s.45 1 1 1 1-.45 1-1-.45-1-1-1zm4 0c-.55 0-1 .45-1 1s.45 1 1 1 1-.45 1-1-.45-1-1-1zm-4 4h4c.55 0 1-.45 1-1s-.45-1-1-1h-4c-.55 0-1 .45-1 1s.45 1 1 1z"/></svg>`;
+        avatar.innerHTML = DEFAULT_BOT_SVG;
     }
     const statusDot = document.createElement('span');
     statusDot.className = 'cc-status-dot';
@@ -466,7 +512,6 @@
     closeBtn.setAttribute('aria-label', 'Close chat');
     closeBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none"><path d="M18 6L6 18M6 6l12 12" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 
-    // Three-dot past-chats menu (only shown when "Save Past Chats" is enabled)
     const menuBtn = document.createElement('button');
     menuBtn.className = 'cc-menu-btn';
     menuBtn.setAttribute('aria-label', 'Past chats');
@@ -515,11 +560,15 @@
     `;
     chatBox.appendChild(welcomeCard);
 
-    // Animated Typing Engine Anchor
+    // Animated Typing Engine Anchor (with Agent Avatar + Name)
     const typingEl = document.createElement('div');
     typingEl.className = 'cc-typing';
     typingEl.id = 'ccTyping';
-    typingEl.innerHTML = '<div class="cc-dot"></div><div class="cc-dot"></div><div class="cc-dot"></div>';
+    typingEl.appendChild(createAgentSenderHeader(false));
+    const typingDots = document.createElement('div');
+    typingDots.className = 'cc-typing-dots';
+    typingDots.innerHTML = '<div class="cc-dot"></div><div class="cc-dot"></div><div class="cc-dot"></div>';
+    typingEl.appendChild(typingDots);
     chatBox.appendChild(typingEl);
 
     // Interactive Widget Footer Element
@@ -588,11 +637,11 @@
         rule('.cc-header', p.concat(mv('header')));
 
         o = e.botMsg || {}; p = base(o); r = num(o.r);
-        if (r !== null) p.push(`border-radius:${r}px !important`, `border-bottom-left-radius:${Math.min(r, 6)}px !important`);
+        if (r !== null) p.push(`border-radius:${r}px !important`, `border-top-left-radius:${Math.min(r, 4)}px !important`);
         rule('.cc-ai .cc-bubble', p);
 
         o = e.userMsg || {}; p = base(o); r = num(o.r);
-        if (r !== null) p.push(`border-radius:${r}px !important`, `border-bottom-right-radius:${Math.min(r, 6)}px !important`);
+        if (r !== null) p.push(`border-radius:${r}px !important`, `border-bottom-right-radius:${Math.min(r, 4)}px !important`);
         rule('.cc-user .cc-bubble', p);
 
         o = e.input || {}; p = base(o); r = num(o.r); h = num(o.h);
@@ -681,7 +730,6 @@
     function appendMsg(text, isUser, opts) {
         opts = opts || {};
 
-        // Remember what's on screen so the chat can be restored / saved as a past chat
         if (!opts.noSave) {
             savedMessages.push({ k: isUser ? 'user' : (opts.isAgent ? 'agent' : 'bot'), text: String(text || '') });
         }
@@ -689,15 +737,19 @@
         const container = document.createElement('div');
         container.className = `cc-bubble-container ${isUser ? 'cc-user' : (opts.isAgent ? 'cc-agent' : 'cc-ai')}`;
 
+        // Render Agent Logo + Name row before every AI/Human agent message
+        if (!isUser) {
+            container.appendChild(createAgentSenderHeader(!!opts.isAgent));
+        }
+
         const bubbleEl = document.createElement('div');
         bubbleEl.className = 'cc-bubble';
 
         if (isUser) {
             bubbleEl.textContent = text;
         } else {
-            bubbleEl.innerHTML = (opts.isAgent ? '<strong>' + iconHtml('svg:user') + ' Human Agent:</strong> ' : '') + parseMarkdown(text);
+            bubbleEl.innerHTML = parseMarkdown(text);
         }
-        container.appendChild(bubbleEl);
 
         const metaCfg = isUser ? userMsgCfg : botMsgCfg;
         const metaRow = document.createElement('div');
@@ -768,7 +820,16 @@
 
         if (!isUser) metaRow.appendChild(actionsEl);
 
-        container.appendChild(metaRow);
+        if (isUser) {
+            container.appendChild(bubbleEl);
+            container.appendChild(metaRow);
+        } else {
+            const bodyWrap = document.createElement('div');
+            bodyWrap.className = 'cc-agent-body';
+            bodyWrap.appendChild(bubbleEl);
+            bodyWrap.appendChild(metaRow);
+            container.appendChild(bodyWrap);
+        }
 
         chatBox.insertBefore(container, typingEl);
         chatBox.scrollTop = chatBox.scrollHeight;
@@ -859,7 +920,6 @@
     const escW = v => String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     const colW = (c, d) => /^#[0-9a-f]{3,8}$/i.test(c || '') ? c : d;
 
-    // ── SVG icons / image icons / custom-HTML widgets (parity with Widget Studio) ──
     const SVG_PATHS = {
         check:'<circle cx="12" cy="12" r="10"/><path d="m8 12 3 3 5-6"/>',
         user:'<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>',
@@ -935,7 +995,6 @@
         if (e.data.ccWidgetSubmit && fr.__submit) fr.__submit(e.data.ccWidgetSubmit.fields);
     });
 
-
     function widgetToHtml(def, ctx) {
         if ((def.config || {}).mode === 'custom') return customWidgetHtml(def, ctx);
         ctx = ctx || {};
@@ -978,7 +1037,6 @@
             const defs = config.uiWidgets || {};
             const bookedDef = (defs.appointment_booked || [])[0];
 
-            // If this was an appointment booking and an appointment_booked widget exists, replace/show the booked widget directly without sending a chat message!
             if (data.success && data._widget && data._widget.category === 'appointment_booked' && bookedDef) {
                 if (rowEl) rowEl.remove();
                 appendWidget(bookedDef, data._widget.ctx || fields);
@@ -986,7 +1044,6 @@
                 return;
             }
 
-            // Otherwise render a clean inline confirmation card in place of the form (no noisy user chat bubble!)
             if (rowEl) {
                 const accent = colW(def.config && def.config.accent, themeColor);
                 rowEl.innerHTML = `<div class="cw-card" style="width:100%;background:#fff;color:#0f172a;border-radius:16px;border:1px solid ${accent}44;padding:16px;box-shadow:0 10px 26px -10px ${accent}44;">
@@ -1043,14 +1100,12 @@
         const pick = (c, id) => (defs[c] || []).find(d => d.id === id) || first(c);
         const w = data && data._widget;
 
-        // 1. Explicit backend _widget payload (e.g. appointment_booked or custom category)
         if (w && w.category && pick(w.category, w.id)) {
             const def = pick(w.category, w.id);
             const ctxMsg = (def.config && def.config.contextMessage) || '';
             return { def, ctx: w.ctx || {}, contextText: ctxMsg || null };
         }
 
-        // 2. Appointment Booked confirmation text fallback -> suppress raw text, show only widget
         if (/APPOINTMENT BOOKED/.test(reply) && first('appointment_booked')) {
             const g = re => (reply.match(re) || [])[1] || '';
             const def = first('appointment_booked');
@@ -1061,7 +1116,6 @@
             };
         }
 
-        // 3. Appointment Form trigger -> show short context intro + form widget (instead of long chatty questions)
         if (first('appointment_form') && config.behaviorConfig.allowAppointmentBooking && /\b(book|appointment|schedule|reserve)\b/i.test(userMsg || '')) {
             const def = first('appointment_form');
             const customCtx = def.config && def.config.contextMessage;
@@ -1072,7 +1126,6 @@
             };
         }
 
-        // 4. Unlimited custom categories matched by triggerKeywords
         const msgLow = String(userMsg || '').toLowerCase();
         for (const cat of Object.keys(defs)) {
             if (['appointment_booked', 'appointment_form', 'human_joined'].includes(cat)) continue;
@@ -1140,14 +1193,13 @@
                 } else if (m.sender === 'agent' && m.isSystem) {
                     appendSystemNote(m.text);
                 }
-                // visitor's own messages are already on screen / in savedMessages
             });
             saveSession();
 
             if (data.status === 'closed') {
                 stopHumanPolling("This conversation was closed — you're chatting with the AI assistant again.");
             }
-        } catch (err) { /* silent — retry next tick */ }
+        } catch (err) {}
         finally {
             humanPollInFlight = false;
         }
@@ -1334,7 +1386,7 @@
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ requestId: humanRequestId, closedBy: 'user' })
             });
-        } catch (err) { /* silent cleanup */ }
+        } catch (err) {}
         stopHumanPolling('You ended this conversation.');
     });
 
@@ -1369,7 +1421,7 @@
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ requestId: humanRequestId, sender: 'user', text })
                 });
-            } catch (err) { /* handled by next poll tick */ }
+            } catch (err) {}
             isSending = false;
             sendBtn.disabled = false;
             inputEl.focus();
