@@ -115,6 +115,36 @@ async function verifyIdToken(req) {
     }
 }
 
+// ── Employee link signature ────────────────────────────────────────────────
+// users/{email} is writable from the client, so fields such as accountType /
+// employerOwnerEmail / employeeOf can be forged. Every legitimate employee link
+// is therefore stamped by the server (verify-and-connect) with an HMAC that binds
+// {employee, owner, company}. Delegation (acting for an owner) is only honoured
+// when the stamp verifies. Set ENFORCE_EMPLOYEE_LINK=false to disable (not recommended).
+function employeeLinkKey() {
+    const s = process.env.EMPLOYEE_LINK_SECRET || process.env.OAUTH_STATE_SECRET || process.env.EMAIL_CRED_KEY;
+    return s ? crypto.createHash('sha256').update('employee-link:' + s).digest() : null;
+}
+
+function signEmployeeLink(employeeEmail, ownerEmail, companyKey) {
+    const key = employeeLinkKey();
+    if (!key) throw new Error('Missing EMPLOYEE_LINK_SECRET (or OAUTH_STATE_SECRET / EMAIL_CRED_KEY) env var.');
+    const msg = [employeeEmail, ownerEmail, companyKey].map(v => String(v || '').toLowerCase()).join('|');
+    return crypto.createHmac('sha256', key).update(msg).digest('hex');
+}
+
+function hasValidEmployeeLink(employeeEmail, profile) {
+    if (process.env.ENFORCE_EMPLOYEE_LINK === 'false') return true;
+    try {
+        const sig = profile?.employeeLinkSig;
+        if (typeof sig !== 'string' || !sig) return false;
+        const expected = signEmployeeLink(employeeEmail, profile.employerOwnerEmail, profile.employeeOf);
+        const a = Buffer.from(sig);
+        const b = Buffer.from(expected);
+        return a.length === b.length && crypto.timingSafeEqual(a, b);
+    } catch { return false; }
+}
+
 /**
  * P0-10: resolve the effective owner context for an authenticated user.
  * An employee only counts as "acting on behalf of" the owner when
@@ -128,7 +158,8 @@ async function resolveOwnerContext(db, email) {
 
     const isActiveEmployee = profile.accountType === 'employee'
         && profile.employerOwnerEmail
-        && (profile.employeeStatus || 'active') === 'active';
+        && (profile.employeeStatus || 'active') === 'active'
+        && hasValidEmployeeLink(String(email).toLowerCase(), profile);
 
     if (isActiveEmployee) {
         const ownerSnap = await db.collection('users').doc(profile.employerOwnerEmail).get();
@@ -146,8 +177,12 @@ async function resolveOwnerContext(db, email) {
  * Require a valid ID token. Optionally require the token's email to match
  * one of the emails supplied in `matches` (body/query). Writes a 401/403 and
  * returns null if the check fails.
+ *
+ * ownerOnly: true  → the token's email must itself be one of `matches`.
+ * Employee delegation ("acting for the owner") is NOT allowed. Use it on every
+ * destructive, billing or integration-management route.
  */
-async function requireAuth(req, res, { matches = [], allowUnverified = false } = {}) {
+async function requireAuth(req, res, { matches = [], allowUnverified = false, ownerOnly = false } = {}) {
     const user = await verifyIdToken(req);
     if (!user) {
         res.status(401).json({ success: false, message: 'Authentication required.' });
@@ -158,9 +193,14 @@ async function requireAuth(req, res, { matches = [], allowUnverified = false } =
         res.status(403).json({ success: false, message: 'Please verify your email address first.' });
         return null;
     }
-    if (matches.length) {
+    if (matches.length || ownerOnly) {
         const normalized = matches.map(e => String(e || '').toLowerCase()).filter(Boolean);
-        if (normalized.length && !normalized.includes(user.email)) {
+        if (ownerOnly) {
+            if (!normalized.includes(user.email)) {
+                res.status(403).json({ success: false, message: 'Only the account owner can do this.' });
+                return null;
+            }
+        } else if (normalized.length && !normalized.includes(user.email)) {
             // P0-10: only ACTIVE employees may act on behalf of their owner.
             try {
                 const db = getDb();
@@ -168,7 +208,8 @@ async function requireAuth(req, res, { matches = [], allowUnverified = false } =
                 const profile = snap.exists ? snap.data() : {};
                 const isActiveEmployee = profile.accountType === 'employee'
                     && profile.employerOwnerEmail
-                    && (profile.employeeStatus || 'active') === 'active';
+                    && (profile.employeeStatus || 'active') === 'active'
+                    && hasValidEmployeeLink(user.email, profile);
                 const ownerEmail = isActiveEmployee
                     ? String(profile.employerOwnerEmail).toLowerCase()
                     : null;
@@ -528,7 +569,7 @@ async function countOccupiedSeats(db, companyUsername) {
     let n = 0;
     snap.forEach(d => {
         const status = d.data()?.employeeStatus || 'active';
-        if (status !== 'removed') n++;
+        if (status !== 'removed' && hasValidEmployeeLink(d.id, d.data())) n++;
     });
     return n;
 }
@@ -2459,6 +2500,10 @@ async function ragRetrieve(db, businessId, query, k = RAG_TOP_K) {
             }
         } catch (e) {
             console.warn('[RAG/Retrieve] vector search unavailable, using fallback scan:', e.message);
+            if (!globalThis.__ragIndexWarned) {
+                globalThis.__ragIndexWarned = true;
+                console.error('[RAG/Retrieve] ACTION REQUIRED: create the Firestore vector index (gcloud command in the RAG section comment). Without it every RAG chat scans up to ' + RAG_MAX_CHUNKS + ' chunks.');
+            }
         }
     }
 
@@ -2974,6 +3019,7 @@ export default async function handler(req, res) {
     if (path === '/api/account/delete-cascade')   return handleAccountDeleteCascade(req, res);
     if (path === '/api/account/update-email')     return handleAccountChangeEmail(req, res);
     if (path === '/api/account/check-exists')     return handleCheckAccountExists(req, res);
+    if (path === '/api/account/init')             return handleAccountInit(req, res);
     if (path === '/api/account/update-photo')     return handleUpdateProfilePhoto(req, res);
     if (path === '/api/plan/usage')               return handlePlanUsage(req, res);
     if (path === '/api/plan/features')            return handlePlanFeatures(req, res);
@@ -3422,7 +3468,7 @@ async function handleSlackConnectManual(req, res) {
     if (!token.startsWith('xoxb-'))
         return res.status(400).json({ success: false, message: 'That does not look like a Slack Bot Token (it should start with xoxb-).' });
 
-    const auth = await requireAuth(req, res, { matches: [ownerEmail] });
+    const auth = await requireAuth(req, res, { matches: [ownerEmail], ownerOnly: true });
     if (!auth) return;
 
     try {
@@ -3535,7 +3581,7 @@ async function handleSlackDisconnect(req, res) {
     const { ownerEmail } = req.body || {};
     if (!ownerEmail) return res.status(400).json({ success: false, message: 'Missing ownerEmail.' });
 
-    const auth = await requireAuth(req, res, { matches: [ownerEmail] });
+    const auth = await requireAuth(req, res, { matches: [ownerEmail], ownerOnly: true });
     if (!auth) return;
 
     try {
@@ -4022,7 +4068,7 @@ async function handlePlanSelect(req, res) {
     if (!email || !planKey) return res.status(400).json({ success: false, message: 'Missing email or planKey.' });
     if (!PLAN_LIMITS[planKey]) return res.status(400).json({ success: false, message: `Unknown plan: ${planKey}` });
 
-    const auth = await requireAuth(req, res, { matches: [email] });
+    const auth = await requireAuth(req, res, { matches: [email], ownerOnly: true });
     if (!auth) return;
 
     try {
@@ -4098,7 +4144,7 @@ async function handleEnterpriseCreateCheckout(req, res) {
     if (!email || creditPool === undefined || creditPool === null)
         return res.status(400).json({ success: false, message: 'Missing email or creditPool.' });
 
-    const auth = await requireAuth(req, res, { matches: [email] });
+    const auth = await requireAuth(req, res, { matches: [email], ownerOnly: true });
     if (!auth) return;
 
     const { credits, agents, seats, price } = calculateEnterprisePrice(creditPool, agentCount, seatCount);
@@ -4779,7 +4825,7 @@ async function handleBotDeleteCascade(req, res) {
     if (!businessId || !ownerEmail)
         return res.status(400).json({ success: false, message: 'Missing businessId or ownerEmail.' });
 
-    const auth = await requireAuth(req, res, { matches: [ownerEmail] });
+    const auth = await requireAuth(req, res, { matches: [ownerEmail], ownerOnly: true });
     if (!auth) return;
 
     try {
@@ -4808,7 +4854,7 @@ async function handleBotRestore(req, res) {
     if (!businessId || !ownerEmail)
         return res.status(400).json({ success: false, message: 'Missing businessId or ownerEmail.' });
 
-    const auth = await requireAuth(req, res, { matches: [ownerEmail] });
+    const auth = await requireAuth(req, res, { matches: [ownerEmail], ownerOnly: true });
     if (!auth) return;
 
     try {
@@ -4850,7 +4896,7 @@ async function handleAccountDeleteCascade(req, res) {
     const { email } = req.body || {};
     if (!email) return res.status(400).json({ success: false, message: 'Missing email.' });
 
-    const auth = await requireAuth(req, res, { matches: [email] });
+    const auth = await requireAuth(req, res, { matches: [email], ownerOnly: true });
     if (!auth) return;
 
     try {
@@ -5281,7 +5327,7 @@ async function handleEmailConnect(req, res) {
         return res.status(400).json({ success: false, message: 'Missing required email connection fields.' });
     }
 
-    const auth = await requireAuth(req, res, { matches: [ownerEmail] });
+    const auth = await requireAuth(req, res, { matches: [ownerEmail], ownerOnly: true });
     if (!auth) return;
 
     try {
@@ -5346,7 +5392,7 @@ async function handleEmailDisconnect(req, res) {
     const { ownerEmail } = req.body || {};
     if (!ownerEmail) return res.status(400).json({ success: false, message: 'Missing ownerEmail.' });
 
-    const auth = await requireAuth(req, res, { matches: [ownerEmail] });
+    const auth = await requireAuth(req, res, { matches: [ownerEmail], ownerOnly: true });
     if (!auth) return;
 
     try {
@@ -6321,7 +6367,7 @@ async function notifyOwnerAndEmployees(db, ownerEmail, notification) {
                 .where('employeeOf', '==', companyUsername)
                 .where('employeeStatus', '==', 'active')
                 .get();
-            empSnap.forEach(d => targets.push(d.id));
+            empSnap.forEach(d => { if (hasValidEmployeeLink(d.id, d.data())) targets.push(d.id); });
         }
     } catch (e) { console.warn('[NotifyOwnerAndEmployees]', e.message); }
 
@@ -6679,7 +6725,7 @@ async function handleDeploy(req, res) {
     if (!botData?.id || !botData?.name || !ownerEmail)
         return res.status(400).json({ success: false, message: 'Missing botData.id, botData.name, or ownerEmail.' });
 
-    const auth = await requireAuth(req, res, { matches: [ownerEmail] });
+    const auth = await requireAuth(req, res, { matches: [ownerEmail], ownerOnly: true });
     if (!auth) return;
 
     try {
@@ -7899,7 +7945,7 @@ async function handlePromoValidate(req, res) {
         return res.status(400).json({ success: false, message: 'Missing code or email.' });
 
     // P1-25: require authentication and match the token email.
-    const auth = await requireAuth(req, res, { matches: [email] });
+    const auth = await requireAuth(req, res, { matches: [email], ownerOnly: true });
     if (!auth) return;
 
     if (await isRateLimitedDistributed(getDb(), `promo:${req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown'}`, 10, 60000)) {
@@ -8091,7 +8137,7 @@ async function handleEmailVerificationSend(req, res) {
 
         const fromEmail = process.env.RESEND_FROM_EMAIL || 'Mebor AI <noreply@meboragents.com>';
 
-    await getResend().emails.send({
+    await sendResendEmailOrThrow({
         from: fromEmail,
         to: auth.email,
         subject: 'Verify your email for Mebor AI',
@@ -8119,6 +8165,14 @@ async function handleEmailVerificationSend(req, res) {
         return res.json({ success: true });
     } catch (err) {
         console.error('[EmailVerification/Send]', err.message);
+        if (isEmailQuotaError(err)) {
+            return res.status(503).json({
+                success: false,
+                code: 'EMAIL_QUOTA',
+                retryAfterSeconds: 3600,
+                message: 'We are sending a very large number of verification emails right now. Please try again in a little while.',
+            });
+        }
         return res.status(500).json({ success: false, message: err.message });
     }
 }
@@ -8266,7 +8320,7 @@ async function handleDisconnectCalendar(req, res) {
     const { userEmail, calendarId, all } = req.body || {};
     if (!userEmail) return res.status(400).json({ success: false, message: 'Missing userEmail.' });
 
-    const auth = await requireAuth(req, res, { matches: [userEmail] });
+    const auth = await requireAuth(req, res, { matches: [userEmail], ownerOnly: true });
     if (!auth) return;
 
     try {
@@ -8971,7 +9025,7 @@ async function handleDisconnectDatabase(req, res) {
     if (!ownerEmail || !service)
         return res.status(400).json({ success: false, message: 'Missing ownerEmail or service.' });
 
-    const auth = await requireAuth(req, res, { matches: [ownerEmail] });
+    const auth = await requireAuth(req, res, { matches: [ownerEmail], ownerOnly: true });
     if (!auth) return;
 
     const fieldMap = {
@@ -9148,7 +9202,7 @@ async function handleCompanySetup(req, res) {
     if (!username || !ownerEmail)
         return res.status(400).json({ success: false, message: 'Missing username or ownerEmail.' });
 
-    const auth = await requireAuth(req, res, { matches: [ownerEmail] });
+    const auth = await requireAuth(req, res, { matches: [ownerEmail], ownerOnly: true });
     if (!auth) return;
 
     const key = companyKeyFrom(username);
@@ -9215,7 +9269,7 @@ async function handleCompanyJoinCode(req, res) {
     if (!companyUsername || !requestedBy)
         return res.status(400).json({ success: false, message: 'Missing companyUsername or requestedBy.' });
 
-    const auth = await requireAuth(req, res, { matches: [requestedBy] });
+    const auth = await requireAuth(req, res, { matches: [requestedBy], ownerOnly: true });
     if (!auth) return;
 
     try {
@@ -9255,7 +9309,7 @@ async function handleCompanyJoinCodeRegenerate(req, res) {
     if (!companyUsername || !requestedBy)
         return res.status(400).json({ success: false, message: 'Missing companyUsername or requestedBy.' });
 
-    const auth = await requireAuth(req, res, { matches: [requestedBy] });
+    const auth = await requireAuth(req, res, { matches: [requestedBy], ownerOnly: true });
     if (!auth) return;
 
     try {
@@ -9347,6 +9401,7 @@ async function handleEmployeeVerifyAndConnect(req, res) {
             pendingSetup:    false,
             connectedAt:     new Date().toISOString(),
             employerOwnerEmail: secret.ownerEmail,
+            employeeLinkSig: signEmployeeLink(employeeEmail, secret.ownerEmail, key),
             ...(logoBase64 ? { logoBase64 } : {}),
         }, { merge: true });
 
@@ -9365,7 +9420,7 @@ async function handleCompanyEmployeesList(req, res) {
     if (!companyUsername || !requestedBy)
         return res.status(400).json({ success: false, message: 'Missing companyUsername or requestedBy.' });
 
-    const auth = await requireAuth(req, res, { matches: [requestedBy] });
+    const auth = await requireAuth(req, res, { matches: [requestedBy], ownerOnly: true });
     if (!auth) return;
 
     try {
@@ -9414,7 +9469,7 @@ async function handleCompanyEmployeeRemove(req, res) {
     if (!companyUsername || !employeeEmail || !requestedBy)
         return res.status(400).json({ success: false, message: 'Missing required fields.' });
 
-    const auth = await requireAuth(req, res, { matches: [requestedBy] });
+    const auth = await requireAuth(req, res, { matches: [requestedBy], ownerOnly: true });
     if (!auth) return;
 
     try {
@@ -9446,7 +9501,7 @@ async function handleCompanyEmployeeDisable(req, res) {
     if (!companyUsername || !employeeEmail || !requestedBy)
         return res.status(400).json({ success: false, message: 'Missing required fields.' });
 
-    const auth = await requireAuth(req, res, { matches: [requestedBy] });
+    const auth = await requireAuth(req, res, { matches: [requestedBy], ownerOnly: true });
     if (!auth) return;
 
     try {
@@ -9483,7 +9538,7 @@ async function handleCompanyEmployeeDelete(req, res) {
     if (!companyUsername || !employeeEmail || !requestedBy)
         return res.status(400).json({ success: false, message: 'Missing required fields.' });
 
-    const auth = await requireAuth(req, res, { matches: [requestedBy] });
+    const auth = await requireAuth(req, res, { matches: [requestedBy], ownerOnly: true });
     if (!auth) return;
 
     try {
@@ -9878,6 +9933,39 @@ async function handleCheckAccountExists(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// POST /api/account/init  { accountType: 'company' | 'employee' | 'individual' }
+// Server-side replacement for the client's direct users/{email} accountType write
+// at signup (lets Firestore rules block client writes to that field).
+// Never touches employer/entitlement/credit fields and never overwrites an
+// account type that is already set.
+// ════════════════════════════════════════════════════════════════════════════
+async function handleAccountInit(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { accountType } = req.body || {};
+    if (!['company', 'employee', 'individual'].includes(accountType))
+        return res.status(400).json({ success: false, message: 'Invalid accountType.' });
+
+    // Signup happens before email verification, so unverified users must be allowed here.
+    const auth = await requireAuth(req, res, { allowUnverified: true });
+    if (!auth) return;
+
+    try {
+        const db = getDb();
+        const ref = db.collection('users').doc(auth.email);
+        const snap = await ref.get();
+        const existing = snap.exists ? snap.data() : {};
+        if (existing.accountType || existing.companyUsername || existing.employeeOf) {
+            return res.json({ success: true, accountType: existing.accountType || null, unchanged: true });
+        }
+        await ref.set({ accountType }, { merge: true });
+        return res.json({ success: true, accountType });
+    } catch (err) {
+        console.error('[Account/Init]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // POST /api/account/update-email
 // ════════════════════════════════════════════════════════════════════════════
 async function handleAccountChangeEmail(req, res) {
@@ -9885,14 +9973,34 @@ async function handleAccountChangeEmail(req, res) {
     const { oldEmail, newEmail } = req.body || {};
     if (!oldEmail || !newEmail) return res.status(400).json({ success: false, message: 'Missing oldEmail or newEmail.' });
 
-    const auth = await requireAuth(req, res, { matches: [oldEmail] });
+    const auth = await requireAuth(req, res, { matches: [oldEmail], ownerOnly: true });
     if (!auth) return;
 
     try {
         const db = getDb();
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(newEmail)))
+            return res.status(400).json({ success: false, message: 'Invalid newEmail.' });
+
+        // Never merge into an established account (would let one user overwrite another's profile).
+        const newSnap = await db.collection('users').doc(newEmail).get();
+        if (newSnap.exists && newEmail !== oldEmail) {
+            const nd = newSnap.data() || {};
+            if (nd.accountType || nd.entitlement || nd.companyUsername || nd.employeeOf)
+                return res.status(409).json({ success: false, message: 'That email is already in use.' });
+        }
+
         const oldSnap = await db.collection('users').doc(oldEmail).get();
         const profile = oldSnap.exists ? oldSnap.data() : {};
         await db.collection('users').doc(newEmail).set(profile, { merge: true });
+
+        // The employee link is bound to the employee's email — re-stamp it for the new address.
+        if (profile.accountType === 'employee' && hasValidEmployeeLink(oldEmail, profile)) {
+            try {
+                await db.collection('users').doc(newEmail).set({
+                    employeeLinkSig: signEmployeeLink(newEmail, profile.employerOwnerEmail, profile.employeeOf),
+                }, { merge: true });
+            } catch (e) { console.warn('[Account/ChangeEmail/relink]', e.message); }
+        }
         await db.collection('users').doc(oldEmail).delete().catch(() => {});
 
         const ownerCollections = ['user_bots', 'appointments', 'reports', 'leads'];
@@ -9925,7 +10033,15 @@ async function handleAccountChangeEmail(req, res) {
             const docs = empSnap.docs;
             for (let i = 0; i < docs.length; i += 400) {
                 const batch = db.batch();
-                docs.slice(i, i + 400).forEach(d => batch.update(d.ref, { employerOwnerEmail: newEmail }));
+                docs.slice(i, i + 400).forEach(d => {
+                    const dd = d.data() || {};
+                    const upd = { employerOwnerEmail: newEmail };
+                    // Re-stamp only links that were genuine before the owner's email changed.
+                    if (hasValidEmployeeLink(d.id, dd)) {
+                        try { upd.employeeLinkSig = signEmployeeLink(d.id, newEmail, dd.employeeOf); } catch { /* no key */ }
+                    }
+                    batch.update(d.ref, upd);
+                });
                 await batch.commit();
             }
         }
@@ -9963,6 +10079,23 @@ const PASSWORD_RESET_TOKEN_TTL_MS = 60 * 60 * 1000;
 function getResend() {
     if (!process.env.RESEND_API_KEY) throw new Error('Missing RESEND_API_KEY env var.');
     return new Resend(process.env.RESEND_API_KEY);
+}
+
+// Resend's SDK returns { data, error } instead of throwing — turn errors into exceptions.
+async function sendResendEmailOrThrow(payload) {
+    const result = await getResend().emails.send(payload);
+    if (result?.error) {
+        const e = new Error(result.error.message || 'Email provider error.');
+        e.statusCode = result.error.statusCode || result.error.status || null;
+        e.code = result.error.name || null;
+        throw e;
+    }
+    return result;
+}
+
+function isEmailQuotaError(e) {
+    const text = `${e?.code || ''} ${e?.message || ''}`;
+    return e?.statusCode === 429 || /quota|rate.?limit|too many requests|daily/i.test(text);
 }
 
 async function handlePasswordResetRequest(req, res) {
