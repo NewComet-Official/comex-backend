@@ -697,6 +697,7 @@ async function buildUsageSnapshot(db, requesterEmail) {
             tier: limits.tier,
             label: limits.label,
             source: limits.entitlementSource,
+            payAsYouGo: limits.tier === 'enterprise',
         },
         agents: {
             used: agentsUsed,
@@ -5360,7 +5361,9 @@ async function handlePlanSelect(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// ENTERPRISE DYNAMIC PRICING (WHOP)
+// ENTERPRISE PAY-AS-YOU-GO PRICING (WHOP)
+// Customers pick agents / credits / teammates within the limits below and pay
+// only for that capacity (base + per-unit extras). Limits are unchanged.
 // ════════════════════════════════════════════════════════════════════════════
 
 const ENTERPRISE_PRICING = {
