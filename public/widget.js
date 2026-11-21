@@ -668,7 +668,7 @@
 
     // ── Ultra-Clean Sanitized Markdown Message Parser ─────────────────────────
     function parseMarkdown(text) {
-        let t = String(text || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        let t = String(text || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
         t = t.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
              .replace(/(^|[^*])\*(?!\*)([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>')
              .replace(/`([^`]+)`/g, '<code>$1</code>')
