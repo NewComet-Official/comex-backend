@@ -291,7 +291,7 @@ const PLAN_LIMITS = {
     free:       { label: 'Free',       maxAgents: 1,   maxSeats: 1,   monthlyCredits: 100    },
     team:       { label: 'Team',       maxAgents: 3,   maxSeats: 3,   monthlyCredits: 2500   },
     teamplus:   { label: 'Team+',      maxAgents: 10,  maxSeats: 10,  monthlyCredits: 10000  },
-    enterprise: { label: 'Enterprise', maxAgents: 10,  maxSeats: 10,  monthlyCredits: 45000  },
+    enterprise: { label: 'Enterprise', maxAgents: 500, maxSeats: 500, monthlyCredits: 500000 },
 };
 
 const PLAN_ORDER = ['free', 'team', 'teamplus', 'enterprise'];
@@ -615,11 +615,13 @@ async function consumeCredits(db, ownerEmail, amount, opts = {}) {
             }
 
             const newUsed = state.used + amount;
+            const entRollover = limits.tier === 'enterprise' && data.creditPeriod && data.creditPeriod !== state.period;
             tx.set(ref, {
                 creditPeriod:    state.period,
                 creditsUsed:     newUsed,
                 creditsLimit:    limits.monthlyCredits,
                 creditsUpdatedAt: new Date().toISOString(),
+                ...(entRollover ? { enterpriseBilling: { closed: { [data.creditPeriod]: { credits: toPositiveInt(data.creditsUsed, 0) } } } } : {}),
             }, { merge: true });
 
             const ratio = limits.monthlyCredits > 0 ? newUsed / limits.monthlyCredits : 1;
@@ -689,6 +691,24 @@ async function buildUsageSnapshot(db, requesterEmail) {
         countOccupiedSeats(db, companyUsername),
     ]);
 
+    let billing = null;
+    const isPayg = limits.tier === 'enterprise' && ctx.ownerProfile?.entitlement?.billingModel === 'payg';
+    if (isPayg) {
+        await trackEnterprisePeaks(db, ctx.ownerEmail, ctx.ownerProfile, agentsUsed, seatsUsed);
+        const eb = ctx.ownerProfile?.enterpriseBilling || {};
+        const sameMonth = eb.period === credits.period;
+        billing = {
+            model: 'pay-as-you-go',
+            period: credits.period,
+            ...calculateEnterpriseBill({
+                agents:  Math.max(sameMonth ? (eb.peakAgents || 0) : 0, agentsUsed),
+                seats:   Math.max(sameMonth ? (eb.peakSeats  || 0) : 0, seatsUsed),
+                credits: credits.used,
+            }),
+            billingStatus: ctx.ownerProfile?.entitlement?.billingStatus || 'ok',
+        };
+    }
+
     return {
         ownerEmail: ctx.ownerEmail,
         isEmployee: ctx.isEmployee,
@@ -697,8 +717,9 @@ async function buildUsageSnapshot(db, requesterEmail) {
             tier: limits.tier,
             label: limits.label,
             source: limits.entitlementSource,
-            payAsYouGo: limits.tier === 'enterprise',
+            payAsYouGo: isPayg,
         },
+        billing,
         agents: {
             used: agentsUsed,
             limit: limits.maxAgents,
@@ -3034,7 +3055,8 @@ export default async function handler(req, res) {
     if (path === '/api/plan/features')            return handlePlanFeatures(req, res);
     if (path === '/api/plan/select')              return handlePlanSelect(req, res);
     if (path === '/api/plan/can-create-agent')    return handleCanCreateAgent(req, res);
-    if (path === '/api/enterprise/create-checkout') return handleEnterpriseCreateCheckout(req, res);
+    if (path === '/api/enterprise/start')           return handleEnterpriseStart(req, res);
+    if (path === '/api/cron/enterprise-billing')    return handleEnterpriseBillingCron(req, res);
     if (path === '/api/email/connect')            return handleEmailConnect(req, res);
     if (path === '/api/email/disconnect')         return handleEmailDisconnect(req, res);
     if (path === '/api/email/status')             return handleEmailStatus(req, res);
@@ -5330,6 +5352,10 @@ async function handlePlanSelect(req, res) {
         const data = snap.exists ? snap.data() : {};
 
         if (planKey === 'free') {
+            if (data.entitlement?.tier === 'enterprise' && data.entitlement?.billingModel === 'payg') {
+                await chargeEnterprisePeriod(db, email, data, currentBillingPeriod(), { final: true })
+                    .catch(e => console.error('[Enterprise/FinalBill]', e.message));
+            }
             const ent = await writeEntitlement(db, email, 'free', 'self-serve');
             return res.json({ success: true, entitlement: ent, limits: resolvePlanLimits({ entitlement: ent }) });
         }
@@ -5361,121 +5387,269 @@ async function handlePlanSelect(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// ENTERPRISE PAY-AS-YOU-GO PRICING (WHOP)
-// Customers pick agents / credits / teammates within the limits below and pay
-// only for that capacity (base + per-unit extras). Limits are unchanged.
+// ENTERPRISE PAY-AS-YOU-GO (WHOP)
+// • Choosing Enterprise only saves a card (Whop "setup" checkout) — nothing is
+//   charged at sign-up and the user goes straight to the dashboard.
+// • Every month costs the preset base price (charged even with zero usage)
+//   PLUS anything used beyond what Team+ already includes.
+// • The card on file is charged once, at the end of the month.
 // ════════════════════════════════════════════════════════════════════════════
 
 const ENTERPRISE_PRICING = {
-    basePrice:        499,
-    baseCredits:      45000,   creditOverageRate: 0.015,  maxCredits: 2000000,
-    baseAgents:       10,      agentOverageRate:  7,      maxAgents:  5000,
-    baseSeats:        10,      seatOverageRate:   4,      maxSeats:   5000,
-    maxCheckoutPrice: 2500,
+    basePrice: 120,
+    included: { credits: 10000, agents: 10, seats: 10 },   // = Team+ allowances
+    rates:    { credit: 0.015,  agent: 7,   seat: 4 },     // per unit beyond included, per month
+    caps:     { credits: 500000, agents: 500, seats: 500 },
 };
 
-function calculateEnterprisePrice(rawCreditPool, rawAgentCount, rawSeatCount) {
-    let credits = Math.round(Number(rawCreditPool) || 0);
-    credits = Math.max(ENTERPRISE_PRICING.baseCredits, Math.min(ENTERPRISE_PRICING.maxCredits, credits));
-
-    let agents = Math.round(Number(rawAgentCount) || ENTERPRISE_PRICING.baseAgents);
-    agents = Math.max(ENTERPRISE_PRICING.baseAgents, Math.min(ENTERPRISE_PRICING.maxAgents, agents));
-
-    let seats = Math.round(Number(rawSeatCount) || ENTERPRISE_PRICING.baseSeats);
-    seats = Math.max(ENTERPRISE_PRICING.baseSeats, Math.min(ENTERPRISE_PRICING.maxSeats, seats));
-
-    const creditsCost = Math.max(0, credits - ENTERPRISE_PRICING.baseCredits) * ENTERPRISE_PRICING.creditOverageRate;
-    const agentsCost  = Math.max(0, agents  - ENTERPRISE_PRICING.baseAgents)  * ENTERPRISE_PRICING.agentOverageRate;
-    const seatsCost   = Math.max(0, seats   - ENTERPRISE_PRICING.baseSeats)   * ENTERPRISE_PRICING.seatOverageRate;
-
-    const price = ENTERPRISE_PRICING.basePrice + creditsCost + agentsCost + seatsCost;
-    return { credits, agents, seats, price: Math.round(price * 100) / 100 };
+function calculateEnterpriseBill(usage) {
+    const P = ENTERPRISE_PRICING;
+    const line = (used, included, rate) => {
+        const u = Math.max(0, Math.round(Number(used) || 0));
+        const extra = Math.max(0, u - included);
+        return { used: u, included, extra, rate, cost: Math.round(extra * rate * 100) / 100 };
+    };
+    const agents  = line(usage?.agents,  P.included.agents,  P.rates.agent);
+    const seats   = line(usage?.seats,   P.included.seats,   P.rates.seat);
+    const credits = line(usage?.credits, P.included.credits, P.rates.credit);
+    const extras  = Math.round((agents.cost + seats.cost + credits.cost) * 100) / 100;
+    return {
+        base: P.basePrice,
+        agents, seats, credits,
+        extras,
+        total: Math.round((P.basePrice + extras) * 100) / 100,
+    };
 }
 
-async function handleEnterpriseCreateCheckout(req, res) {
+async function trackEnterprisePeaks(db, email, userData, agents, seats) {
+    try {
+        const period = currentBillingPeriod();
+        const eb = userData?.enterpriseBilling || {};
+        const same = eb.period === period;
+        const peakAgents = Math.max(same ? (eb.peakAgents || 0) : 0, agents);
+        const peakSeats  = Math.max(same ? (eb.peakSeats  || 0) : 0, seats);
+        if (same && peakAgents === (eb.peakAgents || 0) && peakSeats === (eb.peakSeats || 0)) return;
+        const patch = { period, peakAgents, peakSeats };
+        if (eb.period && !same) patch.closed = { [eb.period]: { agents: eb.peakAgents || 0, seats: eb.peakSeats || 0 } };
+        await db.collection('users').doc(email).set({ enterpriseBilling: patch }, { merge: true });
+        if (userData) userData.enterpriseBilling = { ...eb, ...patch };
+    } catch (e) { console.warn('[Enterprise/Peaks]', e.message); }
+}
+
+// POST /api/enterprise/start { email, companyId }
+// Creates a Whop SETUP checkout (saves the card, charges nothing).
+async function handleEnterpriseStart(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
-    const { email, companyId, creditPool, agentCount, seatCount } = req.body || {};
-    if (!email || creditPool === undefined || creditPool === null)
-        return res.status(400).json({ success: false, message: 'Missing email or creditPool.' });
+    const { email, companyId } = req.body || {};
+    if (!email) return res.status(400).json({ success: false, message: 'Missing email.' });
 
     const auth = await requireAuth(req, res, { matches: [email], ownerOnly: true });
     if (!auth) return;
 
-    const { credits, agents, seats, price } = calculateEnterprisePrice(creditPool, agentCount, seatCount);
-    if (!(price >= ENTERPRISE_PRICING.basePrice))
-        return res.status(400).json({ success: false, message: 'Invalid plan configuration.' });
-    if (price > ENTERPRISE_PRICING.maxCheckoutPrice)
-        return res.status(400).json({ success: false, message: `This configuration exceeds the $${ENTERPRISE_PRICING.maxCheckoutPrice}/mo self-serve limit. Please contact sales.` });
-
     const whopApiKey    = process.env.WHOP_API_KEY;
     const whopCompanyId = process.env.WHOP_COMPANY_ID;
-    const whopProductId = process.env.WHOP_ENTERPRISE_PRODUCT_ID;
-    if (!whopApiKey || !whopCompanyId || !whopProductId) {
-        return res.status(500).json({
-            success: false,
-            message: 'Enterprise checkout is not configured yet. Set WHOP_API_KEY, WHOP_COMPANY_ID, and WHOP_ENTERPRISE_PRODUCT_ID.',
-        });
+    if (!whopApiKey || !whopCompanyId) {
+        return res.status(500).json({ success: false, message: 'Enterprise sign-up is not configured yet. Set WHOP_API_KEY and WHOP_COMPANY_ID.' });
     }
 
     try {
-        const appUrl = process.env.APP_URL || `https://${req.headers.host}`;
-
-        console.log('[Enterprise/CreateCheckout] company_id=', whopCompanyId, 'product_id=', whopProductId, 'price=', price);
-
-        const r = await fetch('https://api.whop.com/api/v1/checkout_configurations', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${whopApiKey}`,
-            },
-            body: JSON.stringify({
-                mode: 'payment',
-                metadata: {
-                    company_id: companyId || email,
-                    owner_email: email,
-                    credit_pool: credits,
-                    agent_count: agents,
-                    seat_count: seats,
-                    tier: 'enterprise',
-                },
-                redirect_url: `${appUrl}/dashboard?enterprise_checkout=started`,
-                plan: {
-                    company_id: whopCompanyId,
-                    product_id: whopProductId,
-                    currency: 'usd',
-                    plan_type: 'renewal',
-                    billing_period: 30,
-                    renewal_price: price,
-                    visibility: 'hidden',
-                },
-            }),
-        });
-
-        if (!r.ok) {
-            const errText = await r.text();
-            throw new Error(`Whop checkout configuration failed (HTTP ${r.status}) [company_id=${whopCompanyId}, product_id=${whopProductId}]: ${errText.substring(0, 300)}`);
+        const db = getDb();
+        const snap = await db.collection('users').doc(email).get();
+        const ent = snap.exists ? snap.data()?.entitlement : null;
+        if (ent?.tier === 'enterprise' && ent?.billingModel === 'payg' && ent?.status === 'active') {
+            return res.json({ success: true, alreadyActive: true });
         }
 
+        const appUrl = process.env.APP_URL || `https://${req.headers.host}`;
+        const r = await fetch('https://api.whop.com/api/v1/checkout_configurations', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${whopApiKey}` },
+            body: JSON.stringify({
+                mode: 'setup',
+                company_id: whopCompanyId,
+                currency: 'usd',
+                metadata: { kind: 'enterprise_setup', owner_email: email, company_id: companyId || email },
+                redirect_url: `${appUrl}/dashboard?enterprise_setup=done`,
+            }),
+        });
+        if (!r.ok) {
+            const errText = await r.text();
+            throw new Error(`Whop setup checkout failed (HTTP ${r.status}): ${errText.substring(0, 300)}`);
+        }
         const data = await r.json();
         let checkoutUrl = data.purchase_url;
         if (checkoutUrl && !/^https?:\/\//i.test(checkoutUrl)) {
             checkoutUrl = `https://whop.com${checkoutUrl.startsWith('/') ? '' : '/'}${checkoutUrl}`;
         }
-        if (!checkoutUrl) throw new Error('Whop did not return a purchase URL.');
+        if (!checkoutUrl) throw new Error('Whop did not return a checkout URL.');
 
-        try {
-            const db = getDb();
-            await db.collection('enterprise_checkout_requests').add({
-                ownerEmail: email, companyId: companyId || email,
-                creditPool: credits, agentCount: agents, seatCount: seats,
-                price, whopCheckoutConfigId: data.id || null,
-                createdAt: new Date().toISOString(),
-            });
-        } catch (e) { /* best-effort logging only */ }
+        await db.collection('enterprise_setup_requests').doc(email).set({
+            ownerEmail: email, companyId: companyId || email, status: 'pending',
+            whopCheckoutConfigId: data.id || null, createdAt: new Date().toISOString(),
+        });
 
-        return res.json({ success: true, checkoutUrl, credits, agents, seats, price });
+        return res.json({ success: true, checkoutUrl });
     } catch (err) {
-        console.error('[Enterprise/CreateCheckout]', err.message);
+        console.error('[Enterprise/Start]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// Whop: setup_intent.succeeded → card is on file → activate Enterprise.
+async function handleEnterpriseSetupSucceeded(db, event, res) {
+    const data = event.data || {};
+    const metadata = data.metadata || {};
+
+    const eventId = event.id || data.id;
+    if (eventId) {
+        const dedupeRef = db.collection('whop_events').doc(String(eventId));
+        if ((await dedupeRef.get()).exists) return res.json({ success: true, duplicate: true });
+        await dedupeRef.set({ type: 'setup_intent.succeeded', receivedAt: new Date().toISOString() });
+    }
+
+    let email = metadata.owner_email || resolveWhopEmail(data, metadata) ||
+                data.member?.user?.email || data.member?.email || null;
+    let reqSnap = email ? await db.collection('enterprise_setup_requests').doc(email).get() : null;
+
+    if (!reqSnap || !reqSnap.exists) {
+        const cfgId = data.checkout_configuration_id || data.checkout_configuration?.id || null;
+        if (cfgId) {
+            const q = await db.collection('enterprise_setup_requests').where('whopCheckoutConfigId', '==', cfgId).limit(1).get();
+            if (!q.empty) { reqSnap = q.docs[0]; email = reqSnap.data().ownerEmail; }
+        }
+    }
+    if (!email || !reqSnap || !reqSnap.exists) {
+        console.warn('[Whop/Setup] No pending Enterprise sign-up matched this setup intent.');
+        await db.collection('whop_unresolved_events').add({ type: 'setup_intent.succeeded', setupIntentId: data.id || null, receivedAt: new Date().toISOString() }).catch(() => {});
+        return res.json({ success: true, unresolved: true });
+    }
+
+    const memberId = data.member?.id || data.member_id || null;
+    const paymentMethodId = data.payment_method_id || data.payment_method?.id || null;
+    const now = new Date().toISOString();
+
+    await writeEntitlement(db, email, 'enterprise', 'whop-payg', null, {
+        billingModel: 'payg',
+        billingStatus: 'ok',
+        allowOverage: false,
+        whopMemberId: memberId,
+        whopPaymentMethodId: paymentMethodId,
+        billingStartedAt: now,
+    });
+    await db.collection('users').doc(email).set({
+        planUnlockedByPromo: false,
+        enterprise: { status: 'active', billingModel: 'payg', activatedAt: now },
+    }, { merge: true });
+    await reqSnap.ref.set({ status: 'completed', completedAt: now }, { merge: true });
+
+    console.log(`[Whop/Setup] Enterprise (pay-as-you-go) activated for ${email}.`);
+    return res.json({ success: true });
+}
+
+// Charge one billing period to the card on file (month-end cron, or final settlement on downgrade).
+async function chargeEnterprisePeriod(db, email, userData, period, opts = {}) {
+    const invRef = db.collection('enterprise_invoices').doc(`${email}_${period}`);
+    const existing = await invRef.get();
+    if (existing.exists && ['paid', 'pending'].includes(existing.data().status)) return { skipped: true };
+
+    const ent = userData?.entitlement || {};
+    const eb = userData?.enterpriseBilling || {};
+    const closed = (eb.closed && eb.closed[period]) || {};
+    const live = eb.period === period ? eb : {};
+
+    let agents = Math.max(closed.agents || 0, live.peakAgents || 0);
+    let seats  = Math.max(closed.seats  || 0, live.peakSeats  || 0);
+    if (!agents) agents = await countActiveAgents(db, email);
+    if (!seats)  seats  = await countOccupiedSeats(db, userData?.companyUsername || null);
+    const credits = userData?.creditPeriod === period ? toPositiveInt(userData.creditsUsed, 0) : (closed.credits || 0);
+
+    const bill = calculateEnterpriseBill({ agents, seats, credits });
+    const record = { ownerEmail: email, period, total: bill.total, breakdown: bill, final: !!opts.final, createdAt: new Date().toISOString() };
+
+    const fail = async (reason) => {
+        await invRef.set({ ...record, status: 'failed', reason }, { merge: true });
+        await db.collection('users').doc(email).set({ entitlement: { billingStatus: 'past_due' } }, { merge: true });
+        console.error(`[Enterprise/Bill] ${email} ${period}: ${reason}`);
+        return { ok: false, reason };
+    };
+
+    const whopApiKey = process.env.WHOP_API_KEY, whopCompanyId = process.env.WHOP_COMPANY_ID, productId = process.env.WHOP_ENTERPRISE_PRODUCT_ID;
+    if (!whopApiKey || !whopCompanyId || !productId) return fail('whop_not_configured');
+    if (!ent.whopMemberId || !ent.whopPaymentMethodId) return fail('no_payment_method_on_file');
+
+    try {
+        const headers = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${whopApiKey}` };
+        // 1) one-off hidden plan carrying this month's exact amount
+        const planRes = await fetch('https://api.whop.com/api/v1/plans', {
+            method: 'POST', headers,
+            body: JSON.stringify({
+                company_id: whopCompanyId, product_id: productId, plan_type: 'one_time',
+                initial_price: bill.total, currency: 'usd', visibility: 'hidden',
+                title: `Enterprise usage ${period}`,
+            }),
+        });
+        if (!planRes.ok) return fail(`plan_create_${planRes.status}: ${(await planRes.text()).substring(0, 200)}`);
+        const plan = await planRes.json();
+
+        // 2) charge the saved card off-session
+        const payRes = await fetch('https://api.whop.com/api/v1/payments', {
+            method: 'POST', headers,
+            body: JSON.stringify({
+                company_id: whopCompanyId, plan_id: plan.id,
+                member_id: ent.whopMemberId, payment_method_id: ent.whopPaymentMethodId,
+                metadata: { kind: 'enterprise_invoice', owner_email: email, period, invoice_id: `${email}_${period}` },
+            }),
+        });
+        if (!payRes.ok) return fail(`payment_create_${payRes.status}: ${(await payRes.text()).substring(0, 200)}`);
+        const pay = await payRes.json();
+
+        await invRef.set({ ...record, status: 'pending', whopPlanId: plan.id, whopPaymentId: pay.id || null }, { merge: true });
+        return { ok: true, total: bill.total };
+    } catch (err) {
+        return fail(err.message);
+    }
+}
+
+// Whop payment events for monthly Enterprise invoices.
+async function handleEnterpriseInvoiceEvent(db, type, data, metadata) {
+    const invId = metadata.invoice_id || `${metadata.owner_email}_${metadata.period}`;
+    const invRef = db.collection('enterprise_invoices').doc(invId);
+    if (type === 'payment.succeeded') {
+        await invRef.set({ status: 'paid', paidAt: new Date().toISOString() }, { merge: true });
+        await db.collection('users').doc(metadata.owner_email).set({ entitlement: { billingStatus: 'ok' } }, { merge: true });
+    } else if (type === 'payment.failed') {
+        await invRef.set({ status: 'failed', reason: 'card_declined', failedAt: new Date().toISOString() }, { merge: true });
+        await db.collection('users').doc(metadata.owner_email).set({ entitlement: { billingStatus: 'past_due' } }, { merge: true });
+    }
+}
+
+// GET|POST /api/cron/enterprise-billing   (Authorization: Bearer CRON_SECRET)
+// Schedule on the 1st of every month; it bills the month that just ended.
+async function handleEnterpriseBillingCron(req, res) {
+    const secret = process.env.CRON_SECRET;
+    if (!secret || req.headers.authorization !== `Bearer ${secret}`) {
+        return res.status(401).json({ success: false, message: 'Unauthorized.' });
+    }
+    try {
+        const db = getDb();
+        const now = new Date();
+        const prev = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
+        const period = currentBillingPeriod(prev);
+        const currentStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).getTime();
+
+        const snap = await db.collection('users').where('entitlement.tier', '==', 'enterprise').get();
+        const results = { period, charged: 0, skipped: 0, failed: 0 };
+        for (const doc of snap.docs) {
+            const data = doc.data();
+            const ent = data.entitlement || {};
+            if (ent.billingModel !== 'payg' || ent.status === 'revoked' || ent.status === 'cancelled') continue;
+            if (ent.billingStartedAt && new Date(ent.billingStartedAt).getTime() >= currentStart) { results.skipped++; continue; }
+            const r = await chargeEnterprisePeriod(db, doc.id, data, period);
+            if (r.skipped) results.skipped++; else if (r.ok) results.charged++; else results.failed++;
+        }
+        return res.json({ success: true, ...results });
+    } catch (err) {
+        console.error('[Enterprise/Cron]', err.message);
         return res.status(500).json({ success: false, message: err.message });
     }
 }
@@ -5569,6 +5743,7 @@ async function handleWhopWebhook(req, res) {
 
     try {
         const db = getDb();
+        if (type === 'setup_intent.succeeded') return await handleEnterpriseSetupSucceeded(db, event, res);
         const ownerEmail = resolveWhopEmail(data, metadata);
 
         if (!ownerEmail) {
@@ -5587,6 +5762,11 @@ async function handleWhopWebhook(req, res) {
             await dedupeRef.set({ type, ownerEmail, receivedAt: new Date().toISOString() });
         } catch (e) { console.warn('[Whop/Webhook/Dedupe]', e.message); }
 
+        if (metadata?.kind === 'enterprise_invoice') {
+            await handleEnterpriseInvoiceEvent(db, type, data, metadata);
+            return res.json({ success: true });
+        }
+
         // P0-5: if we cannot resolve a tier with certainty, ignore + alert.
         const tier = resolveWhopTier(data, metadata);
         if (!tier) {
@@ -5599,9 +5779,9 @@ async function handleWhopWebhook(req, res) {
 
         if (type === 'membership.went_valid' || type === 'membership.activated' || type === 'payment.succeeded') {
             if (tier === 'enterprise') {
-                const creditPool = parseInt(metadata.credit_pool, 10) || ENTERPRISE_PRICING.baseCredits;
-                const agentCount = parseInt(metadata.agent_count, 10) || ENTERPRISE_PRICING.baseAgents;
-                const seatCount  = parseInt(metadata.seat_count, 10)  || ENTERPRISE_PRICING.baseSeats;
+                const creditPool = parseInt(metadata.credit_pool, 10) || ENTERPRISE_PRICING.included.credits;
+                const agentCount = parseInt(metadata.agent_count, 10) || ENTERPRISE_PRICING.included.agents;
+                const seatCount  = parseInt(metadata.seat_count, 10)  || ENTERPRISE_PRICING.included.seats;
 
                 await db.collection('users').doc(ownerEmail).set({
                     planUnlockedByPromo: false,
