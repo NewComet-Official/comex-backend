@@ -13,6 +13,7 @@
       "source": "/api/(.*)",
       "dest": "/api/index.js"
     },
+    { "handle": "filesystem" },
     {
       "source": "/dashboard/testing/(.*)",
       "dest": "/index.html"
