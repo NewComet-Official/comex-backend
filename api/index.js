@@ -693,9 +693,9 @@ async function buildUsageSnapshot(db, requesterEmail) {
 
     let billing = null;
     const isPayg = limits.tier === 'enterprise' && ctx.ownerProfile?.entitlement?.billingModel === 'payg';
-    if (isPayg) {
-        await trackEnterprisePeaks(db, ctx.ownerEmail, ctx.ownerProfile, agentsUsed, seatsUsed);
-        const eb = ctx.ownerProfile?.enterpriseBilling || {};
+    if (limits.tier === 'enterprise') {
+        if (isPayg) await trackEnterprisePeaks(db, ctx.ownerEmail, ctx.ownerProfile, agentsUsed, seatsUsed);
+        const eb = isPayg ? (ctx.ownerProfile?.enterpriseBilling || {}) : {};
         const sameMonth = eb.period === credits.period;
         billing = {
             model: 'pay-as-you-go',
@@ -706,6 +706,7 @@ async function buildUsageSnapshot(db, requesterEmail) {
                 credits: credits.used,
             }),
             billingStatus: ctx.ownerProfile?.entitlement?.billingStatus || 'ok',
+            billed: isPayg,   // false = promo / non-card account: shown as an estimate, never charged
         };
     }
 
