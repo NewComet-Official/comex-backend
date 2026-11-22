@@ -146,6 +146,10 @@
     const botMsgCfg  = config.messageConfig.bot;
     const humanHandoffEnabled = config.behaviorConfig.allowHumanHandoff !== false;
     savePastChatsEnabled = !!config.behaviorConfig.allowSavePastChats;
+    // Save Chats is off: make sure no chats saved earlier (while it was on) linger in this browser.
+    if (!savePastChatsEnabled) { try { localStorage.removeItem(CHATS_KEY); } catch (e) {} }
+    const LOADING_ANIM = ['dots', 'pulse', 'spinner'].includes(loadingAnim) ? loadingAnim : 'dots';
+    const ANIM_DEFAULT_CAPTION = { dots: '', pulse: 'Thinking deeply…', spinner: 'Analyzing…' }[LOADING_ANIM];
 
     // ── Position Computations ────────────────────────────────────────────────
     const positions = {
@@ -409,7 +413,169 @@
         .cc-rstar.active { color: #f59e0b; } .cc-rstar:hover { transform: scale(1.2); }
         .cc-rerror { color: #ef4444; font-size: 12px; font-weight: 700; margin-bottom: 12px; display: none; }
 
+
+        /* ── Response animations (Style Studio: Typing Dots / Soft Pulse / Classic Spinner) ── */
+        .cc-typing-dots { align-items: center; gap: 9px; max-width: calc(100% - 44px); }
+        .cc-dots { display: inline-flex; align-items: center; gap: 5px; }
+        .cc-spinner {
+            width: 16px; height: 16px; border-radius: 50%; flex-shrink: 0;
+            border: 3px solid #e2e8f0; border-top-color: ${themeColor};
+            animation: ccSpin 1s linear infinite;
+        }
+        @keyframes ccSpin { to { transform: rotate(360deg); } }
+        .cc-pulse-orb { position: relative; width: 14px; height: 14px; flex-shrink: 0; border-radius: 50%; background: ${themeColor}; animation: ccSoftPulse 1.6s ease-in-out infinite; }
+        .cc-pulse-orb::after { content: ''; position: absolute; inset: -5px; border-radius: 50%; background: ${themeColor}; opacity: .25; animation: ccSoftRing 1.6s ease-in-out infinite; }
+        @keyframes ccSoftPulse { 0%,100% { transform: scale(.8); opacity: .6; } 50% { transform: scale(1.1); opacity: 1; } }
+        @keyframes ccSoftRing { 0%,100% { transform: scale(.8); opacity: .05; } 50% { transform: scale(1.35); opacity: .28; } }
+        .cc-typing-caption { font-size: 12.5px; font-weight: 600; color: #475569; line-height: 1.35; animation: ccCaptionIn .25s ease; }
+        .cc-typing-caption:empty { display: none; }
+        .cc-anim-pulse .cc-typing-caption { font-style: italic; animation: ccCaptionIn .25s ease, ccPulseText 1.2s ease-in-out .25s infinite alternate; }
+        @keyframes ccPulseText { from { opacity: .55; } to { opacity: 1; } }
+        @keyframes ccCaptionIn { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: translateY(0); } }
+        @media (prefers-reduced-motion: reduce) {
+            .cc-dot, .cc-pulse-orb, .cc-pulse-orb::after, .cc-anim-pulse .cc-typing-caption { animation: none; }
+            .cc-spinner { animation-duration: 2.4s; }
+        }
+
+        /* ── Refresh (clear chat) button — shown only when Save Chats is off ── */
+        .cc-refresh-btn {
+            width: 34px; height: 34px; border-radius: 50%; cursor: pointer; color: #fff;
+            background: rgba(255,255,255,.14); border: 1px solid rgba(255,255,255,.22);
+            display: none; align-items: center; justify-content: center; transition: background .2s;
+        }
+        .cc-refresh-btn:hover { background: rgba(255,255,255,.28); }
+        .cc-refresh-btn svg { width: 16px; height: 16px; stroke: currentColor; fill: none; transition: transform .45s cubic-bezier(0.16,1,0.3,1); }
+        .cc-refresh-btn.cc-spin svg { transform: rotate(360deg); }
+
+        /* ── Liquid Glass ──────────────────────────────────────────────────────
+           Refractive, light-catching surfaces: heavy blur + saturation, a bright
+           specular rim, inner glow, a highlight that follows the pointer, spring
+           motion, and (Chromium only) a gentle SVG refraction of the backdrop. */
+        #cc-widget-window {
+            --lg-x: 28%; --lg-y: 0%;
+            background:
+                radial-gradient(120% 72% at var(--lg-x) var(--lg-y), rgba(255,255,255,.5) 0%, rgba(255,255,255,0) 58%),
+                linear-gradient(160deg, rgba(255,255,255,.44) 0%, rgba(255,255,255,.2) 50%, ${themeColor}18 100%);
+            -webkit-backdrop-filter: blur(22px) saturate(190%) brightness(1.06);
+            backdrop-filter: blur(22px) saturate(190%) brightness(1.06);
+            border: 1px solid rgba(255,255,255,.5);
+            box-shadow:
+                0 34px 80px -18px rgba(15,23,42,.45),
+                0 8px 24px -8px rgba(15,23,42,.2),
+                inset 0 1.5px 1px rgba(255,255,255,.95),
+                inset 0 -1.5px 1px rgba(255,255,255,.35),
+                inset 1.5px 0 1px rgba(255,255,255,.55),
+                inset -1.5px 0 1px rgba(255,255,255,.25),
+                inset 0 0 42px rgba(255,255,255,.22);
+            transition: opacity .3s cubic-bezier(0.16,1,0.3,1), transform .6s cubic-bezier(0.34,1.56,0.64,1);
+        }
+        #cc-widget-window.cc-closed { transition: opacity .25s ease, transform .3s cubic-bezier(0.16,1,0.3,1); }
+        #cc-widget-window.cc-lg-refract {
+            -webkit-backdrop-filter: blur(14px) url(#cc-liquid-refract) saturate(190%) brightness(1.06);
+            backdrop-filter: blur(14px) url(#cc-liquid-refract) saturate(190%) brightness(1.06);
+        }
+        /* static sheen + one-shot light sweep every time the window opens */
+        #cc-widget-window::before {
+            content: ''; position: absolute; inset: 0; z-index: 2; pointer-events: none; border-radius: inherit;
+            background: linear-gradient(115deg, rgba(255,255,255,.26) 0%, rgba(255,255,255,0) 30%, rgba(255,255,255,0) 70%, rgba(255,255,255,.14) 100%);
+        }
+        #cc-widget-window::after {
+            content: ''; position: absolute; inset: 0; z-index: 2; pointer-events: none; border-radius: inherit; opacity: 0;
+            background: linear-gradient(105deg, transparent 38%, rgba(255,255,255,.5) 50%, transparent 62%);
+            background-size: 260% 100%; background-position: 130% 0;
+        }
+        #cc-widget-window.cc-open::after { animation: ccLiquidSweep 1.2s cubic-bezier(0.22,1,0.36,1) .12s 1 both; }
+        @keyframes ccLiquidSweep { 0% { opacity: 0; background-position: 130% 0; } 15% { opacity: 1; } 100% { opacity: 0; background-position: -30% 0; } }
+
+        .cc-header {
+            background: linear-gradient(135deg, ${themeColor}d9 0%, ${themeColor}96 100%);
+            border-bottom: 1px solid rgba(255,255,255,.38);
+            box-shadow: inset 0 1.5px 1px rgba(255,255,255,.5), inset 0 -1px 1px rgba(255,255,255,.18);
+        }
+        .cc-header::after {
+            content: ''; position: absolute; left: 0; right: 0; top: 0; height: 52%; pointer-events: none;
+            background: linear-gradient(180deg, rgba(255,255,255,.3), rgba(255,255,255,0));
+        }
+        .cc-close-btn, .cc-endchat-btn, .cc-menu-btn, .cc-refresh-btn {
+            background: linear-gradient(160deg, rgba(255,255,255,.34), rgba(255,255,255,.1));
+            border: 1px solid rgba(255,255,255,.5);
+            box-shadow: 0 4px 10px rgba(15,23,42,.14), inset 0 1.5px 1px rgba(255,255,255,.65), inset 0 -1px 2px rgba(255,255,255,.18);
+            transition: transform .35s cubic-bezier(0.34,1.56,0.64,1), background .2s;
+        }
+        .cc-menu-btn:hover, .cc-refresh-btn:hover { background: linear-gradient(160deg, rgba(255,255,255,.5), rgba(255,255,255,.2)); transform: scale(1.08); }
+        .cc-menu-btn:active, .cc-refresh-btn:active { transform: scale(.92); }
+
+        .cc-chatbox { background: transparent; }
+        .cc-chatbox::-webkit-scrollbar-thumb { background: rgba(100,116,139,.35); }
+
+        .cc-welcome-card, .cc-suggested-chip, .cc-typing-dots, .cc-ai .cc-bubble {
+            background: linear-gradient(145deg, rgba(255,255,255,.8) 0%, rgba(255,255,255,.5) 100%);
+            border: 1px solid rgba(255,255,255,.9);
+            box-shadow: 0 10px 26px -14px rgba(15,23,42,.32), inset 0 1.5px 1px rgba(255,255,255,1), inset 0 -1px 1px rgba(255,255,255,.4), inset 0 0 14px rgba(255,255,255,.35);
+        }
+        .cc-suggested-chip { background: linear-gradient(145deg, rgba(255,255,255,.62), rgba(255,255,255,.34)); transition: all .35s cubic-bezier(0.34,1.56,0.64,1); }
+        .cc-suggested-chip:hover { background: linear-gradient(145deg, rgba(255,255,255,.92), rgba(255,255,255,.66)); transform: translateY(-2px) scale(1.01); }
+        .cc-agent .cc-bubble {
+            background: linear-gradient(145deg, rgba(236,253,245,.82), rgba(209,250,229,.5));
+            border: 1px solid rgba(167,243,208,.9);
+            box-shadow: 0 10px 26px -14px rgba(6,95,70,.3), inset 0 1.5px 1px rgba(255,255,255,.9), inset 0 0 14px rgba(255,255,255,.3);
+        }
+        .cc-user .cc-bubble {
+            background: linear-gradient(180deg, rgba(255,255,255,.24), rgba(255,255,255,0) 55%), linear-gradient(145deg, ${themeColor}f2 0%, ${themeColor}c0 100%);
+            border: 1px solid rgba(255,255,255,.38);
+            box-shadow: 0 14px 28px -12px ${themeColor}aa, inset 0 1.5px 1px rgba(255,255,255,.55), inset 0 -2px 5px rgba(0,0,0,.12);
+        }
+        .cc-system-note { background: linear-gradient(145deg, rgba(255,255,255,.55), rgba(226,232,240,.5)); border: 1px solid rgba(255,255,255,.8); box-shadow: inset 0 1px 1px rgba(255,255,255,.9); }
+
+        .cc-footer { background: linear-gradient(180deg, rgba(255,255,255,.32), rgba(255,255,255,.58)); border-top: 1px solid rgba(255,255,255,.8); box-shadow: inset 0 1.5px 1px rgba(255,255,255,.7); }
+        .cc-input {
+            background: linear-gradient(180deg, rgba(255,255,255,.52), rgba(255,255,255,.3));
+            border: 1.5px solid rgba(255,255,255,.8);
+            box-shadow: inset 0 2px 5px rgba(15,23,42,.09), inset 0 -1px 1px rgba(255,255,255,.85), 0 4px 14px -8px rgba(15,23,42,.25);
+        }
+        .cc-input:focus { background: linear-gradient(180deg, rgba(255,255,255,.9), rgba(255,255,255,.7)); border-color: ${themeColor}; box-shadow: inset 0 2px 5px rgba(15,23,42,.06), 0 0 0 3px ${themeColor}22; }
+        .cc-send-btn {
+            background: linear-gradient(180deg, rgba(255,255,255,.28), rgba(255,255,255,0) 55%), linear-gradient(160deg, ${themeColor}f2, ${themeColor}b8);
+            border: 1px solid rgba(255,255,255,.35);
+            box-shadow: 0 12px 22px -8px ${themeColor}aa, inset 0 1.5px 1px rgba(255,255,255,.6), inset 0 -2px 4px rgba(0,0,0,.14);
+            transition: transform .35s cubic-bezier(0.34,1.56,0.64,1), box-shadow .2s;
+        }
+        .cc-brand-footer { background: rgba(255,255,255,.55); }
+
+        .cc-menu-panel {
+            background: linear-gradient(145deg, rgba(255,255,255,.9), rgba(255,255,255,.7));
+            border: 1px solid rgba(255,255,255,.9);
+            box-shadow: 0 22px 44px -12px rgba(15,23,42,.35), inset 0 1.5px 1px rgba(255,255,255,1);
+            -webkit-backdrop-filter: blur(18px) saturate(170%); backdrop-filter: blur(18px) saturate(170%);
+        }
+        .cc-menu-chat:hover, .cc-menu-chat.active { background: rgba(241,245,249,.85); }
+        .cc-confirm-card, .cc-report-card {
+            background: linear-gradient(145deg, rgba(255,255,255,.86), rgba(255,255,255,.62));
+            border: 1px solid rgba(255,255,255,.9);
+            box-shadow: 0 28px 60px rgba(15,23,42,.32), inset 0 1.5px 1px rgba(255,255,255,1), inset 0 0 22px rgba(255,255,255,.35);
+            -webkit-backdrop-filter: blur(24px) saturate(170%); backdrop-filter: blur(24px) saturate(170%);
+        }
+
+        /* launcher: glossy liquid orb */
+        #cc-widget-bubble {
+            border: 1.5px solid rgba(255,255,255,.55);
+            box-shadow: 0 14px 32px -8px ${themeColor}99, 0 4px 12px rgba(15,23,42,.18), inset 0 2px 2px rgba(255,255,255,.7), inset 0 -4px 8px rgba(0,0,0,.18), inset 0 0 16px rgba(255,255,255,.22);
+            -webkit-backdrop-filter: blur(10px) saturate(180%); backdrop-filter: blur(10px) saturate(180%);
+            transition: transform .45s cubic-bezier(0.34,1.56,0.64,1), box-shadow .25s ease;
+        }
+        #cc-widget-bubble::after {
+            content: ''; position: absolute; top: 3px; left: 11%; width: 78%; height: 46%; pointer-events: none;
+            border-radius: 50% 50% 60% 60% / 80% 80% 40% 40%;
+            background: linear-gradient(180deg, rgba(255,255,255,.6), rgba(255,255,255,0));
+        }
+
+        @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+            #cc-widget-window { background: rgba(255,255,255,.97); }
+            .cc-menu-panel, .cc-confirm-card, .cc-report-card { background: #fff; }
+        }
+
         @media (max-width: 480px) {
+            #cc-widget-window.cc-lg-refract { -webkit-backdrop-filter: blur(22px) saturate(190%) brightness(1.06); backdrop-filter: blur(22px) saturate(190%) brightness(1.06); }
             #cc-widget-window { width: 100% !important; height: 100% !important; max-height: 100vh !important; inset: 0 !important; border-radius: 0 !important; transform: translateY(100%); }
             #cc-widget-window.cc-open { transform: translateY(0); }
             #cc-widget-window.cc-closed { transform: translateY(100%); opacity: 0; }
@@ -521,7 +687,18 @@
     const menuPanel = document.createElement('div');
     menuPanel.className = 'cc-menu-panel';
 
+    // Refresh: wipes this conversation. Only offered when Save Chats is off
+    // (when it is on, the past-chats menu already has "New chat").
+    const refreshBtn = document.createElement('button');
+    refreshBtn.className = 'cc-refresh-btn';
+    refreshBtn.id = 'ccRefreshBtn';
+    refreshBtn.setAttribute('aria-label', 'Refresh chat');
+    refreshBtn.title = 'Refresh chat (clears this conversation)';
+    refreshBtn.innerHTML = `<svg viewBox="0 0 24 24" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path></svg>`;
+    if (!savePastChatsEnabled) refreshBtn.style.display = 'flex';
+
     headerActions.appendChild(menuBtn);
+    headerActions.appendChild(refreshBtn);
     headerActions.appendChild(endChatBtn);
     headerActions.appendChild(closeBtn);
     header.appendChild(headerLeft);
@@ -565,11 +742,31 @@
     typingEl.className = 'cc-typing';
     typingEl.id = 'ccTyping';
     typingEl.appendChild(createAgentSenderHeader(false));
+    typingEl.setAttribute('role', 'status');
+    typingEl.setAttribute('aria-live', 'polite');
     const typingDots = document.createElement('div');
-    typingDots.className = 'cc-typing-dots';
-    typingDots.innerHTML = '<div class="cc-dot"></div><div class="cc-dot"></div><div class="cc-dot"></div>';
+    typingDots.className = `cc-typing-dots cc-anim-${LOADING_ANIM}`;
+    typingDots.innerHTML = (
+        LOADING_ANIM === 'spinner' ? '<span class="cc-spinner"></span>' :
+        LOADING_ANIM === 'pulse'   ? '<span class="cc-pulse-orb"></span>' :
+        '<span class="cc-dots"><div class="cc-dot"></div><div class="cc-dot"></div><div class="cc-dot"></div></span>'
+    ) + '<span class="cc-typing-caption"></span>';
     typingEl.appendChild(typingDots);
     chatBox.appendChild(typingEl);
+
+    // Caption under/next to the animation (e.g. "Searching the web…" while a tool runs)
+    const typingCaptionEl = typingDots.querySelector('.cc-typing-caption');
+    function setTypingCaption(text) {
+        const next = String(text || '').trim() || ANIM_DEFAULT_CAPTION;
+        if (typingCaptionEl.textContent !== next) typingCaptionEl.textContent = next;
+        chatBox.scrollTop = chatBox.scrollHeight;
+    }
+    function showTyping() {
+        setTypingCaption('');
+        typingEl.classList.add('visible');
+        chatBox.scrollTop = chatBox.scrollHeight;
+    }
+    function hideTyping() { typingEl.classList.remove('visible'); }
 
     // Interactive Widget Footer Element
     const footer = document.createElement('div');
@@ -615,6 +812,35 @@
     win.appendChild(brandFooter);
 
     document.body.appendChild(win);
+
+    // ── Liquid Glass: refraction filter (Chromium), pointer-following highlight ──
+    (function liquidGlass() {
+        const brands = (navigator.userAgentData && navigator.userAgentData.brands) || [];
+        if (brands.some(b => /Chromium/i.test(b.brand))) {
+            const svgNS = 'http://www.w3.org/2000/svg';
+            const svg = document.createElementNS(svgNS, 'svg');
+            svg.setAttribute('width', '0'); svg.setAttribute('height', '0');
+            svg.setAttribute('aria-hidden', 'true');
+            svg.style.cssText = 'position:absolute;width:0;height:0;pointer-events:none;';
+            svg.innerHTML = '<defs><filter id="cc-liquid-refract" x="0" y="0" width="100%" height="100%" color-interpolation-filters="sRGB">' +
+                '<feTurbulence type="fractalNoise" baseFrequency="0.006 0.009" numOctaves="2" seed="7" result="n"/>' +
+                '<feGaussianBlur in="n" stdDeviation="2" result="nb"/>' +
+                '<feDisplacementMap in="SourceGraphic" in2="nb" scale="26" xChannelSelector="R" yChannelSelector="G"/></filter></defs>';
+            document.body.appendChild(svg);
+            win.classList.add('cc-lg-refract');
+        }
+        let raf = 0;
+        win.addEventListener('pointermove', (e) => {
+            if (raf) return;
+            raf = requestAnimationFrame(() => {
+                raf = 0;
+                const r = win.getBoundingClientRect();
+                if (!r.width || !r.height) return;
+                win.style.setProperty('--lg-x', Math.max(0, Math.min(100, ((e.clientX - r.left) / r.width) * 100)).toFixed(1) + '%');
+                win.style.setProperty('--lg-y', Math.max(0, Math.min(100, ((e.clientY - r.top) / r.height) * 100)).toFixed(1) + '%');
+            });
+        }, { passive: true });
+    })();
 
     // ── Style Studio overrides (designConfig.studio) ─────────────────────────
     (function applyStudio() {
@@ -916,6 +1142,29 @@
     });
     win.addEventListener('click', closeMenu);
 
+    // Refresh: clear this conversation completely (Save Chats off). Nothing is kept.
+    function refreshChat() {
+        if (savePastChatsEnabled || isSending) return;
+        if (humanSessionActive) {
+            appendSystemNote('End the live conversation before refreshing the chat.');
+            return;
+        }
+        refreshBtn.classList.add('cc-spin');
+        setTimeout(() => refreshBtn.classList.remove('cc-spin'), 500);
+        conversationId = newConvId();
+        chatHistory = [];
+        savedMessages = [];
+        resetChatUI();
+        welcomeCard.style.display = '';
+        inputEl.value = '';
+        try { sessionStorage.removeItem(SESSION_KEY); } catch (e) {}
+        try { localStorage.removeItem(CHATS_KEY); } catch (e) {}
+        saveSession();
+        chatBox.scrollTop = 0;
+        inputEl.focus();
+    }
+    refreshBtn.addEventListener('click', (e) => { e.stopPropagation(); refreshChat(); });
+
     // ── Widget Studio cards (designed in the dashboard) ──────────────────────
     const escW = v => String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     const colW = (c, d) => /^#[0-9a-f]{3,8}$/i.test(c || '') ? c : d;
@@ -1205,6 +1454,45 @@
         }
     }
 
+    // ── Chat transport: streams tool captions, falls back to plain JSON ──────
+    // The backend answers with newline-delimited JSON when asked for stream:true:
+    //   {"type":"status","caption":"Searching the web…"} … {"type":"final", …reply payload…}
+    // Errors / rate limits (plain JSON) and older backends are handled transparently.
+    async function requestChat(payload, onStatus) {
+        const r = await fetch('https://comex-backend.vercel.app/api/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ...payload, stream: true })
+        });
+        const ct = r.headers.get('content-type') || '';
+        if (!ct.includes('ndjson') || !r.body || !r.body.getReader) {
+            let data = null;
+            try { data = await r.json(); } catch (e) {}
+            return { ok: r.ok && !!data, data };
+        }
+        const reader = r.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '', final = null;
+        const handle = (line) => {
+            line = line.trim();
+            if (!line) return;
+            let msg;
+            try { msg = JSON.parse(line); } catch (e) { return; }
+            if (msg.type === 'status') { if (onStatus) onStatus(msg.caption); }
+            else if (msg.type === 'final') { final = msg; }
+        };
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            let nl;
+            while ((nl = buf.indexOf('\n')) >= 0) { handle(buf.slice(0, nl)); buf = buf.slice(nl + 1); }
+        }
+        buf += decoder.decode();
+        handle(buf);
+        return { ok: !!final && final.success !== false, data: final };
+    }
+
     // ── Regenerate Answer ────────────────────────────────────────────────────
     async function regenerateAnswer(container, bubbleEl, metaRow) {
         let lastUserContent = null;
@@ -1217,15 +1505,14 @@
 
         try {
             const historyForCall = chatHistory.slice(0, -1);
-            const r = await fetch('https://comex-backend.vercel.app/api/chat', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    businessId, message: lastUserContent, conversationId,
-                    history: historyForCall.slice(-10)
-                })
+            const res = await requestChat({
+                businessId, message: lastUserContent, conversationId,
+                history: historyForCall.slice(-10)
+            }, (caption) => {
+                const p = bubbleEl.querySelector('p');
+                if (p && caption) p.textContent = caption;
             });
-            const data = await r.json();
+            const data = res.data || {};
             const reply = data.answer || data.reply || "Sorry, I couldn't process that.";
             bubbleEl.innerHTML = parseMarkdown(reply);
             if (chatHistory.length && chatHistory[chatHistory.length - 1].role === 'assistant') {
@@ -1428,29 +1715,24 @@
             return;
         }
 
-        typingEl.classList.add('visible');
-        chatBox.scrollTop = chatBox.scrollHeight;
+        showTyping();
 
         try {
-            const r = await fetch('https://comex-backend.vercel.app/api/chat', {
-                method:  'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    businessId,
-                    message: text,
-                    conversationId,
-                    history: chatHistory.slice(-10)
-                })
-            });
+            const res = await requestChat({
+                businessId,
+                message: text,
+                conversationId,
+                history: chatHistory.slice(-10)
+            }, setTypingCaption);
 
-            typingEl.classList.remove('visible');
+            hideTyping();
 
-            if (!r.ok) {
+            if (!res.ok || !res.data) {
                 appendMsg('Sorry, something went wrong. Please try again.', false, { noRegenerate: true, noReport: true, noSave: true });
                 return;
             }
 
-            const data = await r.json();
+            const data = res.data;
 
             if (humanHandoffEnabled && data._humanRequested) {
                 const reply = data.answer || data.reply || "I've flagged this for our team — someone will join shortly.";
@@ -1477,7 +1759,7 @@
             saveSession();
 
         } catch (err) {
-            typingEl.classList.remove('visible');
+            hideTyping();
             appendMsg('Connection interrupted. Please try again.', false, { noRegenerate: true, noReport: true, noSave: true });
         } finally {
             isSending = false;
