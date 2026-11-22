@@ -2943,6 +2943,28 @@ async function toolSendEmail(ctx, { to, subject, body }) {
     } catch (e) { return { success: false, error: `Email failed: ${e.message}` }; }
 }
 
+// Short, visitor-facing captions shown in the chat widget while a tool runs.
+const TOOL_CAPTIONS = {
+    web_search:   'Searching the web…',
+    read_page:    'Reading the page…',
+    calculate:    'Calculating…',
+    capture_lead: 'Saving your details…',
+    send_email:   'Sending an email…',
+};
+
+function toolCaption(name, args, ctx) {
+    try {
+        if (name === 'web_search' && args && typeof args.query === 'string' && args.query.trim()) {
+            const q = args.query.trim().replace(/\s+/g, ' ');
+            return `Searching the web for "${q.length > 40 ? q.slice(0, 40) + '…' : q}"…`;
+        }
+        if (TOOL_CAPTIONS[name]) return TOOL_CAPTIONS[name];
+        const actionDef = (ctx?.agentActionsList || []).find(a => actionFunctionName(a) === name);
+        if (actionDef?.name) return `Using ${String(actionDef.name).replace(/[_-]+/g, ' ').trim().slice(0, 40)}…`;
+    } catch { /* fall through */ }
+    return 'Working on it…';
+}
+
 async function executeAnyTool(name, args, ctx) {
     switch (name) {
         case 'web_search':   return toolWebSearch(args);
@@ -2956,7 +2978,7 @@ async function executeAnyTool(name, args, ctx) {
     return { success: false, error: `Unknown tool "${name}".` };
 }
 
-async function runAgentLoop({ modelKey, sysPrompt, history, userMsg, tools, ctx }) {
+async function runAgentLoop({ modelKey, sysPrompt, history, userMsg, tools, ctx, onStatus }) {
     const messages = [
         { role: 'system', content: sysPrompt + AGENT_LOOP_SUFFIX },
         ...history,
@@ -2983,6 +3005,9 @@ async function runAgentLoop({ modelKey, sysPrompt, history, userMsg, tools, ctx 
             const name = tc.function?.name;
             let args = {};
             try { args = JSON.parse(tc.function?.arguments || '{}'); } catch { args = {}; }
+            if (typeof onStatus === 'function') {
+                try { onStatus({ tool: name, caption: toolCaption(name, args, ctx) }); } catch { /* never break the loop */ }
+            }
             const result = await executeAnyTool(name, args, ctx);
             used.push(name);
             if (Array.isArray(result?._sources)) sources.push(...result._sources);
@@ -2993,6 +3018,9 @@ async function runAgentLoop({ modelKey, sysPrompt, history, userMsg, tools, ctx 
             });
         }
         await addCreditUsage(ctx.db, ctx.ownerEmail, CREDIT_COSTS.toolFollowUp);
+        if (typeof onStatus === 'function') {
+            try { onStatus({ tool: null, caption: 'Putting your answer together…' }); } catch { /* ignore */ }
+        }
     }
     return { answer: '', used, sources, steps: AGENT_MAX_STEPS };
 }
@@ -8619,7 +8647,7 @@ async function handleConfig(req, res) {
 
 const MAX_MESSAGE_CHARS = 4000; // P0-3
 
-async function generateBotReply({ db, businessId, userMsg, history = [], conversationId, source = 'web' }) {
+async function generateBotReply({ db, businessId, userMsg, history = [], conversationId, source = 'web', onStatus }) {
     const convId = conversationId || `conv-${Date.now()}`;
     const meta = {};
 
@@ -9025,6 +9053,7 @@ async function generateBotReply({ db, businessId, userMsg, history = [], convers
                 modelKey, sysPrompt, history: safeHistory, userMsg,
                 tools: [..._builtinDefs, ...agentActionToolDefs],
                 ctx: { db, businessId, botName, ownerEmail, convId, source, agentActionsList },
+                onStatus,
             });
             let finalAnswer = await recoverWeakReply({
                 answer: loop.answer,
@@ -9321,6 +9350,32 @@ async function handleChat(req, res) {
             console.error('[Chat/MetaTask]', err.message);
             return res.status(500).json({ success: false, message: err.message, answer: err.message });
         }
+    }
+
+    // Streaming mode (used by the website widget): newline-delimited JSON. Zero or more
+    // {"type":"status","caption":…} lines while tools run, then one {"type":"final",…} line
+    // carrying the same payload the plain JSON response would. Clients that don't send
+    // stream:true get the original single JSON response.
+    if (req.body?.stream === true) {
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache, no-transform');
+        res.setHeader('X-Accel-Buffering', 'no');
+        if (typeof res.flushHeaders === 'function') res.flushHeaders();
+        const send = obj => { try { res.write(JSON.stringify(obj) + '\n'); } catch { /* client went away */ } };
+        try {
+            const result = await generateBotReply({
+                db, businessId, userMsg, history,
+                conversationId: convId, source,
+                onStatus: s => send({ type: 'status', tool: s?.tool || null, caption: String(s?.caption || '').slice(0, 120) }),
+            });
+            const answer = result.answer || emptyReplyFallback(userMsg);
+            send({ type: 'final', success: true, answer, reply: answer, ...result.meta });
+        } catch (err) {
+            console.error('[Chat/Stream]', err.message);
+            send({ type: 'final', success: false, answer: 'Something went wrong. Please try again.', reply: 'Something went wrong.' });
+        }
+        return res.end();
     }
 
     try {
