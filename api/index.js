@@ -59,6 +59,7 @@ const PUBLIC_ROUTE_PREFIXES = [
     '/api/google-chat/webhook',
     '/api/slack/events',
     '/api/zendesk/webhook',
+    '/api/meta/webhook',
     '/api/webhooks/whop',
     '/api/email/poll-worker',
     '/api/knowledge/ingest-worker',
@@ -316,7 +317,7 @@ const DB_SERVICE_FEATURE = { firebase: 'firebaseDatabase', supabase: 'supabaseDa
 const MAX_FILE_CONTEXT_CHARS = 25000;
 const DESIGN_SERVICE_FEATURE = { canva: 'canvaDesign', figma: 'figmaDesign' };
 
-const ALL_CHANNELS = ['widget', 'email', 'telegram', 'slack', 'zendesk', 'helppage'];
+const ALL_CHANNELS = ['widget', 'email', 'telegram', 'whatsapp', 'instagram', 'messenger', 'slack', 'zendesk', 'helppage'];
 
 function normalizeChannels(botData) {
     let channels = Array.isArray(botData?.channels)
@@ -328,6 +329,7 @@ function normalizeChannels(botData) {
         const map = {
             widget: ['widget'], email: ['email'], telegram: ['telegram'],
             slack: ['slack'], zendesk: ['zendesk'], helppage: ['helppage'],
+            whatsapp: ['whatsapp'], instagram: ['instagram'], messenger: ['messenger'],
             both: ['widget', 'email'],
             'widget+telegram': ['widget', 'telegram'],
             'widget+helppage': ['widget', 'helppage'],
@@ -357,6 +359,9 @@ function deriveBuildMode(channels) {
     if (e)           return 'email';
     if (t)           return 'telegram';
     if (sl)          return 'slack';
+    if (!w && c.includes('whatsapp'))  return 'whatsapp';
+    if (!w && c.includes('instagram')) return 'instagram';
+    if (!w && c.includes('messenger')) return 'messenger';
     if (zd)          return 'zendesk';
     return 'widget';
 }
@@ -3048,6 +3053,7 @@ export default async function handler(req, res) {
     if (path === '/api/knowledge/ingest-worker')  return handleKnowledgeIngestWorker(req, res);
     if (path === '/api/slack/events')             return handleSlackWebhook(req, res);
     if (path === '/api/zendesk/webhook')          return handleZendeskWebhook(req, res);
+    if (path === '/api/meta/webhook')             return handleMetaWebhook(req, res);
     if (path === '/api/password-reset/request')   return handlePasswordResetRequest(req, res);
     if (path === '/api/password-reset/verify')    return handlePasswordResetVerify(req, res);
     if (path === '/api/password-reset/confirm')   return handlePasswordResetConfirm(req, res);
@@ -3142,7 +3148,582 @@ export default async function handler(req, res) {
     if (path === '/api/oauth/zendesk')         return handleZendeskOAuth(req, res);
     if (path === '/api/oauth/zendesk/callback') return handleZendeskOAuthCallback(req, res);
 
+    // ── Meta (WhatsApp / Instagram / Messenger) routes ──
+    if (path === '/api/meta/status')           return handleMetaStatus(req, res);
+    if (path === '/api/meta/disconnect')       return handleMetaDisconnect(req, res);
+    if (path === '/api/oauth/meta')            return handleMetaOAuth(req, res);
+    if (path === '/api/oauth/meta/callback')   return handleMetaOAuthCallback(req, res);
+
     return res.status(404).json({ success: false, message: `Unknown route: ${path}` });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// META CHANNELS — WhatsApp · Instagram DMs · Facebook Messenger
+// One OAuth login + one webhook (/api/meta/webhook).
+//   user_secrets/{owner}.integrations.meta  → public-ish summary (no tokens)
+//   meta_assets/{assetId}                   → one doc per number / IG account / Page, with an
+//                                             encrypted token. assetId = WhatsApp phone_number_id,
+//                                             Instagram account id, or Facebook Page id, so the
+//                                             webhook can route in a single document read.
+//   user_bots/{id}.metaConfig               → { whatsapp|instagram|messenger: { enabled, accountId } }
+// Env: META_APP_ID, META_APP_SECRET, META_WEBHOOK_VERIFY_TOKEN
+//      (optional) META_REDIRECT_URI, META_GRAPH_VERSION
+// ════════════════════════════════════════════════════════════════════════════
+
+const META_CHANNELS = ['whatsapp', 'instagram', 'messenger'];
+const META_CHANNEL_LABELS = { whatsapp: 'WhatsApp number', instagram: 'Instagram account', messenger: 'Facebook Page' };
+const META_GRAPH_VERSION = process.env.META_GRAPH_VERSION || 'v23.0';
+const META_GRAPH = `https://graph.facebook.com/${META_GRAPH_VERSION}`;
+const META_SCOPES = [
+    'whatsapp_business_management', 'whatsapp_business_messaging',
+    'instagram_basic', 'instagram_manage_messages',
+    'pages_show_list', 'pages_manage_metadata', 'pages_messaging',
+    'business_management', 'public_profile',
+];
+// Conservative per-message limits (WhatsApp 4096, Messenger 2000, Instagram 1000 chars).
+const META_TEXT_LIMITS = { whatsapp: 4000, instagram: 950, messenger: 1900 };
+const META_MEDIA_REPLY = "I can only read text messages right now. Could you type your question?";
+
+function metaRedirectUri(req) {
+    return process.env.META_REDIRECT_URI || `https://${req.headers.host}/api/oauth/meta/callback`;
+}
+
+function metaSafeEqual(a, b) {
+    const x = Buffer.from(String(a)), y = Buffer.from(String(b));
+    return x.length === y.length && crypto.timingSafeEqual(x, y);
+}
+
+async function metaGraph(path, { method = 'GET', token, params = {}, body } = {}) {
+    const url = new URL(/^https?:\/\//i.test(path) ? path : `${META_GRAPH}/${String(path).replace(/^\//, '')}`);
+    for (const [k, v] of Object.entries(params)) {
+        if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
+    }
+    const headers = { Accept: 'application/json' };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const init = { method, headers, signal: AbortSignal.timeout(12000) };
+    if (body !== undefined) { headers['Content-Type'] = 'application/json'; init.body = JSON.stringify(body); }
+    const r = await fetch(url, init);
+    const text = await r.text();
+    let data = {};
+    try { data = JSON.parse(text); } catch { /* non-JSON */ }
+    if (!r.ok || data?.error) {
+        const e = new Error(data?.error?.message || `Meta API error (${r.status})`);
+        e.code = data?.error?.code || r.status;
+        e.subcode = data?.error?.error_subcode || null;
+        throw e;
+    }
+    return data;
+}
+
+async function metaGraphAll(path, opts = {}, maxPages = 5) {
+    const out = [];
+    let data = await metaGraph(path, opts);
+    for (let i = 0; i < maxPages; i++) {
+        out.push(...(data.data || []));
+        if (!data.paging?.next) break;
+        data = await metaGraph(data.paging.next, { token: opts.token });
+    }
+    return out;
+}
+
+// Everything the logged-in Meta user can reach: Pages, their linked Instagram professional
+// accounts, and WhatsApp Business phone numbers.
+async function discoverMetaAssets(userToken) {
+    const warnings = [];
+    const assets = [];
+    const me = await metaGraph('me', { token: userToken, params: { fields: 'id,name' } });
+
+    try {
+        const pages = await metaGraphAll('me/accounts', {
+            token: userToken,
+            params: { fields: 'id,name,access_token,instagram_business_account{id,username,name}', limit: 100 },
+        });
+        for (const p of pages) {
+            if (!p.id || !p.access_token) continue;
+            assets.push({ id: String(p.id), channel: 'messenger', label: p.name || String(p.id), pageId: String(p.id), wabaId: null, accessToken: p.access_token });
+            const ig = p.instagram_business_account;
+            if (ig?.id) {
+                assets.push({
+                    id: String(ig.id), channel: 'instagram',
+                    label: ig.username ? `@${ig.username}` : (ig.name || String(ig.id)),
+                    pageId: String(p.id), wabaId: null, accessToken: p.access_token,
+                });
+            }
+        }
+    } catch (e) { warnings.push('pages'); console.warn('[Meta/Discover/Pages]', e.message); }
+
+    try {
+        const wabaIds = new Set();
+        const appId = process.env.META_APP_ID, appSecret = process.env.META_APP_SECRET;
+        try {
+            const dbg = await metaGraph('debug_token', { params: { input_token: userToken, access_token: `${appId}|${appSecret}` } });
+            for (const gs of dbg?.data?.granular_scopes || []) {
+                if (/^whatsapp_business_(management|messaging)$/.test(gs.scope)) (gs.target_ids || []).forEach(id => wabaIds.add(String(id)));
+            }
+        } catch (e) { console.warn('[Meta/Discover/debug_token]', e.message); }
+
+        if (!wabaIds.size) {
+            // Fallback: walk the user's Business Manager portfolios.
+            const businesses = await metaGraphAll('me/businesses', { token: userToken, params: { fields: 'id,name', limit: 50 } });
+            for (const b of businesses.slice(0, 10)) {
+                for (const edge of ['owned_whatsapp_business_accounts', 'client_whatsapp_business_accounts']) {
+                    try {
+                        const list = await metaGraphAll(`${b.id}/${edge}`, { token: userToken, params: { fields: 'id,name', limit: 50 } });
+                        list.forEach(w => wabaIds.add(String(w.id)));
+                    } catch { /* edge not available for this business */ }
+                }
+            }
+        }
+
+        for (const wabaId of [...wabaIds].slice(0, 20)) {
+            try {
+                const nums = await metaGraphAll(`${wabaId}/phone_numbers`, { token: userToken, params: { fields: 'id,display_phone_number,verified_name', limit: 50 } });
+                for (const n of nums) {
+                    if (!n.id) continue;
+                    assets.push({
+                        id: String(n.id), channel: 'whatsapp',
+                        label: [n.display_phone_number, n.verified_name].filter(Boolean).join(' · ') || String(n.id),
+                        pageId: null, wabaId, accessToken: userToken,
+                    });
+                }
+            } catch (e) { warnings.push('whatsapp'); console.warn('[Meta/Discover/Numbers]', wabaId, e.message); }
+        }
+    } catch (e) { warnings.push('whatsapp'); console.warn('[Meta/Discover/WhatsApp]', e.message); }
+
+    return { me, assets, warnings: [...new Set(warnings)] };
+}
+
+// Best-effort: make Meta deliver `messages` for these Pages / WABAs to the app webhook.
+async function subscribeMetaAssets(assets, userToken) {
+    const failed = [];
+    const seen = new Set();
+    for (const a of assets) {
+        try {
+            if (a.channel === 'whatsapp' && a.wabaId && !seen.has(`w:${a.wabaId}`)) {
+                seen.add(`w:${a.wabaId}`);
+                await metaGraph(`${a.wabaId}/subscribed_apps`, { method: 'POST', token: userToken });
+            } else if ((a.channel === 'messenger' || a.channel === 'instagram') && a.pageId && !seen.has(`p:${a.pageId}`)) {
+                seen.add(`p:${a.pageId}`);
+                await metaGraph(`${a.pageId}/subscribed_apps`, { method: 'POST', token: a.accessToken, params: { subscribed_fields: 'messages' } });
+            }
+        } catch (e) { failed.push(a.id); console.warn('[Meta/Subscribe]', a.id, e.message); }
+    }
+    return failed;
+}
+
+// Unsubscribes and deletes every stored asset for an owner. Returns how many were removed.
+async function teardownMetaAssets(db, ownerEmail) {
+    const snap = await db.collection('meta_assets').where('ownerEmail', '==', ownerEmail).get();
+    const seen = new Set();
+    for (const d of snap.docs) {
+        const a = d.data();
+        try {
+            const token = decryptCredential(a.tokenEnc);
+            if (a.channel === 'whatsapp' && a.wabaId && !seen.has(`w:${a.wabaId}`)) {
+                seen.add(`w:${a.wabaId}`);
+                await metaGraph(`${a.wabaId}/subscribed_apps`, { method: 'DELETE', token });
+            } else if (a.pageId && a.channel !== 'whatsapp' && !seen.has(`p:${a.pageId}`)) {
+                seen.add(`p:${a.pageId}`);
+                await metaGraph(`${a.pageId}/subscribed_apps`, { method: 'DELETE', token });
+            }
+        } catch (e) { console.warn('[Meta/Teardown/unsubscribe]', d.id, e.message); }
+    }
+    for (let i = 0; i < snap.docs.length; i += 400) {
+        const batch = db.batch();
+        snap.docs.slice(i, i + 400).forEach(d => batch.delete(d.ref));
+        await batch.commit();
+    }
+    return snap.size;
+}
+
+// GET /api/oauth/meta?email=…&origin=…&ticket=…
+async function handleMetaOAuth(req, res) {
+    const { email, origin } = req.query;
+    if (!email) return res.status(400).send('Missing email.');
+    if (!(await requireOAuthStarter(req, res, email))) return;
+
+    const appId = process.env.META_APP_ID;
+    if (!appId) return res.status(500).send('Missing META_APP_ID env var.');
+
+    const state = signOAuthState({ email, origin: origin || null, kind: 'oauth_callback' });
+    const url = new URL(`https://www.facebook.com/${META_GRAPH_VERSION}/dialog/oauth`);
+    url.searchParams.set('client_id', appId);
+    url.searchParams.set('redirect_uri', metaRedirectUri(req));
+    url.searchParams.set('state', state);
+    url.searchParams.set('response_type', 'code');
+    url.searchParams.set('scope', META_SCOPES.join(','));
+    url.searchParams.set('auth_type', 'rerequest'); // re-ask for anything declined last time
+    return res.redirect(302, url.toString());
+}
+
+// GET /api/oauth/meta/callback
+async function handleMetaOAuthCallback(req, res) {
+    const { code, state, error } = req.query;
+
+    const parsed = verifyOAuthState(state);
+    if (!parsed || parsed.kind !== 'oauth_callback') return res.status(400).send('Invalid state parameter.');
+    const { email, origin } = parsed;
+
+    const appUrl = buildAppUrl(req, origin);
+    const finish = (params) => {
+        try {
+            const url = new URL(appUrl);
+            Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
+            return res.redirect(302, url.toString());
+        } catch {
+            return res.status(params.meta_error ? 400 : 200).send(params.meta_error ? `Meta connection failed: ${params.meta_error}` : 'Meta connected. You can close this tab.');
+        }
+    };
+    const fail = (msg) => finish({ meta_error: String(msg).substring(0, 200) });
+
+    if (error) return fail(req.query.error_description || req.query.error_reason || error);
+    if (!code) return fail('missing_code');
+
+    const clientId = process.env.META_APP_ID, clientSecret = process.env.META_APP_SECRET;
+    if (!clientId || !clientSecret) {
+        console.error('[Meta/OAuth/Callback] Missing META_APP_ID or META_APP_SECRET.');
+        return fail('oauth_not_configured');
+    }
+
+    try {
+        // code → short-lived → long-lived user token
+        const short = await metaGraph('oauth/access_token', {
+            params: { client_id: clientId, client_secret: clientSecret, redirect_uri: metaRedirectUri(req), code: String(code) },
+        });
+        let userToken = short.access_token, expiresIn = short.expires_in;
+        try {
+            const long = await metaGraph('oauth/access_token', {
+                params: { grant_type: 'fb_exchange_token', client_id: clientId, client_secret: clientSecret, fb_exchange_token: short.access_token },
+            });
+            userToken = long.access_token; expiresIn = long.expires_in || expiresIn;
+        } catch (e) { console.warn('[Meta/OAuth/long-lived]', e.message); }
+        const tokenExpiresAt = expiresIn ? new Date(Date.now() + Number(expiresIn) * 1000).toISOString() : null;
+
+        const { me, assets, warnings } = await discoverMetaAssets(userToken);
+
+        const db = getDb();
+        const col = db.collection('meta_assets');
+
+        // One Meta asset can only be linked to one Mebor account.
+        const existing = assets.length ? await db.getAll(...assets.map(a => col.doc(a.id))) : [];
+        const keep = [];
+        let conflicts = 0;
+        assets.forEach((a, i) => {
+            const prev = existing[i];
+            if (prev.exists && prev.data().ownerEmail !== email) conflicts++;
+            else keep.push(a);
+        });
+        if (!keep.length && conflicts) return fail('account_already_connected');
+
+        const subscribeFailed = await subscribeMetaAssets(keep, userToken);
+
+        const nowISO = new Date().toISOString();
+        const prior = await col.where('ownerEmail', '==', email).get();
+        const keepIds = new Set(keep.map(a => a.id));
+        const batch = db.batch();
+        prior.docs.forEach(d => { if (!keepIds.has(d.id)) batch.delete(d.ref); });
+        keep.forEach(a => {
+            batch.set(col.doc(a.id), {
+                ownerEmail: email,
+                channel: a.channel,
+                label: a.label,
+                pageId: a.pageId || null,
+                wabaId: a.wabaId || null,
+                tokenEnc: encryptCredential(a.accessToken),
+                tokenExpiresAt: a.channel === 'whatsapp' ? tokenExpiresAt : null, // Page tokens don't expire
+                tokenInvalid: false,
+                connectedAt: nowISO,
+            });
+        });
+        await batch.commit();
+
+        await setUserSecrets(db, email, {
+            integrations: {
+                meta: {
+                    connected: true,
+                    accountLabel: me?.name ? `${me.name} (Meta)` : 'Meta account',
+                    userId: me?.id || null,
+                    assetCount: keep.length,
+                    skippedAssets: conflicts,
+                    tokenExpiresAt,
+                    connectedAt: nowISO,
+                },
+            },
+        });
+        await db.collection('users').doc(email).set({ integrations: { meta: publicIntegrationFlag(true) } }, { merge: true });
+
+        const out = { meta_connected: '1' };
+        if (warnings.length || subscribeFailed.length) out.meta_warning = 'partial_setup';
+        return finish(out);
+    } catch (err) {
+        console.error('[Meta/OAuth/Callback]', err.message);
+        return fail(err.code ? `meta_${err.code}` : 'server_error');
+    }
+}
+
+// GET /api/meta/status?ownerEmail=…
+async function handleMetaStatus(req, res) {
+    if (req.method !== 'GET') return res.status(405).json({ success: false });
+    const ownerEmail = String(req.query?.ownerEmail || '').trim();
+    if (!ownerEmail) return res.status(400).json({ success: false, connected: false, message: 'ownerEmail is required.' });
+
+    const auth = await requireAuth(req, res, { matches: [ownerEmail] });
+    if (!auth) return;
+
+    try {
+        const db = getDb();
+        const meta = (await getUserSecrets(db, ownerEmail))?.integrations?.meta || null;
+        const connected = !!meta?.connected;
+        const accounts = [];
+        if (connected) {
+            const snap = await db.collection('meta_assets').where('ownerEmail', '==', ownerEmail).get();
+            snap.forEach(d => {
+                const a = d.data();
+                const expired = a.tokenExpiresAt ? Date.parse(a.tokenExpiresAt) < Date.now() : false;
+                accounts.push({ id: d.id, channel: a.channel, label: a.label || d.id, needsReconnect: !!a.tokenInvalid || expired });
+            });
+            const order = META_CHANNELS;
+            accounts.sort((x, y) => order.indexOf(x.channel) - order.indexOf(y.channel) || String(x.label).localeCompare(String(y.label)));
+        }
+        return res.json({
+            success: true, connected,
+            accountLabel: meta?.accountLabel || null,
+            tokenExpiresAt: meta?.tokenExpiresAt || null,
+            accounts,
+        });
+    } catch (err) {
+        console.error('[Meta/Status]', err.message);
+        return res.status(500).json({ success: false, connected: false, message: err.message });
+    }
+}
+
+// POST /api/meta/disconnect  { ownerEmail }
+async function handleMetaDisconnect(req, res) {
+    if (req.method !== 'POST') return res.status(405).json({ success: false });
+    const { ownerEmail } = req.body || {};
+    if (!ownerEmail) return res.status(400).json({ success: false, message: 'Missing ownerEmail.' });
+
+    const auth = await requireAuth(req, res, { matches: [ownerEmail] });
+    if (!auth) return;
+
+    try {
+        const db = getDb();
+        await teardownMetaAssets(db, ownerEmail);
+        await setUserSecrets(db, ownerEmail, { integrations: { meta: null } });
+        await db.collection('users').doc(ownerEmail).set({ integrations: { meta: publicIntegrationFlag(false) } }, { merge: true });
+        return res.json({ success: true, message: 'Meta disconnected.' });
+    } catch (err) {
+        console.error('[Meta/Disconnect]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+}
+
+// ── Webhook ──────────────────────────────────────────────────────────────────
+
+function verifyMetaSignature(req, rawBody) {
+    const secret = process.env.META_APP_SECRET;
+    if (!secret) return { ok: false, status: 500, message: 'META_APP_SECRET is not set.' };
+    const sig = String(req.headers['x-hub-signature-256'] || '');
+    if (!sig.startsWith('sha256=')) return { ok: false, status: 401, message: 'Missing Meta signature.' };
+    const expected = 'sha256=' + crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
+    if (!metaSafeEqual(sig, expected)) return { ok: false, status: 401, message: 'Invalid Meta signature.' };
+    return { ok: true };
+}
+
+// Flattens the three payload shapes into [{ channel, assetId, senderId, messageId, kind, text }].
+// kind: 'text' | 'media' (we can't read it) | 'other' (reactions, statuses… ignored).
+function extractMetaJobs(body) {
+    const jobs = [];
+    if (!body || !Array.isArray(body.entry)) return jobs;
+
+    if (body.object === 'whatsapp_business_account') {
+        for (const entry of body.entry) {
+            for (const ch of entry.changes || []) {
+                if (ch.field !== 'messages') continue;
+                const v = ch.value || {};
+                const assetId = String(v.metadata?.phone_number_id || '');
+                const names = {};
+                (v.contacts || []).forEach(c => { if (c.wa_id) names[c.wa_id] = c.profile?.name || null; });
+                for (const m of v.messages || []) {
+                    if (!m.from || !m.id) continue;
+                    let text = '', kind = 'other';
+                    if (m.type === 'text') { text = String(m.text?.body || ''); kind = 'text'; }
+                    else if (m.type === 'button') { text = String(m.button?.text || ''); kind = 'text'; }
+                    else if (m.type === 'interactive') {
+                        text = String(m.interactive?.button_reply?.title || m.interactive?.list_reply?.title || '');
+                        kind = text ? 'text' : 'other';
+                    } else if (['image', 'audio', 'video', 'document', 'sticker', 'voice'].includes(m.type)) kind = 'media';
+                    jobs.push({ channel: 'whatsapp', assetId, senderId: String(m.from), senderName: names[m.from] || null, messageId: String(m.id), kind, text });
+                }
+            }
+        }
+        return jobs;
+    }
+
+    if (body.object === 'page' || body.object === 'instagram') {
+        const channel = body.object === 'page' ? 'messenger' : 'instagram';
+        for (const entry of body.entry) {
+            for (const ev of entry.messaging || []) {
+                const msg = ev.message;
+                if (!msg || msg.is_echo || !ev.sender?.id) continue;
+                if (String(ev.sender.id) === String(entry.id)) continue; // our own account
+                const att = msg.attachments?.[0]?.type;
+                const kind = msg.text ? 'text' : (['image', 'audio', 'video', 'file'].includes(att) ? 'media' : 'other');
+                jobs.push({
+                    channel, assetId: String(entry.id), senderId: String(ev.sender.id), senderName: null,
+                    messageId: String(msg.mid || `${ev.sender.id}_${ev.timestamp}`), kind, text: String(msg.text || ''),
+                });
+            }
+        }
+    }
+    return jobs;
+}
+
+function toMetaText(channel, text) {
+    let t = String(text || '');
+    t = t.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '$1 ($2)');
+    t = t.replace(/^#{1,6}\s+(.*)$/gm, channel === 'whatsapp' ? '*$1*' : '$1');
+    t = channel === 'whatsapp'
+        ? t.replace(/\*\*(.+?)\*\*/g, '*$1*')
+        : t.replace(/\*\*(.+?)\*\*/g, '$1').replace(/__(.+?)__/g, '$1');
+    return t.trim() || '(empty reply)';
+}
+
+function splitMetaText(text, limit) {
+    const out = [];
+    let rest = String(text);
+    while (rest.length > limit) {
+        let cut = rest.lastIndexOf('\n\n', limit);
+        if (cut < limit * 0.4) cut = rest.lastIndexOf('\n', limit);
+        if (cut < limit * 0.4) cut = rest.lastIndexOf(' ', limit);
+        if (cut < limit * 0.4) cut = limit;
+        out.push(rest.slice(0, cut).trim());
+        rest = rest.slice(cut).trim();
+    }
+    if (rest) out.push(rest);
+    return out;
+}
+
+async function sendMetaText(assetId, asset, recipientId, text) {
+    const token = decryptCredential(asset.tokenEnc);
+    const chunks = splitMetaText(toMetaText(asset.channel, text), META_TEXT_LIMITS[asset.channel]).slice(0, 3);
+    for (const chunk of chunks) {
+        if (asset.channel === 'whatsapp') {
+            await metaGraph(`${assetId}/messages`, {
+                method: 'POST', token,
+                body: { messaging_product: 'whatsapp', recipient_type: 'individual', to: recipientId, type: 'text', text: { preview_url: false, body: chunk } },
+            });
+        } else {
+            // Messenger and Instagram (Facebook Login) both send through the linked Page.
+            await metaGraph(`${asset.pageId}/messages`, {
+                method: 'POST', token,
+                body: { recipient: { id: recipientId }, messaging_type: 'RESPONSE', message: { text: chunk } },
+            });
+        }
+    }
+}
+
+async function processMetaJob(job) {
+    if (!job.assetId || job.kind === 'other') return;
+    if (job.kind === 'text' && !job.text.trim()) return;
+
+    const db = getDb();
+    const assetRef = db.collection('meta_assets').doc(job.assetId);
+    const assetSnap = await assetRef.get();
+    if (!assetSnap.exists) { console.warn('[Meta/Webhook] Unknown asset', job.channel, job.assetId); return; }
+    const asset = assetSnap.data();
+    if (asset.channel !== job.channel) return;
+
+    // Meta retries deliveries: handle each message once.
+    const evId = crypto.createHash('sha1').update(`${job.channel}:${job.messageId}`).digest('hex');
+    try {
+        await db.collection('meta_events').doc(evId).create({ ownerEmail: asset.ownerEmail, channel: job.channel, receivedAt: new Date().toISOString() });
+    } catch { return; }
+
+    if (await isRateLimitedDistributed(db, `meta:${job.assetId}:${job.senderId}`, 20, 60 * 1000)) {
+        console.warn('[Meta/Webhook] Rate limited', job.channel, job.senderId);
+        return;
+    }
+
+    try {
+        if (job.kind === 'media') {
+            await sendMetaText(job.assetId, asset, job.senderId, META_MEDIA_REPLY);
+            return;
+        }
+
+        let agent = null;
+        const botsSnap = await db.collection('user_bots').where('owner', '==', asset.ownerEmail).get();
+        botsSnap.forEach(d => {
+            const b = d.data();
+            if (agent || b.deletedAt) return;
+            const mc = b.metaConfig?.[job.channel];
+            if (mc?.enabled && String(mc.accountId) === job.assetId && normalizeChannels(b).includes(job.channel)) agent = { id: d.id, data: b };
+        });
+        if (!agent) { console.warn('[Meta/Webhook] No agent on', job.channel, job.assetId); return; }
+
+        const sessionRef = db.collection('meta_sessions').doc(`${agent.id}__${job.channel}__${job.senderId}`);
+        const sessionSnap = await sessionRef.get();
+        const session = sessionSnap.exists ? sessionSnap.data() : {};
+        const history = Array.isArray(session.history) ? session.history.slice(-12) : [];
+
+        const result = await generateBotReply({
+            db, businessId: agent.id, userMsg: job.text.trim(), history,
+            conversationId: `${job.channel}-${agent.id}-${job.senderId}`, source: job.channel,
+        });
+        const replyText = result?.answer || "Sorry, I couldn't respond just now.";
+
+        await sessionRef.set({
+            businessId: agent.id, ownerEmail: asset.ownerEmail, channel: job.channel, assetId: job.assetId,
+            senderId: job.senderId, senderName: job.senderName || session.senderName || null,
+            history: [...history, { role: 'user', content: job.text.trim() }, { role: 'assistant', content: replyText }].slice(-24),
+            updatedAt: new Date().toISOString(),
+        }, { merge: true });
+
+        await sendMetaText(job.assetId, asset, job.senderId, replyText);
+    } catch (e) {
+        console.error('[Meta/Webhook/process]', job.channel, e.message);
+        // OAuth error 190 = token expired/revoked → surface "reconnect" in the dashboard.
+        if (e.code === 190) await assetRef.set({ tokenInvalid: true }, { merge: true }).catch(() => {});
+    }
+}
+
+// GET  /api/meta/webhook  → Meta's verification handshake
+// POST /api/meta/webhook  → inbound messages (signed with META_APP_SECRET)
+async function handleMetaWebhook(req, res) {
+    if (req.method === 'GET') {
+        const expected = process.env.META_WEBHOOK_VERIFY_TOKEN;
+        if (!expected) return res.status(500).send('META_WEBHOOK_VERIFY_TOKEN is not set.');
+        const mode = req.query['hub.mode'], token = req.query['hub.verify_token'], challenge = req.query['hub.challenge'];
+        if (mode === 'subscribe' && typeof token === 'string' && metaSafeEqual(token, expected)) {
+            return res.status(200).setHeader('Content-Type', 'text/plain').send(String(challenge ?? ''));
+        }
+        return res.status(403).send('Forbidden');
+    }
+    if (req.method !== 'POST') return res.status(405).json({ ok: false });
+
+    // Raw body first (before anything touches req.body) so the signature can be verified.
+    const rawBody = await readSlackRawBody(req);
+    const check = verifyMetaSignature(req, rawBody);
+    if (!check.ok) {
+        console.warn('[Meta/Webhook]', check.message);
+        return res.status(check.status).json({ ok: false, message: check.message });
+    }
+
+    let body;
+    try { body = JSON.parse(rawBody.toString('utf8')); }
+    catch { body = (req.body && typeof req.body === 'object') ? req.body : {}; }
+
+    try {
+        const jobs = extractMetaJobs(body).slice(0, 10);
+        for (const job of jobs) {
+            try { await processMetaJob(job); }
+            catch (e) { console.error('[Meta/Webhook/job]', e.message); }
+        }
+    } catch (err) {
+        console.error('[Meta/Webhook]', err.message);
+    }
+    // Always 200 so Meta does not keep retrying.
+    return res.status(200).json({ ok: true });
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -6406,6 +6987,9 @@ async function handleAccountDeleteCascade(req, res) {
         await deleteQueryBatch(db, db.collection('zendesk_drafts').where('ownerEmail', '==', email));
         await deleteQueryBatch(db, db.collection('zendesk_tickets').where('ownerEmail', '==', email));
         await deleteQueryBatch(db, db.collection('zendesk_events').where('ownerEmail', '==', email));
+        await teardownMetaAssets(db, email).catch(() => {});
+        await deleteQueryBatch(db, db.collection('meta_sessions').where('ownerEmail', '==', email));
+        await deleteQueryBatch(db, db.collection('meta_events').where('ownerEmail', '==', email));
         await db.collection('user_secrets').doc(email).delete().catch(() => {});
         await db.collection('users').doc(email).delete().catch(() => {});
 
@@ -8308,6 +8892,46 @@ async function handleDeploy(req, res) {
             if (!botData.zendeskConfig.escalationTags.length) botData.zendeskConfig.escalationTags = ['mebor_escalated'];
         }
 
+        {
+            // Meta channels: the client only sends account IDs. Verify each one belongs to this owner,
+            // has the right channel type, and isn't already driving another agent.
+            const rawMeta = (botData.metaConfig && typeof botData.metaConfig === 'object') ? botData.metaConfig : {};
+            const wantsMeta = META_CHANNELS.some(c => incomingChannels.includes(c));
+            const ownedAssets = new Map();
+            const otherBots = [];
+            if (wantsMeta) {
+                const aSnap = await db.collection('meta_assets').where('ownerEmail', '==', ctx.ownerEmail).get();
+                aSnap.forEach(d => ownedAssets.set(d.id, d.data()));
+                const bSnap = await db.collection('user_bots').where('owner', '==', ctx.ownerEmail).get();
+                bSnap.forEach(d => {
+                    const b = d.data();
+                    if (d.id === botData.id || b.deletedAt) return;
+                    otherBots.push({ name: b.name, mc: b.metaConfig || {}, channels: normalizeChannels(b) });
+                });
+            }
+            const cleanMeta = {};
+            for (const ch of META_CHANNELS) {
+                if (!incomingChannels.includes(ch)) { cleanMeta[ch] = { enabled: false, accountId: '' }; continue; }
+                const accountId = String(rawMeta[ch]?.accountId || '').trim();
+                const asset = ownedAssets.get(accountId);
+                if (!asset || asset.channel !== ch) {
+                    return res.status(400).json({
+                        success: false,
+                        message: `Pick a connected ${META_CHANNEL_LABELS[ch]} for the ${ch} channel. Connect Meta under Third-Party Integrations first.`,
+                    });
+                }
+                const clash = otherBots.find(b => b.channels.includes(ch) && b.mc?.[ch]?.enabled && String(b.mc[ch].accountId) === accountId);
+                if (clash) {
+                    return res.status(409).json({
+                        success: false,
+                        message: `That ${META_CHANNEL_LABELS[ch]} is already used by "${clash.name || 'another agent'}". Each account can answer for one agent.`,
+                    });
+                }
+                cleanMeta[ch] = { enabled: true, accountId, accountLabel: asset.label || null };
+            }
+            botData.metaConfig = cleanMeta;
+        }
+
         if (incomingChannels.includes('email')) {
             const ec = botData.emailConfig || {};
             botData.emailConfig = {
@@ -8798,6 +9422,12 @@ async function generateBotReply({ db, businessId, userMsg, history = [], convers
         sysPrompt += `\n\nTHIS IS A TELEGRAM CONVERSATION. Keep replies natural and concise. Avoid markdown that Telegram can't render — plain text with short paragraphs works best.`;
     } else if (source === 'slack') {
         sysPrompt += `\n\nTHIS IS A SLACK CONVERSATION. Keep replies conversational and concise. Slack uses its own mrkdwn: *single asterisks* for bold, and bullet lists with "-". Avoid headings, tables, and code fences.`;
+    } else if (source === 'whatsapp') {
+        sysPrompt += `\n\nTHIS IS A WHATSAPP CONVERSATION. Keep replies short, warm and conversational. WhatsApp uses *single asterisks* for bold and "-" for bullet lists. Avoid headings, tables, code fences and Markdown links (write the URL in plain text).`;
+    } else if (source === 'instagram') {
+        sysPrompt += `\n\nTHIS IS AN INSTAGRAM DIRECT MESSAGE CONVERSATION. Keep replies very short (a few sentences), friendly and conversational. Use plain text only: no Markdown, no headings, no tables, no code fences. Write URLs in plain text.`;
+    } else if (source === 'messenger') {
+        sysPrompt += `\n\nTHIS IS A FACEBOOK MESSENGER CONVERSATION. Keep replies short, friendly and conversational. Use plain text only: no Markdown, no headings, no tables, no code fences. Write URLs in plain text.`;
     } else if (source === 'zendesk') {
         sysPrompt += `\n\nTHIS IS A REPLY TO A ZENDESK SUPPORT TICKET. Write a clear, polite, professional reply to the customer as a support agent would. Use plain text only: no Markdown, no headings, no tables, no code fences. Keep paragraphs short, start with a brief greeting and end with a brief sign-off. Do NOT mention chat, widgets, or "typing". If you cannot answer from the provided knowledge, say honestly that a member of the team will follow up instead of guessing.`;
     }
