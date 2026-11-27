@@ -299,7 +299,7 @@ const PLAN_ORDER = ['free', 'team', 'teamplus', 'enterprise'];
 
 const FEATURE_CATALOG = {
     appointmentBooking: { label: 'Appointment Booking',                     plans: ['team', 'teamplus', 'enterprise'] },
-    googleCalendar:     { label: 'Google Calendar Auto-Booking',            plans: ['team', 'teamplus', 'enterprise'] },
+    googleCalendar:     { label: 'Calendly Auto-Booking',                  plans: ['team', 'teamplus', 'enterprise'] },
     pushNotifications:  { label: 'Desktop Push Notifications',              plans: ['team', 'teamplus', 'enterprise'] },
     emailAgent:         { label: 'Email Agent (IMAP/SMTP Inbox)',           plans: ['team', 'teamplus', 'enterprise'] },
     telegramAgent:      { label: 'Telegram Channel',                        plans: ['teamplus', 'enterprise'] },
@@ -3073,11 +3073,10 @@ export default async function handler(req, res) {
     if (path === '/api/fcm-test-notification')    return handleFCMTestNotification(req, res);
     if (path === '/api/appointment/cancel')       return handleAppointmentCancel(req, res);
     if (path === '/api/appointment/edit')         return handleAppointmentEdit(req, res);
-    if (path === '/api/oauth/google')             return handleGoogleOAuth(req, res);
-    if (path === '/api/oauth/google/callback')    return handleGoogleCallback(req, res);
-    if (path === '/api/disconnect-calendar')      return handleDisconnectCalendar(req, res);
-    if (path === '/api/integrations/calendar-accounts') return handleCalendarAccounts(req, res);
-    if (path === '/api/integrations/toggle-calendar-account') return handleToggleCalendarAccount(req, res);
+    if (path === '/api/oauth/calendly')           return handleCalendlyOAuth(req, res);
+    if (path === '/api/oauth/calendly/callback')  return handleCalendlyCallback(req, res);
+    if (path === '/api/disconnect-calendly')      return handleDisconnectCalendly(req, res);
+    if (path === '/api/integrations/calendly-status') return handleCalendlyStatus(req, res);
     if (path === '/api/report/submit')            return handleReportSubmit(req, res);
     if (path === '/api/bot/delete-cascade')       return handleBotDeleteCascade(req, res);
     if (path === '/api/bot/restore')              return handleBotRestore(req, res);
@@ -3338,6 +3337,9 @@ async function teardownMetaAssets(db, ownerEmail) {
 
 // GET /api/oauth/meta?email=…&origin=…&ticket=…
 async function handleMetaOAuth(req, res) {
+    // Meta (WhatsApp / Instagram / Messenger) is currently in development. Set META_ENABLED=true to allow connecting.
+    if (process.env.META_ENABLED !== 'true')
+        return res.status(503).send('Meta (WhatsApp, Instagram & Messenger) is currently in development and is not available yet.');
     const { email, origin } = req.query;
     if (!email) return res.status(400).send('Missing email.');
     if (!(await requireOAuthStarter(req, res, email))) return;
@@ -5672,7 +5674,7 @@ async function handleWidgetSubmit(req, res) {
                 extraFields: fields,
                 status: 'confirmed',
                 createdAt: nowISO,
-                googleCalendarEvents: [],
+                calendlyEvents: [],
             };
 
             const apptDocRef = await db.collection('appointments').add(appt);
@@ -5683,15 +5685,13 @@ async function handleWidgetSubmit(req, res) {
                     const ownerSnap = await db.collection('users').doc(ownerEmail).get();
                     const planLimits = resolvePlanLimits(ownerSnap.exists ? ownerSnap.data() : {});
                     if (planLimits.features.googleCalendar) {
-                        const bookingAccounts = bookingEnabledAccounts(await getGoogleCalendarAccounts(db, ownerEmail));
-                        const createdEvents = [];
-                        for (const acct of bookingAccounts) {
+                        const calendlyAcct = await getCalendlyAccount(db, ownerEmail);
+                        if (calendlyAcct) {
                             try {
-                                const calResult = await addCalendarEvent(acct, appt, ownerEmail, db);
-                                if (calResult?.eventId) createdEvents.push({ accountEmail: acct.email, eventId: calResult.eventId });
+                                const calResult = await addCalendarEvent(calendlyAcct, appt, ownerEmail, db);
+                                if (calResult?.eventId) await apptDocRef.update({ calendlyEvents: [{ eventId: calResult.eventId, inviteeUri: calResult.inviteeUri || null }] });
                             } catch (e) { console.error('[WidgetSubmit/Calendar]', e.message); }
                         }
-                        if (createdEvents.length) await apptDocRef.update({ googleCalendarEvents: createdEvents });
                     }
                     await sendFCMToUser(ownerEmail, buildBookingNotification(appt)).catch(() => {});
                 } catch (e) { console.error('[WidgetSubmit/Notify]', e.message); }
@@ -6401,7 +6401,7 @@ async function handleWhopWebhook(req, res) {
                         maxSeats: seatCount,
                         integrations: {
                             firebase: true, supabase: true, canva: true, figma: true,
-                            google_calendar: true, push_alerts: true, email_agent: true, telegram_agent: true,
+                            calendly: true, push_alerts: true, email_agent: true, telegram_agent: true,
                         },
                         status: 'active',
                         whopMembershipId: data.id || null,
@@ -8619,12 +8619,20 @@ async function handleAppointmentEdit(req, res) {
             q.forEach(d => d.ref.update({ [field]: resolvedValue, updatedAt: new Date().toISOString() }));
         }
 
-        if ((field === 'appointmentDay' || field === 'appointmentTime') && (appt.googleCalendarEvents?.length || appt.googleCalendarEventId)) {
+        if ((field === 'appointmentDay' || field === 'appointmentTime') && appt.calendlyEvents?.length) {
             const notifyEmail = ownerEmail || appt.owner;
             if (notifyEmail) {
                 const updatedAppt = { ...appt, [field]: resolvedValue };
                 if (field === 'appointmentDay') updatedAppt.scheduledDate = resolveDay(resolvedValue);
-                await updateCalendarEventsForAppt(db, notifyEmail, updatedAppt);
+                // Calendly can't move a booking, so this books the new time and cancels the old one.
+                const newEvents = await updateCalendarEventsForAppt(db, notifyEmail, updatedAppt);
+                if (newEvents) {
+                    await apptRef.update({ calendlyEvents: newEvents });
+                    if (businessId) {
+                        const q2 = await db.collection('user_bots').doc(businessId).collection('appointments').where('conversationId', '==', appt.conversationId).get();
+                        q2.forEach(d => d.ref.update({ calendlyEvents: newEvents }));
+                    }
+                }
             }
         }
 
@@ -9772,11 +9780,11 @@ async function generateBotReply({ db, businessId, userMsg, history = [], convers
             };
         }
 
-        let bookingAccounts = [];
+        let calendlyAcct = null;
         if (ownerEmail && planLimits.features.googleCalendar) {
-            bookingAccounts = bookingEnabledAccounts(await getGoogleCalendarAccounts(db, ownerEmail));
-            if (bookingAccounts.length) {
-                const avail = await checkCalendarAvailability(bookingAccounts[0], dateISO, appointmentTime, ownerEmail, db);
+            calendlyAcct = await getCalendlyAccount(db, ownerEmail);
+            if (calendlyAcct) {
+                const avail = await checkCalendarAvailability(calendlyAcct, dateISO, appointmentTime, ownerEmail, db);
                 if (!avail.available) {
                     const alts    = avail.suggestedTimes || [];
                     const altText = alts.length > 0
@@ -9792,21 +9800,19 @@ async function generateBotReply({ db, businessId, userMsg, history = [], convers
             customerName: userName, contactInfo,
             appointmentDay, appointmentTime, scheduledDate: dateISO,
             status: 'confirmed', createdAt: new Date().toISOString(),
-            googleCalendarEvents: [],
+            calendlyEvents: [],
         };
 
         const apptDocRef = await db.collection('appointments').add(appt);
         await db.collection('user_bots').doc(businessId).collection('appointments').add({ ...appt, globalId: apptDocRef.id });
 
         if (ownerEmail) {
-            const createdEvents = [];
-            for (const acct of bookingAccounts) {
+            if (calendlyAcct) {
                 try {
-                    const calResult = await addCalendarEvent(acct, appt, ownerEmail, db);
-                    if (calResult?.eventId) createdEvents.push({ accountEmail: acct.email, eventId: calResult.eventId });
-                } catch (e) { console.error('[Chat/Calendar]', acct.email, e.message); }
+                    const calResult = await addCalendarEvent(calendlyAcct, appt, ownerEmail, db);
+                    if (calResult?.eventId) await apptDocRef.update({ calendlyEvents: [{ eventId: calResult.eventId, inviteeUri: calResult.inviteeUri || null }] });
+                } catch (e) { console.error('[Chat/Calendar]', e.message); }
             }
-            if (createdEvents.length) await apptDocRef.update({ googleCalendarEvents: createdEvents });
 
             try { await sendFCMToUser(ownerEmail, buildBookingNotification(appt)); }
             catch (e) { console.error('[FCM] Booking notify error:', e.message); }
@@ -10245,7 +10251,7 @@ async function handleReportSubmit(req, res) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// GOOGLE OAUTH (Calendar)
+// OAUTH START HELPERS + CALENDLY
 // ════════════════════════════════════════════════════════════════════════════
 
 // P1-21: OAuth start endpoints require an authenticated user whose email
@@ -10344,32 +10350,68 @@ async function handleOAuthTicket(req, res) {
     }
 }
 
-async function handleGoogleOAuth(req, res) {
+// ── Calendly ────────────────────────────────────────────────────────────────
+// Env: CALENDLY_CLIENT_ID, CALENDLY_CLIENT_SECRET
+//      (optional) CALENDLY_REDIRECT_URI, CALENDLY_SCOPES
+//   user_secrets/{owner}.integrations.calendly → { connected, access_token, refresh_token,
+//     expiry_date, userUri, organizationUri, email, name, timezone, schedulingUrl,
+//     eventTypeUri, eventTypeName, durationMinutes, connectedAt }
+// Booking uses the Scheduling API (POST /invitees), which requires a paid Calendly plan.
+const CALENDLY_API  = 'https://api.calendly.com';
+const CALENDLY_AUTH = 'https://auth.calendly.com';
+const CALENDLY_DEFAULT_SCOPES = 'users:read event_types:read scheduled_events:write';
+
+function calendlyRedirectUri(req) {
+    return process.env.CALENDLY_REDIRECT_URI || `https://${req.headers.host}/api/oauth/calendly/callback`;
+}
+
+function calendlyBasicAuth() {
+    const id = process.env.CALENDLY_CLIENT_ID || '';
+    const secret = process.env.CALENDLY_CLIENT_SECRET || '';
+    return 'Basic ' + Buffer.from(`${id}:${secret}`).toString('base64');
+}
+
+async function calendlyApi(accessToken, path, { method = 'GET', params, body } = {}) {
+    const url = new URL(/^https?:\/\//i.test(path) ? path : `${CALENDLY_API}${path}`);
+    for (const [k, v] of Object.entries(params || {})) if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
+    const r = await fetch(url, {
+        method,
+        headers: { Authorization: `Bearer ${accessToken}`, ...(body ? { 'Content-Type': 'application/json' } : {}) },
+        body: body ? JSON.stringify(body) : undefined,
+    });
+    let data = null;
+    try { data = await r.json(); } catch { /* empty body */ }
+    if (!r.ok) {
+        const e = new Error(data?.message || data?.title || `Calendly API error (${r.status})`);
+        e.status = r.status;
+        e.details = data;
+        throw e;
+    }
+    return data;
+}
+
+async function handleCalendlyOAuth(req, res) {
     const { email, origin } = req.query;
     if (!email) return res.status(400).send('Missing email.');
 
     if (!(await requireOAuthStarter(req, res, email))) return;
     if (await gateOAuthFeature(req, res, email, origin, 'googleCalendar')) return;
 
-    const clientId    = process.env.GOOGLE_CLIENT_ID;
-    const redirectUri = process.env.GOOGLE_REDIRECT_URI ||
-                        `https://${req.headers.host}/api/oauth/google/callback`;
-    if (!clientId) return res.status(500).send('Missing GOOGLE_CLIENT_ID env var.');
+    const clientId = process.env.CALENDLY_CLIENT_ID;
+    if (!clientId) return res.status(500).send('Missing CALENDLY_CLIENT_ID env var.');
 
     const state = signOAuthState({ email, origin: origin || null, kind: 'oauth_callback' });
-    const url   = new URL('https://accounts.google.com/o/oauth2/v2/auth');
+    const url   = new URL(`${CALENDLY_AUTH}/oauth/authorize`);
     url.searchParams.set('client_id',     clientId);
-    url.searchParams.set('redirect_uri',  redirectUri);
     url.searchParams.set('response_type', 'code');
-    url.searchParams.set('scope',         'openid email https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/calendar.events');
-    url.searchParams.set('access_type',   'offline');
-    url.searchParams.set('prompt',        'consent');
+    url.searchParams.set('redirect_uri',  calendlyRedirectUri(req));
+    url.searchParams.set('scope',         process.env.CALENDLY_SCOPES || CALENDLY_DEFAULT_SCOPES);
     url.searchParams.set('state',         state);
 
     return res.redirect(302, url.toString());
 }
 
-async function handleGoogleCallback(req, res) {
+async function handleCalendlyCallback(req, res) {
     const { code, state, error } = req.query;
     if (error) return res.status(400).send(`OAuth error: ${error}`);
     if (!code || !state) return res.status(400).send('Missing code or state.');
@@ -10380,96 +10422,98 @@ async function handleGoogleCallback(req, res) {
 
     if (await gateOAuthFeature(req, res, email, origin, 'googleCalendar')) return;
 
-    const clientId     = process.env.GOOGLE_CLIENT_ID;
-    const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-    const redirectUri  = process.env.GOOGLE_REDIRECT_URI ||
-                         `https://${req.headers.host}/api/oauth/google/callback`;
-    if (!clientId || !clientSecret) return res.status(500).send('Missing Google OAuth env vars.');
+    if (!process.env.CALENDLY_CLIENT_ID || !process.env.CALENDLY_CLIENT_SECRET)
+        return res.status(500).send('Missing Calendly OAuth env vars.');
+
+    const appUrl = buildAppUrl(req, origin);
+    const back = (key, value) => res.redirect(302, `${appUrl}?${key}=${encodeURIComponent(value)}`);
 
     try {
-        const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+        const tokenRes = await fetch(`${CALENDLY_AUTH}/oauth/token`, {
             method:  'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            headers: { Authorization: calendlyBasicAuth(), 'Content-Type': 'application/x-www-form-urlencoded' },
             body:    new URLSearchParams({
-                code, client_id: clientId, client_secret: clientSecret,
-                redirect_uri: redirectUri, grant_type: 'authorization_code',
+                grant_type: 'authorization_code', code, redirect_uri: calendlyRedirectUri(req),
             }),
         });
+        const tokens = await tokenRes.json().catch(() => ({}));
+        if (!tokenRes.ok || tokens.error || !tokens.access_token)
+            return res.status(400).send(`Token error: ${tokens.error_description || tokens.error || tokenRes.status}`);
 
-        const tokens = await tokenRes.json();
-        if (tokens.error) return res.status(400).send(`Token error: ${tokens.error_description || tokens.error}`);
+        const me = (await calendlyApi(tokens.access_token, '/users/me'))?.resource;
+        if (!me?.uri) return back('calendly_error', 'profile_unavailable');
 
-        let calendarLabel = email;
-        try {
-            const profileRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
-                headers: { Authorization: `Bearer ${tokens.access_token}` },
-            });
-            const profile = await profileRes.json();
-            calendarLabel = profile.email || email;
-        } catch { /* best-effort */ }
+        const types = await calendlyApi(tokens.access_token, '/event_types', {
+            params: { user: me.uri, active: 'true', count: 100 },
+        });
+        // Bookable by the API: active, one-on-one, standard (not one-off) event types.
+        const usable = (types?.collection || []).filter(t =>
+            t.active !== false && t.kind !== 'group' && t.type !== 'AdhocEventType' && !t.secret);
+        if (!usable.length) return back('calendly_error', 'no_active_event_type');
 
         const db       = getDb();
         const secrets  = await getUserSecrets(db, email);
-        const existing = secrets?.integrations?.google_calendar_accounts || [];
-
-        const newAccount = {
-            email:         calendarLabel,
-            connected:     true,
-            enabledForBooking: true,
-            access_token:  tokens.access_token,
-            refresh_token: tokens.refresh_token || null,
-            expiry_date:   tokens.expires_in
-                ? new Date(Date.now() + tokens.expires_in * 1000).toISOString()
-                : new Date(Date.now() + 3600 * 1000).toISOString(),
-            connectedAt: new Date().toISOString(),
-        };
-
-        const idx = existing.findIndex(a => a.email === calendarLabel);
-        if (idx >= 0) existing[idx] = { ...newAccount, enabledForBooking: existing[idx].enabledForBooking !== false }; else existing.push(newAccount);
+        const previous = secrets?.integrations?.calendly;
+        // Keep the owner's previous event type on reconnect if it still exists, otherwise pick the one closest to 30 min.
+        let chosen = usable.find(t => t.uri === previous?.eventTypeUri);
+        if (!chosen) chosen = [...usable].sort((a, b) => Math.abs((a.duration || 30) - 30) - Math.abs((b.duration || 30) - 30))[0];
 
         await setUserSecrets(db, email, {
             integrations: {
-                google_calendar: {
-                    connected:     true,
-                    access_token:  tokens.access_token,
-                    refresh_token: tokens.refresh_token || null,
-                    expiry_date:   newAccount.expiry_date,
+                calendly: {
+                    connected:       true,
+                    access_token:    tokens.access_token,
+                    refresh_token:   tokens.refresh_token || null,
+                    expiry_date:     new Date(Date.now() + (tokens.expires_in || 7200) * 1000).toISOString(),
+                    userUri:         me.uri,
+                    organizationUri: me.current_organization || tokens.organization || null,
+                    email:           me.email || null,
+                    name:            me.name || null,
+                    timezone:        me.timezone || 'UTC',
+                    schedulingUrl:   me.scheduling_url || null,
+                    eventTypeUri:    chosen.uri,
+                    eventTypeName:   chosen.name || null,
+                    durationMinutes: chosen.duration || 30,
+                    connectedAt:     new Date().toISOString(),
                 },
-                google_calendar_accounts: existing,
             },
         });
         await db.collection('users').doc(email).set({
-            integrations: { google_calendar: publicIntegrationFlag(true) },
+            integrations: { calendly: publicIntegrationFlag(true) },
         }, { merge: true });
 
-        const appUrl = buildAppUrl(req, origin);
-        return res.redirect(302, `${appUrl}?calendar_connected=1`);
+        return res.redirect(302, `${appUrl}?calendly_connected=1`);
     } catch (err) {
-        console.error('[OAuth/Google]', err.message);
+        console.error('[OAuth/Calendly]', err.message);
         return res.status(500).send(`Server error: ${err.message}`);
     }
 }
 
-async function handleCalendarAccounts(req, res) {
+async function handleCalendlyStatus(req, res) {
     const { userEmail } = req.query;
     if (!userEmail) return res.status(400).json({ success: false, message: 'Missing userEmail.' });
     const auth = await requireAuth(req, res, { matches: [userEmail] });
     if (!auth) return;
     try {
-        const secrets = await getUserSecrets(getDb(), userEmail);
-        const accounts = (secrets?.integrations?.google_calendar_accounts || [])
-            .filter(a => a && a.connected)
-            .map(a => ({ email: a.email, connected: true, enabledForBooking: a.enabledForBooking !== false }));
-        return res.json({ success: true, accounts });
+        const c = (await getUserSecrets(getDb(), userEmail))?.integrations?.calendly;
+        if (!c?.connected) return res.json({ success: true, connected: false });
+        return res.json({
+            success:         true,
+            connected:       true,
+            accountLabel:    c.email || c.name || 'Connected',
+            eventTypeName:   c.eventTypeName || null,
+            durationMinutes: c.durationMinutes || null,
+            schedulingUrl:   c.schedulingUrl || null,
+        });
     } catch (err) {
-        console.error('[CalendarAccounts]', err.message);
+        console.error('[CalendlyStatus]', err.message);
         return res.status(500).json({ success: false, message: err.message });
     }
 }
 
-async function handleDisconnectCalendar(req, res) {
+async function handleDisconnectCalendly(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ success: false });
-    const { userEmail, calendarId, all } = req.body || {};
+    const { userEmail } = req.body || {};
     if (!userEmail) return res.status(400).json({ success: false, message: 'Missing userEmail.' });
 
     const auth = await requireAuth(req, res, { matches: [userEmail], ownerOnly: true });
@@ -10477,72 +10521,27 @@ async function handleDisconnectCalendar(req, res) {
 
     try {
         const db = getDb();
-        const secrets = await getUserSecrets(db, userEmail);
+        const c  = (await getUserSecrets(db, userEmail))?.integrations?.calendly;
 
-        if (all) {
-            await setUserSecrets(db, userEmail, {
-                integrations: { google_calendar: null, google_calendar_accounts: [] },
-            });
-            await db.collection('users').doc(userEmail).set({
-                integrations: { google_calendar: publicIntegrationFlag(false) },
-            }, { merge: true });
-            return res.json({ success: true, message: 'All Google Calendars disconnected.' });
+        // Best-effort: revoke the token on Calendly's side too.
+        if (c?.refresh_token || c?.access_token) {
+            try {
+                await fetch(`${CALENDLY_AUTH}/oauth/revoke`, {
+                    method:  'POST',
+                    headers: { Authorization: calendlyBasicAuth(), 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body:    new URLSearchParams({ token: c.refresh_token || c.access_token }),
+                });
+            } catch (e) { console.warn('[DisconnectCalendly/revoke]', e.message); }
         }
 
-        if (!calendarId)
-            return res.status(400).json({ success: false, message: 'Missing calendarId.' });
-
-        const existing = secrets?.integrations?.google_calendar_accounts || [];
-        const remaining = existing.filter(a => a.email !== calendarId);
-        const newPrimary = remaining[0] || null;
-
-        await setUserSecrets(db, userEmail, {
-            integrations: {
-                google_calendar_accounts: remaining,
-                google_calendar: newPrimary ? {
-                    connected:     true,
-                    access_token:  newPrimary.access_token,
-                    refresh_token: newPrimary.refresh_token || null,
-                    expiry_date:   newPrimary.expiry_date,
-                } : null,
-            },
-        });
+        await setUserSecrets(db, userEmail, { integrations: { calendly: null } });
         await db.collection('users').doc(userEmail).set({
-            integrations: { google_calendar: publicIntegrationFlag(!!newPrimary) },
+            integrations: { calendly: publicIntegrationFlag(false) },
         }, { merge: true });
 
-        return res.json({ success: true, message: 'Calendar disconnected.' });
+        return res.json({ success: true, message: 'Calendly disconnected.' });
     } catch (err) {
-        console.error('[DisconnectCalendar]', err.message);
-        return res.status(500).json({ success: false, message: err.message });
-    }
-}
-
-async function handleToggleCalendarAccount(req, res) {
-    if (req.method !== 'POST') return res.status(405).json({ success: false });
-    const { userEmail, calendarId, enabled } = req.body || {};
-    if (!userEmail || !calendarId)
-        return res.status(400).json({ success: false, message: 'Missing userEmail or calendarId.' });
-
-    const auth = await requireAuth(req, res, { matches: [userEmail] });
-    if (!auth) return;
-
-    try {
-        const db = getDb();
-
-        if (await denyIfFeatureLocked(res, db, userEmail, 'googleCalendar')) return;
-
-        const secrets = await getUserSecrets(db, userEmail);
-        const accounts = secrets?.integrations?.google_calendar_accounts || [];
-        const idx = accounts.findIndex(a => a.email === calendarId);
-        if (idx === -1) return res.status(404).json({ success: false, message: 'Calendar account not found.' });
-
-        accounts[idx] = { ...accounts[idx], enabledForBooking: enabled !== false };
-        await setUserSecrets(db, userEmail, { integrations: { google_calendar_accounts: accounts } });
-
-        return res.json({ success: true });
-    } catch (err) {
-        console.error('[ToggleCalendarAccount]', err.message);
+        console.error('[DisconnectCalendly]', err.message);
         return res.status(500).json({ success: false, message: err.message });
     }
 }
@@ -10550,6 +10549,20 @@ async function handleToggleCalendarAccount(req, res) {
 // ════════════════════════════════════════════════════════════════════════════
 // FIREBASE PROJECT OAUTH
 // ════════════════════════════════════════════════════════════════════════════
+// The Google Cloud project used for "Connect Firebase Account" is whichever project owns this OAuth client.
+// To switch projects, set FIREBASE_OAUTH_CLIENT_ID / FIREBASE_OAUTH_CLIENT_SECRET (and optionally
+// FIREBASE_OAUTH_REDIRECT_URI). They fall back to the legacy GOOGLE_* vars.
+function firebaseOAuthCreds() {
+    return {
+        clientId:     process.env.FIREBASE_OAUTH_CLIENT_ID     || process.env.GOOGLE_CLIENT_ID,
+        clientSecret: process.env.FIREBASE_OAUTH_CLIENT_SECRET || process.env.GOOGLE_CLIENT_SECRET,
+    };
+}
+function firebaseOAuthRedirect(req) {
+    return process.env.FIREBASE_OAUTH_REDIRECT_URI || process.env.GOOGLE_REDIRECT_URI_FIREBASE ||
+           `https://${req.headers.host}/api/oauth/firebase-project/callback`;
+}
+
 async function handleFirebaseProjectOAuth(req, res) {
     const { email, origin } = req.query;
     if (!email) return res.status(400).send('Missing email.');
@@ -10557,10 +10570,9 @@ async function handleFirebaseProjectOAuth(req, res) {
     if (!(await requireOAuthStarter(req, res, email))) return;
     if (await gateOAuthFeature(req, res, email, origin, 'firebaseDatabase')) return;
 
-    const clientId    = process.env.GOOGLE_CLIENT_ID;
-    const redirectUri = process.env.GOOGLE_REDIRECT_URI_FIREBASE ||
-                        `https://${req.headers.host}/api/oauth/firebase-project/callback`;
-    if (!clientId) return res.status(500).send('Missing GOOGLE_CLIENT_ID env var.');
+    const { clientId } = firebaseOAuthCreds();
+    const redirectUri  = firebaseOAuthRedirect(req);
+    if (!clientId) return res.status(500).send('Missing FIREBASE_OAUTH_CLIENT_ID (or GOOGLE_CLIENT_ID) env var.');
 
     const state = signOAuthState({ email, origin: origin || null, kind: 'oauth_callback' });
     const url   = new URL('https://accounts.google.com/o/oauth2/v2/auth');
@@ -10591,11 +10603,9 @@ async function handleFirebaseProjectCallback(req, res) {
 
     if (await gateOAuthFeature(req, res, email, origin, 'firebaseDatabase')) return;
 
-    const clientId     = process.env.GOOGLE_CLIENT_ID;
-    const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-    const redirectUri  = process.env.GOOGLE_REDIRECT_URI_FIREBASE ||
-                         `https://${req.headers.host}/api/oauth/firebase-project/callback`;
-    if (!clientId || !clientSecret) return res.status(500).send('Missing Google OAuth env vars.');
+    const { clientId, clientSecret } = firebaseOAuthCreds();
+    const redirectUri  = firebaseOAuthRedirect(req);
+    if (!clientId || !clientSecret) return res.status(500).send('Missing Firebase OAuth env vars (FIREBASE_OAUTH_CLIENT_ID / FIREBASE_OAUTH_CLIENT_SECRET).');
 
     try {
         const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
@@ -11207,8 +11217,7 @@ async function refreshGenericGoogleToken(authObj, ownerEmail, db, key) {
         const expiryMs = new Date(authObj.expiry_date).getTime();
         if (!isNaN(expiryMs) && expiryMs < Date.now() + 60000) {
             
-            const cId = process.env.GOOGLE_CLIENT_ID;
-            const cSec = process.env.GOOGLE_CLIENT_SECRET;
+            const { clientId: cId, clientSecret: cSec } = firebaseOAuthCreds();
 
             const r = await fetch('https://oauth2.googleapis.com/token', {
                 method:  'POST',
@@ -12407,217 +12416,173 @@ async function handlePasswordResetConfirm(req, res) {
     }
 }
 
-async function getCalendarTimezone(accessToken) {
-    try {
-        const r = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary',
-            { headers: { Authorization: `Bearer ${accessToken}` } });
-        if (!r.ok) return 'UTC';
-        return (await r.json()).timeZone || 'UTC';
-    } catch { return 'UTC'; }
+// ════════════════════════════════════════════════════════════════════════════
+// CALENDLY BOOKING HELPERS (availability · booking · cancel · reschedule)
+// ════════════════════════════════════════════════════════════════════════════
+const CAL_EMAIL_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
+const pad2 = n => String(n).padStart(2, '0');
+const calIso = d => d.toISOString().replace(/\.\d{3}Z$/, 'Z');
+
+// Wall-clock time in `tz` → the matching UTC instant.
+function zonedLocalToUTC(localStr, tz) {
+    const naive = new Date(localStr + 'Z');
+    const fmt   = new Intl.DateTimeFormat('en-CA', {
+        timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+    });
+    const parts = fmt.formatToParts(naive);
+    const get   = type => parseInt(parts.find(p => p.type === type)?.value || '0', 10);
+    const tzH   = get('hour') === 24 ? 0 : get('hour');
+    const repr  = Date.UTC(get('year'), get('month') - 1, get('day'), tzH, get('minute'), get('second'));
+    return new Date(naive.getTime() - (repr - naive.getTime()));
 }
 
-async function getGoogleCalendarAccounts(db, ownerEmail) {
-    if (!ownerEmail) return [];
-    const secrets = await getUserSecrets(db, ownerEmail);
-    return secrets?.integrations?.google_calendar_accounts || [];
+async function getCalendlyAccount(db, ownerEmail) {
+    if (!ownerEmail) return null;
+    const c = (await getUserSecrets(db, ownerEmail))?.integrations?.calendly;
+    return (c?.connected && c.eventTypeUri) ? c : null;
 }
 
-function bookingEnabledAccounts(accounts) {
-    return (accounts || []).filter(a => a?.connected && a.enabledForBooking !== false);
-}
-
-async function refreshAccountToken(account, ownerEmail, db) {
+async function refreshCalendlyToken(account, ownerEmail, db) {
     let accessToken = account.access_token;
-    if (account.refresh_token && account.expiry_date) {
-        const expiryMs = new Date(account.expiry_date).getTime();
-        if (!isNaN(expiryMs) && expiryMs < Date.now() + 60000) {
-            const r = await fetch('https://oauth2.googleapis.com/token', {
-                method:  'POST',
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                body:    new URLSearchParams({
-                    client_id:     process.env.GOOGLE_CLIENT_ID,
-                    client_secret: process.env.GOOGLE_CLIENT_SECRET,
-                    refresh_token: account.refresh_token,
-                    grant_type:    'refresh_token',
-                }),
-            });
-            const t = await r.json();
-            if (t.access_token) {
-                accessToken = t.access_token;
-                const newExpiry = new Date(Date.now() + (t.expires_in || 3500) * 1000).toISOString();
-                account.access_token = t.access_token;
-                account.expiry_date  = newExpiry;
-                try {
-                    const secrets = await getUserSecrets(db, ownerEmail);
-                    const accounts = secrets?.integrations?.google_calendar_accounts || [];
-                    const idx = accounts.findIndex(a => a.email === account.email);
-                    if (idx >= 0) {
-                        accounts[idx] = { ...accounts[idx], access_token: t.access_token, expiry_date: newExpiry };
-                        await setUserSecrets(db, ownerEmail, { integrations: { google_calendar_accounts: accounts } });
-                    }
-                } catch (e) { /* best-effort */ }
-            }
+    const expiryMs = account.expiry_date ? new Date(account.expiry_date).getTime() : 0;
+    if (account.refresh_token && (!expiryMs || expiryMs < Date.now() + 60000)) {
+        const r = await fetch(`${CALENDLY_AUTH}/oauth/token`, {
+            method:  'POST',
+            headers: { Authorization: calendlyBasicAuth(), 'Content-Type': 'application/x-www-form-urlencoded' },
+            body:    new URLSearchParams({ grant_type: 'refresh_token', refresh_token: account.refresh_token }),
+        });
+        const t = await r.json().catch(() => ({}));
+        if (t.access_token) {
+            accessToken = t.access_token;
+            const patch = {
+                access_token:  t.access_token,
+                // Calendly refresh tokens are single-use, so always store the new one.
+                refresh_token: t.refresh_token || account.refresh_token,
+                expiry_date:   new Date(Date.now() + (t.expires_in || 7200) * 1000).toISOString(),
+            };
+            Object.assign(account, patch);
+            try { await setUserSecrets(db, ownerEmail, { integrations: { calendly: patch } }); }
+            catch (e) { console.error('[Calendly/Refresh/persist]', e.message); }
+        } else {
+            console.error('[Calendly/Refresh]', t.error_description || t.error || r.status);
         }
     }
     return accessToken;
 }
 
-async function deleteCalendarEventsForAppt(db, ownerEmail, appt) {
-    if (!ownerEmail) return;
-    const accounts = await getGoogleCalendarAccounts(db, ownerEmail);
-    const events = (appt.googleCalendarEvents && appt.googleCalendarEvents.length)
-        ? appt.googleCalendarEvents
-        : (appt.googleCalendarEventId ? [{ accountEmail: accounts[0]?.email || null, eventId: appt.googleCalendarEventId }] : []);
-    for (const ev of events) {
-        try {
-            const acct = accounts.find(a => a.email === ev.accountEmail) || accounts[0];
-            if (!acct?.connected) continue;
-            const token = await refreshAccountToken(acct, ownerEmail, db);
-            await fetch(`https://www.googleapis.com/calendar/v3/calendars/primary/events/${ev.eventId}`,
-                { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
-        } catch (e) { console.error('[Calendar/Delete]', e.message); }
+async function cancelCalendlyEvent(accessToken, eventId) {
+    try {
+        await calendlyApi(accessToken, `/scheduled_events/${encodeURIComponent(eventId)}/cancellation`, {
+            method: 'POST', body: { reason: 'Cancelled via Mebor AI' },
+        });
+    } catch (e) {
+        // 4xx usually means it was already cancelled or removed in Calendly.
+        console.error('[Calendly/Cancel]', eventId, e.message);
     }
 }
 
-async function updateCalendarEventsForAppt(db, ownerEmail, appt) {
+async function deleteCalendarEventsForAppt(db, ownerEmail, appt) {
     if (!ownerEmail) return;
-    const accounts = await getGoogleCalendarAccounts(db, ownerEmail);
-    const events = (appt.googleCalendarEvents && appt.googleCalendarEvents.length)
-        ? appt.googleCalendarEvents
-        : (appt.googleCalendarEventId ? [{ accountEmail: accounts[0]?.email || null, eventId: appt.googleCalendarEventId }] : []);
-    for (const ev of events) {
-        try {
-            const acct = accounts.find(a => a.email === ev.accountEmail) || accounts[0];
-            if (!acct?.connected) continue;
-            await updateCalendarEvent(acct, ev.eventId, appt, ownerEmail, db);
-        } catch (e) { console.error('[Calendar/Update]', e.message); }
+    const events = appt?.calendlyEvents || [];
+    if (!events.length) return;
+    const acct = await getCalendlyAccount(db, ownerEmail);
+    if (!acct) return;
+    const token = await refreshCalendlyToken(acct, ownerEmail, db);
+    for (const ev of events) if (ev?.eventId) await cancelCalendlyEvent(token, ev.eventId);
+}
+
+// Calendly has no "move booking" call: book the new time first, then cancel the old one.
+// Returns the new calendlyEvents array, or null if nothing changed.
+async function updateCalendarEventsForAppt(db, ownerEmail, appt) {
+    if (!ownerEmail) return null;
+    const old = appt?.calendlyEvents || [];
+    if (!old.length) return null;
+    const acct = await getCalendlyAccount(db, ownerEmail);
+    if (!acct) return null;
+    try {
+        const created = await addCalendarEvent(acct, appt, ownerEmail, db);
+        if (!created?.eventId) return null;
+        const token = await refreshCalendlyToken(acct, ownerEmail, db);
+        for (const ev of old) if (ev?.eventId) await cancelCalendlyEvent(token, ev.eventId);
+        return [{ eventId: created.eventId, inviteeUri: created.inviteeUri || null }];
+    } catch (e) {
+        console.error('[Calendly/Update]', e.message);
+        return null;
     }
 }
 
 async function checkCalendarAvailability(account, dateISO, timeStr, ownerEmail, db) {
     try {
-        const accessToken = await refreshAccountToken(account, ownerEmail, db);
-        const timeZone    = await getCalendarTimezone(accessToken);
-        const parsed      = parseTime(timeStr);
+        const parsed = parseTime(timeStr);
         if (!parsed) return { available: true };
 
+        const accessToken = await refreshCalendlyToken(account, ownerEmail, db);
+        const tz = account.timezone || 'UTC';
         const { h, min } = parsed;
-        const localStart = `${dateISO}T${String(h).padStart(2,'0')}:${String(min).padStart(2,'0')}:00`;
-        const endTotal = h * 60 + min + 30;
-        const endH = Math.floor(endTotal / 60) % 24;
-        const endMin = endTotal % 60;
-        const localEnd = `${dateISO}T${String(endH).padStart(2,'0')}:${String(endMin).padStart(2,'0')}:00`;
 
-        const toUTC = (localStr, tz) => {
-            const naive = new Date(localStr + 'Z');
-            const fmt   = new Intl.DateTimeFormat('en-CA', {
-                timeZone: tz, year:'numeric', month:'2-digit', day:'2-digit',
-                hour:'2-digit', minute:'2-digit', second:'2-digit', hour12: false,
-            });
-            const parts = fmt.formatToParts(naive);
-            const get   = type => parseInt(parts.find(p => p.type === type)?.value || '0', 10);
-            const tzH   = get('hour') === 24 ? 0 : get('hour');
-            const repr  = Date.UTC(get('year'), get('month')-1, get('day'), tzH, get('minute'), get('second'));
-            return new Date(naive.getTime() - (repr - naive.getTime()));
-        };
+        const startUTC = zonedLocalToUTC(`${dateISO}T${pad2(h)}:${pad2(min)}:00`, tz);
+        const dayStart = zonedLocalToUTC(`${dateISO}T00:00:00`, tz);
+        const dayEnd   = zonedLocalToUTC(`${dateISO}T23:59:59`, tz);
+        // Calendly only returns future slots.
+        const from = new Date(Math.max(dayStart.getTime(), Date.now() + 60000));
+        if (from >= dayEnd) return { available: false, suggestedTimes: [] };
 
-        const startUTC    = toUTC(localStart, timeZone);
-        const endUTC      = toUTC(localEnd,   timeZone);
-        const dayStartUTC = toUTC(`${dateISO}T00:00:00`, timeZone);
-        const dayEndUTC   = toUTC(`${dateISO}T23:59:59`, timeZone);
-
-        const r = await fetch(
-            `https://www.googleapis.com/calendar/v3/calendars/primary/events?` +
-            `timeMin=${dayStartUTC.toISOString()}&timeMax=${dayEndUTC.toISOString()}&singleEvents=true&orderBy=startTime`,
-            { headers: { Authorization: `Bearer ${accessToken}` } }
-        );
-        if (!r.ok) return { available: true };
-
-        const events   = (await r.json()).items || [];
-        const isBooked = events.some(ev => {
-            const evS = new Date(ev.start?.dateTime || ev.start?.date);
-            const evE = new Date(ev.end?.dateTime   || ev.end?.date);
-            return startUTC < evE && endUTC > evS;
+        const data = await calendlyApi(accessToken, '/event_type_available_times', {
+            params: { event_type: account.eventTypeUri, start_time: calIso(from), end_time: calIso(dayEnd) },
         });
-        if (!isBooked) return { available: true };
+        const slots = (data?.collection || [])
+            .filter(sl => sl.status === 'available')
+            .map(sl => new Date(sl.start_time))
+            .filter(d => !isNaN(d));
 
-        const booked      = events.map(ev => ({
-            start: new Date(ev.start?.dateTime || ev.start?.date),
-            end:   new Date(ev.end?.dateTime   || ev.end?.date),
-        }));
-        const suggestions = [];
-        for (let sh = 9; sh < 18 && suggestions.length < 3; sh++) {
-            for (let sm = 0; sm < 60 && suggestions.length < 3; sm += 30) {
-                const sStr = `${dateISO}T${String(sh).padStart(2,'0')}:${String(sm).padStart(2,'0')}:00`;
-                const sUTC = toUTC(sStr, timeZone);
-                const eUTC = new Date(sUTC.getTime() + 30*60000);
-                if (!booked.some(b => sUTC < b.end && eUTC > b.start)) {
-                    const dh = sh%12 === 0 ? 12 : sh%12;
-                    suggestions.push(`${dh}:${String(sm).padStart(2,'0')} ${sh < 12 ? 'AM' : 'PM'}`);
-                }
-            }
-        }
-        return { available: false, suggestedTimes: suggestions };
+        if (slots.some(d => d.getTime() === startUTC.getTime())) return { available: true };
 
+        const fmt = new Intl.DateTimeFormat('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit', hour12: true });
+        const suggestedTimes = slots.slice(0, 3).map(d => fmt.format(d).replace(/[\u202f\u00a0]/g, ' '));
+        return { available: false, suggestedTimes };
     } catch (err) {
         console.error('[Availability]', err.message);
         return { available: true };
     }
 }
 
+// Books the slot through Calendly's Scheduling API. Calendly needs the customer's email;
+// if the contact info has none, the appointment is still saved in Mebor but not sent to Calendly.
 async function addCalendarEvent(account, appt, ownerEmail, db) {
-    const accessToken = await refreshAccountToken(account, ownerEmail, db);
     const parsed = parseTime(appt.appointmentTime);
-    if (!parsed) { console.error(`[Calendar] Cannot parse time "${appt.appointmentTime}"`); return null; }
+    if (!parsed) { console.error(`[Calendly] Cannot parse time "${appt.appointmentTime}"`); return null; }
 
-    const { h, min } = parsed;
-    const timeZone   = await getCalendarTimezone(accessToken);
-    const localStart = `${appt.scheduledDate}T${String(h).padStart(2,'0')}:${String(min).padStart(2,'0')}:00`;
-    const endTotal = h * 60 + min + 30;
-    const endH = Math.floor(endTotal / 60) % 24;
-    const endMin = endTotal % 60;
-    const localEnd = `${appt.scheduledDate}T${String(endH).padStart(2,'0')}:${String(endMin).padStart(2,'0')}:00`;
+    const inviteeEmail = (String(appt.contactInfo || '').match(CAL_EMAIL_RE) || [])[0];
+    if (!inviteeEmail) {
+        console.warn('[Calendly] Skipped booking: customer contact info has no email address.');
+        return null;
+    }
 
-    const r = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
-        method:  'POST',
-        headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
-        body:    JSON.stringify({
-            summary:     `Appointment: ${appt.customerName}`,
-            description: `Contact: ${appt.contactInfo}\nBooked via Mebor AI`,
-            start: { dateTime: localStart, timeZone },
-            end:   { dateTime: localEnd,   timeZone },
-        }),
-    });
-    const data = await r.json();
-    if (!r.ok) { console.error('[Calendar] Event error:', data.error?.message); return null; }
-    return { eventId: data.id, eventLink: data.htmlLink };
-}
+    try {
+        const accessToken = await refreshCalendlyToken(account, ownerEmail, db);
+        const tz = account.timezone || 'UTC';
+        const { h, min } = parsed;
+        const startUTC = zonedLocalToUTC(`${appt.scheduledDate}T${pad2(h)}:${pad2(min)}:00`, tz);
 
-async function updateCalendarEvent(account, eventId, appt, ownerEmail, db) {
-    const accessToken = await refreshAccountToken(account, ownerEmail, db);
-    const parsed = parseTime(appt.appointmentTime);
-    if (!parsed) return;
-
-    const { h, min } = parsed;
-    const timeZone   = await getCalendarTimezone(accessToken);
-    const localStart = `${appt.scheduledDate}T${String(h).padStart(2,'0')}:${String(min).padStart(2,'0')}:00`;
-    const endTotal = h * 60 + min + 30;
-    const endH = Math.floor(endTotal / 60) % 24;
-    const endMin = endTotal % 60;
-    const localEnd = `${appt.scheduledDate}T${String(endH).padStart(2,'0')}:${String(endMin).padStart(2,'0')}:00`;
-
-    const r = await fetch(`https://www.googleapis.com/calendar/v3/calendars/primary/events/${eventId}`, {
-        method:  'PATCH',
-        headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
-        body:    JSON.stringify({
-            summary:     `Appointment: ${appt.customerName}`,
-            description: `Contact: ${appt.contactInfo}\nBooked via Mebor AI`,
-            start: { dateTime: localStart, timeZone },
-            end:   { dateTime: localEnd,   timeZone },
-        }),
-    });
-    if (!r.ok) {
-        const d = await r.json();
-        console.error('[Calendar] Update error:', d.error?.message);
+        const data = await calendlyApi(accessToken, '/invitees', {
+            method: 'POST',
+            body: {
+                event_type: account.eventTypeUri,
+                start_time: calIso(startUTC),
+                invitee: {
+                    name:     appt.customerName || 'Guest',
+                    email:    inviteeEmail,
+                    timezone: tz,
+                },
+            },
+        });
+        const inv = data?.resource;
+        const eventId = String(inv?.event || '').split('/').filter(Boolean).pop();
+        if (!eventId) { console.error('[Calendly] Booking response had no event id.'); return null; }
+        return { eventId, inviteeUri: inv.uri || null, eventLink: inv.reschedule_url || null };
+    } catch (e) {
+        console.error('[Calendly] Booking error:', e.status || '', e.message);
+        return null;
     }
 }
